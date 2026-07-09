@@ -36,6 +36,13 @@ Full plan: session plan file / conversation plan for hierarchy redesign.
 
 ## Phase C — product differentiation
 
+- [x] **Phone relay (Cmux Remote compatible)** — opt-in `vmux relay serve`
+  - HTTP `/v1/health`, `/v1/state`, device register/APNs/revoke
+  - WebSocket `/v1/ws` hello + JSON-RPC (workspace/surface/screen/keys/events)
+  - Maps to existing Unix-socket daemon API only (no attach/daemon behaviour change when idle)
+  - Tailscale whois + localhost / CGNAT auth options; device token store
+- [ ] Relay: harden Tailscale whois JSON variants; optional systemd user unit
+- [ ] Relay: APNs push fanout (currently accepts token registration only)
 - [ ] Named layout presets (“agents-2x2”) restore in one command
 - [ ] Per-pane restart policy (`never` | `on-fail` | `always`) for agents
 - [ ] Protocol versioning (`"v": 1` on requests/responses)

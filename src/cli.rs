@@ -96,6 +96,12 @@ pub enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Opt-in cmux-remote compatible phone relay (Tailscale / LAN).
+    /// Does not change daemon/attach behaviour unless you start it.
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
+    },
     Markdown {
         #[command(subcommand)]
         command: MarkdownCommand,
@@ -775,6 +781,42 @@ pub enum AgentCommand {
 
         #[arg(long, default_value = "")]
         message: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RelayCommand {
+    /// Start the phone relay (HTTP + WebSocket, default :4399).
+    Serve {
+        #[arg(long)]
+        config: Option<String>,
+
+        #[arg(long, help = "Override listen address (host:port)")]
+        listen: Option<String>,
+
+        #[arg(
+            long,
+            help = "Allow device registration from localhost (dev / simulator)"
+        )]
+        allow_localhost: bool,
+    },
+    /// Show relay config, paired devices, and health probe.
+    Status {
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// List or revoke paired mobile devices.
+    Devices {
+        #[command(subcommand)]
+        command: RelayDevicesCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RelayDevicesCommand {
+    List,
+    Revoke {
+        device_id: String,
     },
 }
 

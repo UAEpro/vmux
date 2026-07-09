@@ -415,6 +415,77 @@ Project actions live in `vmux.json` and are runnable via `vmux actions` or `Ctrl
 
 ---
 
+## Phone relay (Cmux Remote compatible)
+
+**Opt-in only.** Starting the relay does not change attach, CLI, or daemon behaviour.
+If you never run it, nothing listens on the network.
+
+`vmux relay` speaks the community **[Cmux Remote](https://github.com/NewTurn2017/cmux-remote)**
+HTTP + WebSocket protocol so you can put your Tailscale IP + port `4399` in that
+iPhone app and drive **vmux** workspaces/panes from your phone.
+
+```text
+iPhone (Cmux Remote)  ── Tailscale ──►  vmux relay :4399  ── Unix socket ──►  vmux daemon
+```
+
+### Start
+
+```sh
+# Ensure a session daemon is up (auto-started by the relay if needed)
+vmux relay serve
+
+# Dev / same-machine tests (skip Tailscale whois)
+vmux relay serve --allow-localhost --listen 127.0.0.1:4399
+
+# Status + paired devices
+vmux relay status
+vmux relay devices list
+vmux relay devices revoke <device_id>
+```
+
+Config is created on first run at `~/.config/vmux/relay.json`:
+
+```json
+{
+  "listen": "0.0.0.0:4399",
+  "allow_login": [],
+  "allow_localhost": false,
+  "allow_tailnet_cgnat": false,
+  "default_fps": 15,
+  "idle_fps": 5,
+  "session": "default"
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `allow_login` | Tailscale login names allowed to pair (empty = any successful `tailscale whois`) |
+| `allow_localhost` | Allow `127.0.0.1` registration (or env `VMUX_RELAY_ALLOW_LOCALHOST=1`) |
+| `allow_tailnet_cgnat` | Accept `100.64.0.0/10` peers without whois (weaker; last resort) |
+| `bootstrap_secret` | Optional shared secret for restricted pairing flows |
+| `session` | vmux session name the relay attaches to |
+
+Device tokens are stored under `~/.local/state/vmux/relay-devices.json`.
+
+### Phone setup
+
+1. Install **Cmux Remote** (or another client that speaks the same relay wire protocol).
+2. Run Tailscale on the phone and on the Linux host (same tailnet).
+3. On Linux: `vmux relay serve` (and keep the vmux daemon running).
+4. In the app: host = `tailscale ip -4`, port = `4399`.
+5. Pair → list workspaces → open a surface → type / receive agent status.
+
+```sh
+curl -s http://$(tailscale ip -4):4399/v1/health
+# {"ok":true,"version":"…","backend":"vmux",…}
+```
+
+> This is a **compatibility layer**, not an official Manaflow product.
+> Official cmux Mobile Connect is a different stack and will not work.
+> Protocol drift in the App Store app may require relay updates.
+
+---
+
 ## Architecture (short)
 
 ```text
@@ -471,6 +542,7 @@ src/
   agent_hooks.rs   Claude / Codex / Grok / shell
   paths.rs         XDG runtime + state
   input.rs         key encoding into panes
+  relay.rs         opt-in Cmux Remote–compatible phone relay
 ```
 
 Roadmap notes live in [`todo.md`](todo.md).

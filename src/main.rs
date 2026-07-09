@@ -6,6 +6,7 @@ mod input;
 mod model;
 mod paths;
 mod protocol;
+mod relay;
 mod ui;
 
 use anyhow::{anyhow, Result};
@@ -22,8 +23,9 @@ use std::process::{Command as ProcessCommand, Stdio};
 use cli::SurfaceKindArg;
 use cli::{
     ActionCommand, AgentCommand, BrowserCommand, Cli, Command, ConfigCommand, HookShell,
-    HooksCommand, MarkdownCommand, MetadataCommand, PaneTabCommand, ProgressCommand, RemoteCommand,
-    SkillsCommand, SurfaceCommand, TabCommand, WorkspaceCommand,
+    HooksCommand, MarkdownCommand, MetadataCommand, PaneTabCommand, ProgressCommand,
+    RelayCommand, RelayDevicesCommand, RemoteCommand, SkillsCommand, SurfaceCommand, TabCommand,
+    WorkspaceCommand,
 };
 use model::SurfaceKind;
 
@@ -112,6 +114,7 @@ fn main() -> Result<()> {
         Command::Browser { command } => browser_command(session, command),
         Command::Agent { command } => agent_command(session, command),
         Command::Remote { command } => remote_command(session, command),
+        Command::Relay { command } => relay_command(session, command),
         Command::Markdown { command } => markdown_command(session, command),
         Command::Actions { command } => {
             daemon::ensure_running(session)?;
@@ -561,6 +564,28 @@ fn main() -> Result<()> {
         Command::Doctor => doctor(session),
         Command::Smoke { keep } => smoke(keep),
         Command::Stop => stop_session(session),
+    }
+}
+
+fn relay_command(session: &str, command: RelayCommand) -> Result<()> {
+    match command {
+        RelayCommand::Serve {
+            config,
+            listen,
+            allow_localhost,
+        } => relay::serve(
+            session,
+            config.map(std::path::PathBuf::from),
+            listen,
+            allow_localhost,
+        ),
+        RelayCommand::Status { config } => {
+            relay::status(config.map(std::path::PathBuf::from))
+        }
+        RelayCommand::Devices { command } => match command {
+            RelayDevicesCommand::List => relay::devices_list(),
+            RelayDevicesCommand::Revoke { device_id } => relay::devices_revoke(&device_id),
+        },
     }
 }
 
