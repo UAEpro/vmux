@@ -86,6 +86,9 @@ pub struct UiConfig {
     /// Terminal bell when a pane enters attention / needs-input.
     #[serde(default)]
     pub bell_on_attention: bool,
+    /// Auto-hide the workspace sidebar on narrow terminals (burger + picker).
+    #[serde(default = "default_true")]
+    pub sidebar_responsive: bool,
 }
 
 impl Default for LmuxConfig {
@@ -114,6 +117,7 @@ impl Default for UiConfig {
             mouse: true,
             tab_close_button: true,
             bell_on_attention: false,
+            sidebar_responsive: true,
         }
     }
 }
@@ -250,6 +254,9 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
         }
         "ui.bell_on_attention" => {
             config.ui.bell_on_attention = parse_bool(value)?;
+        }
+        "ui.sidebar_responsive" => {
+            config.ui.sidebar_responsive = parse_bool(value)?;
         }
         "relay.enabled" => {
             config.relay.enabled = parse_bool(value)?;

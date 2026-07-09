@@ -164,6 +164,10 @@ struct Ui {
     mouse: bool,
     tab_close_button: bool,
     bell_on_attention: bool,
+    /// Auto-hide sidebar on narrow terminals (burger + workspace picker).
+    sidebar_responsive: bool,
+    /// Selection index inside the ☰ workspace picker.
+    workspace_picker_selected: usize,
     /// Settings: auto-start phone relay on attach.
     mobile_relay_enabled: bool,
     /// Settings: `auto` | `tailscale` | `local` (never all-interfaces).
@@ -210,8 +214,13 @@ enum UiMode {
     Actions,
     Commands,
     Settings,
+    /// Mobile-style workspace list opened from the ☰ burger control.
+    WorkspacePicker,
     ContextMenu,
 }
+
+/// Terminal width (columns) below which the sidebar auto-hides and the burger menu is used.
+const COMPACT_TERM_WIDTH: u16 = 90;
 
 /// A pending action awaiting confirmation. The pane grid stays visible; a modal
 /// alert overlays it and (for pane kills) the target pane is highlighted.
@@ -355,6 +364,8 @@ enum CommandPaletteAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlAction {
+    /// ☰ open/close workspace picker (responsive / mobile-friendly).
+    Workspaces,
     NewWorkspace,
     NewTab,
     SplitRight,
@@ -733,6 +744,8 @@ impl Ui {
             mouse: config.ui.mouse,
             tab_close_button: config.ui.tab_close_button,
             bell_on_attention: config.ui.bell_on_attention,
+            sidebar_responsive: config.ui.sidebar_responsive,
+            workspace_picker_selected: 0,
             mobile_relay_enabled: config.relay.enabled,
             mobile_relay_bind: config.relay.bind.clone(),
             mobile_relay_port: config.relay.port,
@@ -860,6 +873,8 @@ impl Ui {
                             self.mobile_relay_port,
                             self.mobile_relay_allow_localhost,
                             self.mobile_relay_allow_cgnat,
+                            self.sidebar_responsive,
+                            self.workspace_picker_selected,
                         )
                     })?;
                 }
@@ -956,7 +971,15 @@ impl Ui {
                     // remaining keys drive behaviors with no palette action.
                     match key.code {
                         KeyCode::Char('q') => return Ok(true),
-                        KeyCode::Char('B') => self.sidebar_collapsed = !self.sidebar_collapsed,
+                        KeyCode::Char('B') => {
+                            // Compact / mobile: open ☰ picker. Desktop: toggle collapse.
+                            if self.is_compact_layout() {
+                                self.toggle_workspace_picker();
+                            } else {
+                                self.sidebar_collapsed = !self.sidebar_collapsed;
+                            }
+                        }
+                        KeyCode::Char('w') => self.toggle_workspace_picker(),
                         KeyCode::Char('P') => self.toggle_commands(),
                         KeyCode::Char('u') => self.jump_notification()?,
                         KeyCode::Tab => self.focus_direction(SplitDirection::Right)?,
@@ -1037,6 +1060,25 @@ impl Ui {
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                             self.adjust_selected_setting(1)?
                         }
+                        _ => {}
+                    }
+                    return Ok(false);
+                }
+                if self.mode == UiMode::WorkspacePicker {
+                    match key.code {
+                        KeyCode::Esc => self.mode = UiMode::Panes,
+                        KeyCode::Up | KeyCode::Char('k') => self.move_workspace_picker_selection(-1),
+                        KeyCode::Down | KeyCode::Char('j') => self.move_workspace_picker_selection(1),
+                        KeyCode::Home => self.workspace_picker_selected = 0,
+                        KeyCode::End => {
+                            let n = self
+                                .snapshot
+                                .as_ref()
+                                .map(|s| s.workspaces.len())
+                                .unwrap_or(0);
+                            self.workspace_picker_selected = n.saturating_sub(1);
+                        }
+                        KeyCode::Enter => self.activate_workspace_picker_selection()?,
                         _ => {}
                     }
                     return Ok(false);
@@ -1511,6 +1553,80 @@ impl Ui {
         };
     }
 
+    fn toggle_workspace_picker(&mut self) {
+        self.mode = if self.mode == UiMode::WorkspacePicker {
+            UiMode::Panes
+        } else {
+            self.sync_workspace_picker_selection();
+            UiMode::WorkspacePicker
+        };
+    }
+
+    fn sync_workspace_picker_selection(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            self.workspace_picker_selected = 0;
+            return;
+        };
+        self.workspace_picker_selected = snapshot
+            .workspaces
+            .iter()
+            .position(|w| w.id == snapshot.active_workspace)
+            .unwrap_or(0);
+    }
+
+    fn move_workspace_picker_selection(&mut self, delta: isize) {
+        let count = self
+            .snapshot
+            .as_ref()
+            .map(|s| s.workspaces.len())
+            .unwrap_or(0);
+        if count == 0 {
+            self.workspace_picker_selected = 0;
+            return;
+        }
+        let current = self.workspace_picker_selected.min(count - 1);
+        self.workspace_picker_selected = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(count.saturating_sub(1))
+        };
+    }
+
+    fn activate_workspace_picker_selection(&mut self) -> Result<()> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Ok(());
+        };
+        let Some(ws) = snapshot.workspaces.get(self.workspace_picker_selected) else {
+            return Ok(());
+        };
+        let id = ws.id.clone();
+        self.rpc(&Request::SwitchWorkspace { workspace: id })?;
+        self.mode = UiMode::Panes;
+        Ok(())
+    }
+
+    /// True when the terminal is narrow enough to use the mobile/burger layout.
+    fn is_compact_layout(&self) -> bool {
+        if !self.sidebar_responsive {
+            return false;
+        }
+        terminal_size()
+            .map(|(w, _)| w < COMPACT_TERM_WIDTH)
+            .unwrap_or(false)
+    }
+
+    /// Sidebar column count after responsive rules (0 = fully hidden).
+    fn layout_sidebar_cols(&self) -> u16 {
+        let (term_w, _) = terminal_size().unwrap_or((80, 24));
+        if self.sidebar_responsive && term_w < COMPACT_TERM_WIDTH {
+            0
+        } else {
+            sidebar_width(self.sidebar_collapsed, self.sidebar_width)
+        }
+    }
+
     fn move_settings_selection(&mut self, delta: isize) {
         let entries = settings_entries();
         let count = entries.len();
@@ -1564,6 +1680,13 @@ impl Ui {
             SettingsEntryId::Sidebar => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
                 self.save_ui_config("ui.sidebar_collapsed", &self.sidebar_collapsed.to_string())?;
+            }
+            SettingsEntryId::SidebarResponsive => {
+                self.sidebar_responsive = !self.sidebar_responsive;
+                self.save_ui_config(
+                    "ui.sidebar_responsive",
+                    &self.sidebar_responsive.to_string(),
+                )?;
             }
             SettingsEntryId::SidebarWidth => {
                 let next = if delta.is_negative() {
@@ -1967,6 +2090,7 @@ impl Ui {
 
     fn run_control_action(&mut self, action: ControlAction) -> Result<bool> {
         match action {
+            ControlAction::Workspaces => self.toggle_workspace_picker(),
             ControlAction::NewWorkspace => self.new_workspace()?,
             ControlAction::NewTab => self.new_workspace_tab()?,
             ControlAction::SplitRight => self.new_pane(SplitDirection::Right)?,
@@ -2302,15 +2426,42 @@ impl Ui {
     fn handle_click(&mut self, column: u16, row: u16) -> Result<bool> {
         self.update_hover(column, row)?;
         let (width, height) = terminal_size()?;
+        let layout_cols = self.layout_sidebar_cols();
         // Start sidebar resize when grabbing the right edge (expanded only).
-        let cols = sidebar_width(self.sidebar_collapsed, self.sidebar_width);
+        let cols = layout_cols;
         if !self.sidebar_collapsed
+            && layout_cols > 0
             && is_sidebar_resize_edge(column, cols)
             && row < height.saturating_sub(CONTROL_BAR_HEIGHT)
         {
             self.sidebar_resize_drag = true;
             self.sidebar_drag_workspace = None;
             self.pane_resize_drag = None;
+            return Ok(false);
+        }
+        // ☰ workspace picker: click a row to switch.
+        if self.mode == UiMode::WorkspacePicker {
+            let main = confirm_main_area(self.sidebar_collapsed, self.sidebar_width, width, height);
+            // List starts one row below the border title.
+            if column > main.x
+                && column < main.x.saturating_add(main.width)
+                && row > main.y
+                && row < main.y.saturating_add(main.height.saturating_sub(1))
+            {
+                let index = row.saturating_sub(main.y.saturating_add(1)) as usize;
+                if let Some(snapshot) = self.snapshot.as_ref() {
+                    if index < snapshot.workspaces.len() {
+                        self.workspace_picker_selected = index;
+                        self.activate_workspace_picker_selection()?;
+                        return Ok(false);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        // Click the collapsed ☰ header to open the workspace picker.
+        if layout_cols > 0 && self.sidebar_collapsed && column < layout_cols && row == 0 {
+            self.toggle_workspace_picker();
             return Ok(false);
         }
         // Rename dialog: OK / Cancel / ignore outside.
@@ -2840,9 +2991,18 @@ fn draw(
     mobile_relay_port: u16,
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
+    sidebar_responsive: bool,
+    workspace_picker_selected: usize,
 ) {
     let palette = theme.palette();
-    let sidebar_width = sidebar_width(sidebar_collapsed, sidebar_expanded);
+    let term_w = frame.size().width;
+    let compact = sidebar_responsive && term_w < COMPACT_TERM_WIDTH;
+    // Mobile / narrow: fully hide the rail; ☰ menu picks workspaces instead.
+    let sidebar_width = if compact {
+        0
+    } else {
+        sidebar_width(sidebar_collapsed, sidebar_expanded)
+    };
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(sidebar_width), Constraint::Min(10)])
@@ -2853,11 +3013,17 @@ fn draw(
         return;
     };
 
+    if sidebar_width > 0 {
     let sidebar_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(chunks[0]);
-    let sidebar_title = if sidebar_collapsed { " vm " } else { " vmux " };
+    // Collapsed rail: show burger glyph so click-to-open is discoverable.
+    let sidebar_title = if sidebar_collapsed {
+        " ☰ "
+    } else {
+        " vmux "
+    };
     frame.render_widget(
         Paragraph::new(sidebar_title).style(
             Style::default()
@@ -2905,6 +3071,7 @@ fn draw(
         )
         .style(Style::default().fg(palette.text).bg(palette.background));
     frame.render_widget(sidebar, sidebar_chunks[1]);
+    } // end sidebar_width > 0
 
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3024,6 +3191,7 @@ fn draw(
                 theme,
                 workspace_second_line,
                 sidebar_collapsed,
+                sidebar_responsive,
                 sidebar_width: sidebar_expanded,
                 prefix_label,
                 scroll_step,
@@ -3042,6 +3210,15 @@ fn draw(
                 mobile_relay_allow_cgnat,
                 selected: settings_selected,
             },
+        ),
+        UiMode::WorkspacePicker => draw_workspace_picker(
+            frame,
+            main_chunks[0],
+            snapshot,
+            workspace_picker_selected,
+            theme,
+            status_markers,
+            compact,
         ),
         UiMode::ContextMenu => draw_context_menu(
             frame,
@@ -3231,6 +3408,113 @@ fn draw_settings(frame: &mut ratatui::Frame, area: Rect, view: SettingsView<'_>)
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Full-screen (main area) workspace list — mobile-style ☰ menu.
+fn draw_workspace_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &Session,
+    selected: usize,
+    theme: UiTheme,
+    status_markers: &str,
+    compact: bool,
+) {
+    let palette = theme.palette();
+    let title = if compact {
+        " ☰ workspaces · j/k · Enter · Esc "
+    } else {
+        " ☰ workspaces "
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if snapshot.workspaces.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no workspaces)",
+            Style::default().fg(palette.muted),
+        )));
+    }
+    for (index, ws) in snapshot.workspaces.iter().enumerate() {
+        let active = index == selected;
+        let is_current = ws.id == snapshot.active_workspace;
+        let marker = if is_current { "●" } else { "○" };
+        let pin = if ws.pinned { "📌 " } else { "" };
+        let status = workspace_status_summary(snapshot, &ws.id, status_markers);
+        let label = format!(
+            " {marker} {pin}{}  {}",
+            ws.name,
+            if status.is_empty() {
+                String::new()
+            } else {
+                format!(" {status}")
+            }
+        );
+        let style = if active {
+            selected_row_style(palette)
+        } else if is_current {
+            Style::default()
+                .fg(palette.active)
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.text).bg(palette.surface)
+        };
+        lines.push(Line::from(Span::styled(label, style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ select · Enter open · Esc close · ☰ menu toggles",
+        Style::default().fg(palette.muted),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block(title, palette))
+            .style(Style::default().fg(palette.text).bg(palette.surface)),
+        area,
+    );
+}
+
+fn workspace_status_summary(snapshot: &Session, workspace_id: &str, markers: &str) -> String {
+    // Reuse sidebar agent tally for the workspace when possible.
+    let Some(ws) = snapshot.workspaces.iter().find(|w| w.id == workspace_id) else {
+        return String::new();
+    };
+    let mut busy = 0usize;
+    let mut attention = 0usize;
+    let mut done = 0usize;
+    for pane_id in &ws.panes {
+        let Some(pane) = snapshot.panes.get(pane_id) else {
+            continue;
+        };
+        match status_label(&pane.agent_status) {
+            "busy" => busy += 1,
+            "attention" => attention += 1,
+            "done" => done += 1,
+            _ if pane.notification_message.is_some() => attention += 1,
+            _ => {}
+        }
+    }
+    let ascii = markers.eq_ignore_ascii_case("ascii");
+    if attention > 0 {
+        if ascii {
+            format!("?{attention}")
+        } else {
+            format!("🙋{attention}")
+        }
+    } else if busy > 0 {
+        if ascii {
+            format!("*{busy}")
+        } else {
+            format!("🔄{busy}")
+        }
+    } else if done > 0 {
+        if ascii {
+            format!("+{done}")
+        } else {
+            format!("✅{done}")
+        }
+    } else {
+        String::new()
+    }
 }
 
 fn draw_context_menu(
@@ -4542,7 +4826,14 @@ fn workspace_tab_bar_hit(
 fn control_buttons() -> Vec<ControlButton> {
     // Icons use emoji presentation (VS16 where needed) so every glyph is
     // double-width — avoids the uneven gaps from mixed 1-cell / 2-cell symbols.
+    // Note: ☰ is typically single-width in terminals; keep a short label.
     vec![
+        ControlButton {
+            // Burger / workspace menu (double-width emoji for control-bar alignment).
+            icon: "📱",
+            label: "menu",
+            action: ControlAction::Workspaces,
+        },
         ControlButton {
             icon: "📁",
             label: "workspace",
@@ -4668,6 +4959,7 @@ fn control_button_style(
         (UiMode::Commands, ControlAction::Commands)
             | (UiMode::Notifications, ControlAction::Notifications)
             | (UiMode::Settings, ControlAction::Settings)
+            | (UiMode::WorkspacePicker, ControlAction::Workspaces)
     ) || matches!(
         (confirm.map(|pending| &pending.action), button.action),
         (
@@ -4701,7 +4993,7 @@ fn control_button_style(
             ControlAction::Notifications => {
                 Style::default().fg(palette.warning).bg(palette.surface)
             }
-            ControlAction::Commands | ControlAction::Settings => {
+            ControlAction::Commands | ControlAction::Settings | ControlAction::Workspaces => {
                 Style::default().fg(palette.command).bg(palette.surface)
             }
         }
@@ -6518,6 +6810,9 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
         UiMode::Settings => {
             format!("{base} settings j/k select h/l or Enter change/install Esc close ")
         }
+        UiMode::WorkspacePicker => {
+            format!("{base} ☰ workspaces j/k select Enter open Esc close ")
+        }
         UiMode::ContextMenu => format!("{base} pane-menu j/k select Enter run Esc close "),
     }
 }
@@ -7027,6 +7322,7 @@ enum SettingsEntryId {
     Theme,
     WorkspaceLine,
     Sidebar,
+    SidebarResponsive,
     SidebarWidth,
     PrefixKey,
     ScrollStep,
@@ -7068,6 +7364,10 @@ fn settings_entries() -> Vec<SettingsEntry> {
         SettingsEntry {
             id: SettingsEntryId::Sidebar,
             name: "sidebar",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::SidebarResponsive,
+            name: "responsive layout",
         },
         SettingsEntry {
             id: SettingsEntryId::SidebarWidth,
@@ -7160,6 +7460,7 @@ struct SettingsView<'a> {
     theme: UiTheme,
     workspace_second_line: UiWorkspaceSecondLine,
     sidebar_collapsed: bool,
+    sidebar_responsive: bool,
     sidebar_width: u16,
     prefix_label: &'a str,
     scroll_step: usize,
@@ -7195,6 +7496,13 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         "collapsed".to_string()
                     } else {
                         "expanded".to_string()
+                    }
+                }
+                SettingsEntryId::SidebarResponsive => {
+                    if view.sidebar_responsive {
+                        "on · hide sidebar when narrow (<90)".to_string()
+                    } else {
+                        "off · always show sidebar".to_string()
                     }
                 }
                 SettingsEntryId::SidebarWidth => {
@@ -7583,6 +7891,8 @@ mod tests {
                     4399,
                     false,
                     true,
+                    false, // keep sidebar visible in unit tests (not compact-hidden)
+                    0,
                 )
             })
             .unwrap();
@@ -7655,6 +7965,8 @@ mod tests {
                     4399,
                     false,
                     true,
+                    false, // keep sidebar visible in unit tests (not compact-hidden)
+                    0,
                 )
             })
             .unwrap();
@@ -8086,6 +8398,11 @@ mod tests {
         }
         assert_eq!(
             control_buttons()[0].label,
+            "menu",
+            "workspace menu (burger) is first on the control bar"
+        );
+        assert_eq!(
+            control_buttons()[1].label,
             "workspace",
             "new-workspace button uses a clear label"
         );
@@ -9088,6 +9405,7 @@ mod tests {
             theme: UiTheme::Daylight,
             workspace_second_line: UiWorkspaceSecondLine::Path,
             sidebar_collapsed: false,
+            sidebar_responsive: true,
             sidebar_width: 24,
             prefix_label: "Ctrl-b",
             scroll_step: 5,
@@ -9115,8 +9433,12 @@ mod tests {
             .as_ref()
             .contains("workspace line"));
         assert!(lines[2].spans[0].content.as_ref().contains("sidebar"));
-        assert!(lines[3].spans[0].content.as_ref().contains("sidebar width"));
-        assert!(lines[3].spans[0].content.as_ref().contains("24"));
+        assert!(lines[3].spans[0]
+            .content
+            .as_ref()
+            .contains("responsive layout"));
+        assert!(lines[4].spans[0].content.as_ref().contains("sidebar width"));
+        assert!(lines[4].spans[0].content.as_ref().contains("24"));
         assert!(lines.iter().any(|line| {
             line.spans
                 .first()

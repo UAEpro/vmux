@@ -202,11 +202,23 @@ Default prefix is **`Ctrl-b`** (configurable via `vmux config set ui.prefix_key`
 | `Ctrl-b G` | Agent / status panel |
 | `Ctrl-b P` | Command palette + agent controls |
 | `Ctrl-b A` | Project actions (`vmux.json`) |
+| `Ctrl-b w` / **📱 menu** | Open **☰ workspace picker** (mobile-friendly) |
+| `Ctrl-b B` | Toggle sidebar (or open picker when terminal is narrow) |
 | Mouse wheel | Scrollback |
 | Right-click pane | Context menu (copy, paste, split, clear) |
 | Right-click workspace | Toggle pin |
 | Control bar **Detach** | Detach (far right) without stopping the daemon |
-| **⚙ set** / Settings | Theme, sidebar, cursor blink, hook install status |
+| **⚙ set** / Settings | Theme, sidebar, responsive layout, cursor, hooks |
+
+### Responsive / mobile-friendly layout
+
+On **narrow terminals** (&lt; 90 columns) the workspace sidebar **auto-hides** so panes get the full width (like a responsive web layout). Open workspaces via:
+
+- Control bar **📱 menu** (burger / workspace list)
+- `Ctrl-b` then `w`
+- Settings → **responsive layout** (on by default)
+
+The picker is a full list: **j/k** or arrows, **Enter** to switch, **Esc** to close.
 
 ---
 
