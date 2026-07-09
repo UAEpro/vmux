@@ -65,7 +65,11 @@ fn parse_key_code(key: &str) -> Result<KeyCode> {
         "insert" | "ins" => KeyCode::Insert,
         "delete" | "del" => KeyCode::Delete,
         "space" => KeyCode::Char(' '),
-        _ if lower.starts_with('f') => {
+        // Function keys F1–F12… require "f" + digits (not the letter "f" alone).
+        _ if lower.len() > 1
+            && lower.starts_with('f')
+            && lower[1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
             let n = lower[1..]
                 .parse::<u8>()
                 .map_err(|_| anyhow!("unknown key {key}"))?;
@@ -165,11 +169,23 @@ fn modified_tilde(number: u8, modifiers: KeyModifiers) -> String {
 }
 
 fn function_key(n: u8, modifiers: KeyModifiers) -> Option<String> {
+    // Unmodified F1–F4 use SS3 (ESC O P..S) per terminfo/xterm, not CSI [P..S]
+    // (which is DCH and friends). Modified F-keys use CSI 1;mod P..S.
+    if (1..=4).contains(&n) {
+        let letter = match n {
+            1 => 'P',
+            2 => 'Q',
+            3 => 'R',
+            4 => 'S',
+            _ => unreachable!(),
+        };
+        return Some(if let Some(mod_code) = modifier_code(modifiers) {
+            format!("\x1b[1;{mod_code}{letter}")
+        } else {
+            format!("\x1bO{letter}")
+        });
+    }
     let base = match n {
-        1 => return Some(modified_csi("P", modifiers)),
-        2 => return Some(modified_csi("Q", modifiers)),
-        3 => return Some(modified_csi("R", modifiers)),
-        4 => return Some(modified_csi("S", modifiers)),
         5 => 15,
         6 => 17,
         7 => 18,
@@ -214,6 +230,23 @@ fn modifier_code(modifiers: KeyModifiers) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letter_f_is_not_parsed_as_function_key() {
+        assert_eq!(
+            encode_key_spec("f").unwrap(),
+            key_to_input(KeyCode::Char('f'), KeyModifiers::empty()).unwrap()
+        );
+        assert!(encode_key_spec("ctrl+f").is_ok());
+        assert_eq!(
+            key_to_input(KeyCode::F(1), KeyModifiers::empty()).as_deref(),
+            Some("\x1bOP")
+        );
+        assert_eq!(
+            key_to_input(KeyCode::F(4), KeyModifiers::empty()).as_deref(),
+            Some("\x1bOS")
+        );
+    }
 
     #[test]
     fn maps_common_navigation_keys_to_escape_sequences() {

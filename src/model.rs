@@ -193,7 +193,7 @@ impl Session {
 
         {
             let source = &mut self.workspaces[source_index];
-            source.remove_pane_from_active(pane);
+            source.remove_pane_anywhere(pane);
         }
 
         {
@@ -223,18 +223,39 @@ impl Session {
         if !self.panes.contains_key(second) {
             return Err(format!("unknown pane {second}"));
         }
-        // Prefer the active tab of a workspace that contains both; fall back to
-        // any tab that holds both (for multi-tab workspaces).
+        // Prefer active tab that has both; else any tab that holds both.
         let Some(index) = self.workspaces.iter().position(|workspace| {
             workspace.panes.iter().any(|pane| pane == first)
                 && workspace.panes.iter().any(|pane| pane == second)
+        })
+        .or_else(|| {
+            self.workspaces.iter().position(|workspace| {
+                workspace.tabs.iter().any(|tab| {
+                    tab.panes.iter().any(|p| p == first) && tab.panes.iter().any(|p| p == second)
+                })
+            })
         }) else {
             return Err(format!(
-                "panes {first} and {second} are not in the same active tab"
+                "panes {first} and {second} are not in the same workspace tab"
             ));
         };
 
         let workspace = &mut self.workspaces[index];
+        // If both panes are only on a background tab, switch live view there first.
+        if !(workspace.panes.iter().any(|p| p == first)
+            && workspace.panes.iter().any(|p| p == second))
+        {
+            if let Some(tab_id) = workspace
+                .tabs
+                .iter()
+                .find(|tab| {
+                    tab.panes.iter().any(|p| p == first) && tab.panes.iter().any(|p| p == second)
+                })
+                .map(|t| t.id.clone())
+            {
+                let _ = workspace.switch_tab(&tab_id);
+            }
+        }
         for pane in &mut workspace.panes {
             if pane == first {
                 *pane = second.to_string();
@@ -275,24 +296,20 @@ impl Session {
             {
                 continue;
             }
-            let exited = workspace_item
-                .panes
-                .iter()
+            // Collect exited panes across every tab (not only the live view).
+            let candidates: Vec<String> = workspace_item
+                .all_pane_ids()
+                .into_iter()
+                .map(|s| s.to_string())
                 .filter(|pane_id| {
                     self.panes
-                        .get(*pane_id)
+                        .get(pane_id)
                         .map(|pane| matches!(pane.status, PaneStatus::Exited))
                         .unwrap_or(false)
                 })
-                .cloned()
-                .collect::<Vec<_>>();
-            for pane_id in exited {
-                workspace_item.panes.retain(|item| item != &pane_id);
-                workspace_item.layout =
-                    remove_pane_from_layout(workspace_item.layout.take(), &pane_id);
-                if workspace_item.active_pane.as_deref() == Some(&pane_id) {
-                    workspace_item.active_pane = workspace_item.first_pane();
-                }
+                .collect();
+            for pane_id in candidates {
+                workspace_item.remove_pane_anywhere(&pane_id);
                 remove_ids.push(pane_id);
             }
         }
@@ -567,6 +584,42 @@ impl Workspace {
         if self.zoomed_pane.as_deref() == Some(pane) {
             self.zoomed_pane = None;
         }
+        self.flush_active_tab();
+    }
+
+    /// Remove a pane from every tab (and the live view), then re-sync the active tab.
+    pub fn remove_pane_anywhere(&mut self, pane: &str) {
+        // Push live view into the active tab first so we don't re-hydrate stale tab data.
+        self.flush_active_tab();
+        for tab in &mut self.tabs {
+            tab.panes.retain(|item| item != pane);
+            tab.layout = remove_pane_from_layout(tab.layout.take(), pane);
+            if tab.active_pane.as_deref() == Some(pane) {
+                tab.active_pane = tab.panes.first().cloned();
+            }
+            if tab.zoomed_pane.as_deref() == Some(pane) {
+                tab.zoomed_pane = None;
+            }
+        }
+        // Re-hydrate live view from the updated active tab.
+        if let Some(tab_id) = self.active_tab.clone() {
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id).cloned() {
+                self.panes = tab.panes;
+                self.active_pane = tab.active_pane;
+                self.zoomed_pane = tab.zoomed_pane;
+                self.layout = tab.layout;
+            }
+        } else {
+            self.panes.retain(|item| item != pane);
+            self.layout = remove_pane_from_layout(self.layout.take(), pane);
+            if self.active_pane.as_deref() == Some(pane) {
+                self.active_pane = self.first_pane();
+            }
+            if self.zoomed_pane.as_deref() == Some(pane) {
+                self.zoomed_pane = None;
+            }
+        }
+        self.ensure_layout();
         self.flush_active_tab();
     }
 
@@ -1124,6 +1177,10 @@ pub fn merge_agent_status(
             }
             (AgentStatus::Attention, AgentStatus::Idle | AgentStatus::Unknown) => {
                 (AgentStatus::Attention, false)
+            }
+            // Keep ❌ sticky through idle redraws (shell prompt after traceback).
+            (AgentStatus::Error, AgentStatus::Idle | AgentStatus::Unknown) => {
+                (AgentStatus::Error, false)
             }
             (_, next) => (next, false),
         };

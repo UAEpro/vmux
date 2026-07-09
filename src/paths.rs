@@ -1,16 +1,62 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 pub fn runtime_dir() -> Result<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/vmux-{}", unsafe { libc_getuid() })))
         .join("vmux");
-    fs::create_dir_all(&dir).with_context(|| format!("create runtime dir {}", dir.display()))?;
+    ensure_private_dir(&dir)?;
     Ok(dir)
+}
+
+/// Create `dir` mode 0700 if missing; if it exists, require a real directory
+/// owned by the current uid with no group/other access (tmux-style).
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("create private dir {}", dir.display()))?;
+    }
+    let meta = fs::symlink_metadata(dir)
+        .with_context(|| format!("stat runtime dir {}", dir.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to use runtime dir {}: path is a symlink",
+            dir.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "refusing to use runtime dir {}: not a directory",
+            dir.display()
+        );
+    }
+    let uid = unsafe { libc_getuid() };
+    if meta.uid() != uid {
+        bail!(
+            "refusing to use runtime dir {}: owned by uid {}, expected {}",
+            dir.display(),
+            meta.uid(),
+            uid
+        );
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        // Tighten in place when safe (we own it).
+        let mut perms = meta.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        fs::set_permissions(dir, perms)
+            .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Validate a session name before it is turned into a filesystem path.
@@ -54,7 +100,7 @@ pub fn state_dir() -> Result<PathBuf> {
     let dir = dirs::state_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
         .join("vmux");
-    fs::create_dir_all(&dir).with_context(|| format!("create state dir {}", dir.display()))?;
+    ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -67,7 +113,7 @@ pub fn config_dir() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
         .join("vmux");
-    fs::create_dir_all(&dir).with_context(|| format!("create config dir {}", dir.display()))?;
+    ensure_private_dir(&dir)?;
     Ok(dir)
 }
 

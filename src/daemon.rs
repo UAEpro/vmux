@@ -164,6 +164,12 @@ fn ignore_hangup_signal() -> Result<()> {
 }
 
 pub fn serve_foreground(session: &str) -> Result<()> {
+    if is_running(session) {
+        anyhow::bail!(
+            "session {session:?} is already running (socket reachable). \
+             Use `vmux --session {session} stop` first, or attach instead of daemon --foreground"
+        );
+    }
     let server = Arc::new(Server::load(session)?);
     server.restore_saved_panes()?;
     server.ensure_initial_pane()?;
@@ -993,18 +999,23 @@ impl Server {
                 .workspaces
                 .iter()
                 .flat_map(|workspace| {
-                    workspace.panes.iter().filter_map(|pane_id| {
-                        let pane = session.panes.get(pane_id)?;
-                        if matches!(pane.status, PaneStatus::Restored) {
-                            Some((
-                                pane_id.clone(),
-                                workspace.id.clone(),
-                                PathBuf::from(&workspace.cwd),
-                            ))
-                        } else {
-                            None
-                        }
-                    })
+                    // Restore panes on every tab, not only the active-tab live view.
+                    workspace
+                        .all_pane_ids()
+                        .into_iter()
+                        .filter_map(|pane_id| {
+                            let pane = session.panes.get(pane_id)?;
+                            if matches!(pane.status, PaneStatus::Restored) {
+                                Some((
+                                    pane_id.to_string(),
+                                    workspace.id.clone(),
+                                    PathBuf::from(&workspace.cwd),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         };
@@ -1037,6 +1048,28 @@ impl Server {
                 self.log(&format!("restore pane {pane_id} failed: {err:#}"))
                     .ok();
                 continue;
+            }
+            // Seed runtime scrollback so the first PTY append does not wipe history.
+            let seed = if !old_scrollback.is_empty() {
+                old_scrollback.clone()
+            } else {
+                old_output.clone()
+            };
+            if !seed.is_empty() {
+                let runtime_key = active_runtime_key_for_pane(&pane);
+                let mut runtimes = self.panes.lock_or_recover();
+                let key = if runtimes.contains_key(&runtime_key) {
+                    runtime_key
+                } else {
+                    pane_id.clone()
+                };
+                if let Some(runtime) = runtimes.get_mut(&key) {
+                    runtime.push_output(seed.clone());
+                    runtime.parser.process(seed.as_bytes());
+                    runtime.pane.output = seed.clone();
+                    runtime.pane.scrollback = seed;
+                    runtime.pane.scrollback_formatted = old_scrollback_formatted.clone();
+                }
             }
             pane.output = old_output;
             pane.scrollback = old_scrollback;
@@ -1495,8 +1528,10 @@ impl Server {
                 .map_err(anyhow::Error::msg)?
         };
 
-        for pane in &closed.panes {
-            self.remove_pane_runtimes(pane);
+        // Close every pane in every tab of the workspace — not only the active
+        // tab's live `panes` view (improve.md #3).
+        for pane in closed.all_pane_ids() {
+            self.remove_pane_runtimes(&pane);
         }
 
         self.save()?;

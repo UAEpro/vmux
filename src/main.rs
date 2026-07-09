@@ -852,7 +852,16 @@ fn hook_source_line(path: &std::path::Path) -> String {
 }
 
 fn append_hook_source_once(path: &std::path::Path, source_line: &str) -> Result<()> {
-    let existing = fs::read_to_string(path).unwrap_or_default();
+    // Only treat missing file as empty. Other I/O/decode errors must not wipe
+    // the user's rc (improve.md #5 — non-UTF-8 bashrc was truncated).
+    let existing = match fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("read shell rc {}", path.display())));
+        }
+    };
     if existing.lines().any(|line| line.trim() == source_line) {
         return Ok(());
     }
@@ -1819,6 +1828,10 @@ fn normalize_agent_names(agents: Vec<String>) -> Result<Vec<String>> {
 fn write_agent_team_file(cwd: &std::path::Path, agents: &[String]) -> Result<String> {
     fs::create_dir_all(cwd)?;
     let path = cwd.join("AGENTS.md");
+    // Never clobber an existing project AGENTS.md (improve.md #6).
+    if path.exists() {
+        return Ok(path.display().to_string());
+    }
     fs::write(&path, agent_team_markdown(agents))?;
     Ok(path.display().to_string())
 }

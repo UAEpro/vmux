@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
     about = "vmux — the Linux terminal born from the cmux revolution"
 )]
 pub struct Cli {
-    #[arg(long, env = "VMUX_SESSION", default_value = "default")]
+    #[arg(long, env = "VMUX_SESSION", default_value = "default", global = true)]
     pub session: String,
 
     #[command(subcommand)]

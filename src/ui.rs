@@ -58,22 +58,21 @@ pub fn attach(session: &str) -> Result<()> {
 /// `Drop` disables raw mode and leaves the alternate screen (and disables mouse
 /// capture), so every early-return and unwind path restores the shell. Drop is
 /// the only cleanup, so there is no double-teardown on the happy path.
-struct TerminalGuard {
-    mouse: bool,
-}
+struct TerminalGuard;
 
 impl TerminalGuard {
     fn new(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         // Construct the guard immediately after enabling raw mode so that if
         // entering the alternate screen fails, Drop still restores raw mode.
-        let guard = Self { mouse };
+        let guard = Self;
         execute!(
             io::stdout(),
             EnterAlternateScreen,
             // Steady block; vmux software-blinks only the active pane caret.
             SetCursorStyle::SteadyBlock,
         )?;
+        execute!(io::stdout(), event::EnableBracketedPaste)?;
         if mouse {
             execute!(io::stdout(), event::EnableMouseCapture)?;
         }
@@ -85,11 +84,11 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Best-effort restore; ignore errors since we may be unwinding. Leaving
         // the alternate screen / disabling mouse capture is harmless even if
-        // entering it never succeeded.
+        // entering it never succeeded. Always disable mouse/paste — Settings
+        // may have toggled capture after construction (improve.md #20).
         let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
-        if self.mouse {
-            let _ = execute!(io::stdout(), event::DisableMouseCapture);
-        }
+        let _ = execute!(io::stdout(), event::DisableMouseCapture);
+        let _ = execute!(io::stdout(), event::DisableBracketedPaste);
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
@@ -1164,27 +1163,34 @@ impl Ui {
                 }
                 MouseEventKind::Moved => self.update_hover(mouse.column, mouse.row)?,
                 MouseEventKind::ScrollUp => {
-                    self.pane_size_control_requested = true;
-                    if self.scroll_sidebar(mouse.column, -1) {
-                    } else if !self.forward_mouse_to_pane(
-                        mouse.column,
-                        mouse.row,
-                        MouseButtonCode::WheelUp,
-                        true,
-                    )? {
-                        self.scroll_at(mouse.column, mouse.row, self.scroll_step as isize)?
+                    if !matches!(self.mode, UiMode::Panes) {
+                        // Don't scroll panes under overlays.
+                    } else {
+                        self.pane_size_control_requested = true;
+                        if self.scroll_sidebar(mouse.column, -1) {
+                        } else if !self.forward_mouse_to_pane(
+                            mouse.column,
+                            mouse.row,
+                            MouseButtonCode::WheelUp,
+                            true,
+                        )? {
+                            self.scroll_at(mouse.column, mouse.row, self.scroll_step as isize)?
+                        }
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    self.pane_size_control_requested = true;
-                    if self.scroll_sidebar(mouse.column, 1) {
-                    } else if !self.forward_mouse_to_pane(
-                        mouse.column,
-                        mouse.row,
-                        MouseButtonCode::WheelDown,
-                        true,
-                    )? {
-                        self.scroll_at(mouse.column, mouse.row, -(self.scroll_step as isize))?
+                    if !matches!(self.mode, UiMode::Panes) {
+                    } else {
+                        self.pane_size_control_requested = true;
+                        if self.scroll_sidebar(mouse.column, 1) {
+                        } else if !self.forward_mouse_to_pane(
+                            mouse.column,
+                            mouse.row,
+                            MouseButtonCode::WheelDown,
+                            true,
+                        )? {
+                            self.scroll_at(mouse.column, mouse.row, -(self.scroll_step as isize))?
+                        }
                     }
                 }
                 _ => {}
@@ -1773,9 +1779,21 @@ impl Ui {
             }
             SettingsEntryId::MobileRelay => {
                 self.mobile_relay_enabled = !self.mobile_relay_enabled;
-                self.save_ui_config("relay.enabled", &self.mobile_relay_enabled.to_string())?;
-                let msg = crate::relay::apply_enabled(&self.session, &self.relay_settings())?;
-                *self.action_error.get_mut() = Some(msg);
+                if let Err(err) =
+                    self.save_ui_config("relay.enabled", &self.mobile_relay_enabled.to_string())
+                {
+                    *self.action_error.get_mut() = Some(format!("save config: {err:#}"));
+                }
+                // Never fail attach on relay start/stop (improve.md #14).
+                let settings = self.relay_settings();
+                let session = self.session.clone();
+                match crate::relay::apply_enabled(&session, &settings) {
+                    Ok(msg) => *self.action_error.get_mut() = Some(msg),
+                    Err(err) => {
+                        *self.action_error.get_mut() =
+                            Some(format!("mobile relay error: {err:#}"));
+                    }
+                }
             }
             SettingsEntryId::MobileRelayBind => {
                 let next = crate::config::cycle_choice(
@@ -1784,25 +1802,35 @@ impl Ui {
                     delta,
                 );
                 self.mobile_relay_bind = next.clone();
-                self.save_ui_config("relay.bind", &next)?;
-                // Restart managed relay with new bind if enabled.
+                let _ = self.save_ui_config("relay.bind", &next);
                 if self.mobile_relay_enabled {
+                    let settings = self.relay_settings();
+                    let session = self.session.clone();
                     let _ = crate::relay::stop_managed();
-                    let msg = crate::relay::ensure_started(&self.session, &self.relay_settings())?;
-                    if let Some(msg) = msg {
-                        *self.action_error.get_mut() = Some(msg);
+                    match crate::relay::ensure_started(&session, &settings) {
+                        Ok(Some(msg)) => *self.action_error.get_mut() = Some(msg),
+                        Ok(None) => {}
+                        Err(err) => {
+                            *self.action_error.get_mut() =
+                                Some(format!("mobile relay error: {err:#}"));
+                        }
                     }
                 }
             }
             SettingsEntryId::MobileRelayLocalhost => {
                 self.mobile_relay_allow_localhost = !self.mobile_relay_allow_localhost;
-                self.save_ui_config(
+                let _ = self.save_ui_config(
                     "relay.allow_localhost",
                     &self.mobile_relay_allow_localhost.to_string(),
-                )?;
+                );
                 if self.mobile_relay_enabled {
+                    let settings = self.relay_settings();
+                    let session = self.session.clone();
                     let _ = crate::relay::stop_managed();
-                    let _ = crate::relay::ensure_started(&self.session, &self.relay_settings())?;
+                    if let Err(err) = crate::relay::ensure_started(&session, &settings) {
+                        *self.action_error.get_mut() =
+                            Some(format!("mobile relay error: {err:#}"));
+                    }
                 }
             }
             SettingsEntryId::HookShell
@@ -2507,6 +2535,11 @@ impl Ui {
             self.pane_resize_drag = None;
             self.last_click = None;
             return self.run_control_action(action);
+        }
+        // Overlays (settings/commands/picker/…) own the main area — do not
+        // let clicks fall through to hidden pane × buttons (improve.md #19).
+        if !matches!(self.mode, UiMode::Panes) {
+            return Ok(false);
         }
         if self.mode == UiMode::Panes && self.active_workspace_is_empty() {
             let area = pane_area(self.sidebar_collapsed, self.sidebar_width, width, height);
