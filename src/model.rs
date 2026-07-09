@@ -575,18 +575,6 @@ impl Workspace {
         ids
     }
 
-    pub fn remove_pane_from_active(&mut self, pane: &str) {
-        self.panes.retain(|item| item != pane);
-        self.layout = remove_pane_from_layout(self.layout.take(), pane);
-        if self.active_pane.as_deref() == Some(pane) {
-            self.active_pane = self.first_pane();
-        }
-        if self.zoomed_pane.as_deref() == Some(pane) {
-            self.zoomed_pane = None;
-        }
-        self.flush_active_tab();
-    }
-
     /// Remove a pane from every tab (and the live view), then re-sync the active tab.
     pub fn remove_pane_anywhere(&mut self, pane: &str) {
         // Push live view into the active tab first so we don't re-hydrate stale tab data.

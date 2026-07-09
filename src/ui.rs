@@ -5119,16 +5119,7 @@ fn control_bar_layout(area: Rect, scroll: usize) -> ControlBarLayout {
     }
 }
 
-fn control_button_rects(area: Rect, scroll: usize) -> Vec<(ControlAction, Rect)> {
-    let layout = control_bar_layout(area, scroll);
-    let mut rects = layout.buttons;
-    if let Some(d) = layout.detach {
-        rects.push(d);
-    }
-    rects
-}
-
-/// Hit-test including scroll arrows. Returns action, or special scroll deltas via Option.
+/// Hit-test including scroll arrows.
 enum ControlBarHit {
     Action(ControlAction),
     ScrollLeft,
@@ -5173,6 +5164,8 @@ fn control_bar_hit_at(
     None
 }
 
+/// Test helper: hit-test with scroll offset 0.
+#[cfg(test)]
 fn control_action_at(
     sidebar_collapsed: bool,
     sidebar_expanded: u16,
@@ -5181,7 +5174,6 @@ fn control_action_at(
     column: u16,
     row: u16,
 ) -> Option<ControlAction> {
-    // Legacy helper used by tests — no scroll offset.
     match control_bar_hit_at(
         sidebar_collapsed,
         sidebar_expanded,
@@ -7663,21 +7655,6 @@ fn context_menu_lines(selected: usize, pane: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-fn metadata_summary(metadata: &BTreeMap<String, String>) -> Option<String> {
-    if metadata.is_empty() {
-        return None;
-    }
-    Some(
-        metadata
-            .iter()
-            .take(3)
-            .map(|(key, value)| format!("{}={}", trim_label(key, 12), trim_label(value, 18)))
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
-}
-
 fn notification_workspace<'a>(
     snapshot: &'a Session,
     note: &crate::model::Notification,
@@ -8593,6 +8570,7 @@ mod tests {
             && (s.style.bg.is_some() || s.style.add_modifier.contains(Modifier::BOLD))));
     }
 
+    #[test]
     fn confirm_mode_renders_pending_prompt() {
         let session = mouse_test_session();
         let pending = pending_close_for_pane(&session, "pane-2").expect("pending confirm");
