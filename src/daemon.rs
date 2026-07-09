@@ -349,6 +349,9 @@ struct Server {
     // Serializes state-file writes so concurrent handlers can't interleave
     // writes into a shared temp file or race the rename (finding 11).
     save_lock: Mutex<u64>,
+    /// Debounced persistence: PTY reader threads set this; a background writer
+    /// flushes within ~500ms instead of blocking on every OSC notification.
+    save_dirty: std::sync::atomic::AtomicBool,
     // Only one attached UI should drive PTY dimensions at a time. Without this,
     // a small phone terminal and a large desktop terminal can resize the same
     // panes back and forth on every refresh.
@@ -426,6 +429,7 @@ impl Server {
             next_workspace: Mutex::new(next_workspace),
             next_runtime: Mutex::new(1),
             save_lock: Mutex::new(0),
+            save_dirty: std::sync::atomic::AtomicBool::new(false),
             pane_size_owner: Mutex::new(None),
         })
     }
@@ -438,6 +442,11 @@ impl Server {
             // so the snapshot hot loop only ever reads cached values.
             let server = Arc::clone(&self);
             thread::spawn(move || server.refresh_workspace_meta_loop());
+        }
+        {
+            // Debounced state writer (improve.md #37).
+            let server = Arc::clone(&self);
+            thread::spawn(move || server.save_loop());
         }
         if self.socket_path.exists() {
             fs::remove_file(&self.socket_path).ok();
@@ -2566,11 +2575,14 @@ impl Server {
                 .or_else(|| panes.get(&pane_id))
                 .map(|runtime| {
                     let raw = runtime.joined_output();
+                    let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
                     let mut value = serde_json::json!({
                         "pane": pane_id,
                         "screen": runtime.parser.screen().contents(),
                         "rows": runtime.size.rows,
                         "cols": runtime.size.cols,
+                        "cursor_row": cursor_row,
+                        "cursor_col": cursor_col,
                     });
                     if include_scrollback {
                         value["scrollback"] = serde_json::json!(trim_output(raw, limit));
@@ -2967,7 +2979,26 @@ impl Server {
             }
         }
         if should_save {
-            self.save().ok();
+            self.schedule_save();
+        }
+    }
+
+    fn schedule_save(&self) {
+        self.save_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn save_loop(self: Arc<Self>) {
+        loop {
+            thread::sleep(Duration::from_millis(400));
+            if self
+                .save_dirty
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Err(err) = self.save() {
+                    self.log(&format!("debounced save failed: {err:#}")).ok();
+                }
+            }
         }
     }
 
@@ -3292,6 +3323,11 @@ impl Server {
             self.state_path
                 .with_extension(format!("json.tmp.{}.{}", std::process::id(), *counter));
         fs::write(&tmp, &payload)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
         if let Err(err) = fs::rename(&tmp, &self.state_path) {
             fs::remove_file(&tmp).ok();
             return Err(err.into());
@@ -4546,12 +4582,21 @@ fn load_custom_actions(cwd: &Path) -> Result<Option<(PathBuf, Vec<CustomAction>)
 }
 
 fn find_vmux_config(cwd: &Path) -> Option<PathBuf> {
+    // Stop at $HOME so a workspace under /tmp cannot pick up /tmp/vmux.json
+    // planted by another user (improve.md P3).
+    let home = dirs::home_dir();
     for dir in cwd.ancestors() {
         for name in ["vmux.json", ".vmux.json"] {
             let path = dir.join(name);
             if path.is_file() {
                 return Some(path);
             }
+        }
+        if home.as_ref().is_some_and(|h| dir == h) {
+            break;
+        }
+        if dir.parent().is_none() {
+            break;
         }
     }
     None

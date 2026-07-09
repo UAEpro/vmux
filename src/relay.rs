@@ -216,10 +216,14 @@ impl DeviceStore {
     fn validate_token(&self, token: &str) -> Option<String> {
         let hash = sha256_hex(token);
         let guard = self.devices.lock().expect("device store lock");
-        guard
-            .values()
-            .find(|d| d.token_hash == hash)
-            .map(|d| d.device_id.clone())
+        let mut found = None;
+        for d in guard.values() {
+            // Constant-time-ish compare on the hex hash (equal length SHA-256 hex).
+            if ct_eq_str(&d.token_hash, &hash) {
+                found = Some(d.device_id.clone());
+            }
+        }
+        found
     }
 
     fn set_apns(&self, device_id: &str, token: &str, env: &str) -> Result<()> {
@@ -1675,8 +1679,8 @@ fn read_surface_screen(socket: &Path, surface_id: &str, lines: usize) -> Result<
     let cols = data.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
     let rows_n = data.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as usize;
 
-    // Prefer cursor from list snapshot when available.
-    let (cx, cy) = pane_cursor(socket, surface_id).unwrap_or((0, 0));
+    // Cursor comes from ReadScreen itself (no second full List snapshot).
+    let (cx, cy) = pane_cursor_from_read(&data).unwrap_or((0, 0));
 
     let mut rows: Vec<String> = text
         .split('\n')
@@ -1697,13 +1701,9 @@ fn read_surface_screen(socket: &Path, surface_id: &str, lines: usize) -> Result<
     })
 }
 
-fn pane_cursor(socket: &Path, pane: &str) -> Option<(i64, i64)> {
-    let resp = protocol::request(socket, &Request::List).ok()?;
-    let data = resp.data?;
-    let panes = data.get("panes")?.as_object()?;
-    let p = panes.get(pane)?;
-    let col = p.get("cursor_col")?.as_u64()? as i64;
-    let row = p.get("cursor_row")?.as_u64()? as i64;
+fn pane_cursor_from_read(data: &Value) -> Option<(i64, i64)> {
+    let col = data.get("cursor_col")?.as_u64()? as i64;
+    let row = data.get("cursor_row")?.as_u64()? as i64;
     Some((col, row))
 }
 
@@ -2181,6 +2181,17 @@ fn sha256_hex(s: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes().iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn random_hex(bytes: usize) -> String {

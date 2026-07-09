@@ -204,6 +204,8 @@ struct Ui {
     pending_refresh: std::cell::Cell<bool>,
     /// Last keystroke/paste into a pane — keeps the caret solid (no blink) while typing.
     last_typing_at: Option<Instant>,
+    /// Horizontal scroll offset (button index) for the bottom control bar.
+    control_bar_scroll: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,6 +765,7 @@ impl Ui {
             last_snapshot_data: None,
             pending_refresh: std::cell::Cell::new(false),
             last_typing_at: None,
+            control_bar_scroll: 0,
         }
     }
 
@@ -874,6 +877,7 @@ impl Ui {
                             self.mobile_relay_allow_cgnat,
                             self.sidebar_responsive,
                             self.workspace_picker_selected,
+                            self.control_bar_scroll,
                         )
                     })?;
                 }
@@ -1163,9 +1167,14 @@ impl Ui {
                 }
                 MouseEventKind::Moved => self.update_hover(mouse.column, mouse.row)?,
                 MouseEventKind::ScrollUp => {
-                    if !matches!(self.mode, UiMode::Panes) {
+                    let (tw, th) = terminal_size()?;
+                    // Horizontal scroll when pointer is on the control bar.
+                    if th >= CONTROL_BAR_HEIGHT && mouse.row == th.saturating_sub(2) {
+                        self.control_bar_scroll = self.control_bar_scroll.saturating_sub(1);
+                    } else if !matches!(self.mode, UiMode::Panes) {
                         // Don't scroll panes under overlays.
                     } else {
+                        let _ = tw;
                         self.pane_size_control_requested = true;
                         if self.scroll_sidebar(mouse.column, -1) {
                         } else if !self.forward_mouse_to_pane(
@@ -1179,7 +1188,17 @@ impl Ui {
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if !matches!(self.mode, UiMode::Panes) {
+                    let (_tw, th) = terminal_size()?;
+                    if th >= CONTROL_BAR_HEIGHT && mouse.row == th.saturating_sub(2) {
+                        let area = Rect::new(
+                            self.layout_sidebar_cols(),
+                            th.saturating_sub(2),
+                            _tw.saturating_sub(self.layout_sidebar_cols()),
+                            1,
+                        );
+                        let max = control_bar_layout(area, self.control_bar_scroll).max_scroll;
+                        self.control_bar_scroll = (self.control_bar_scroll + 1).min(max);
+                    } else if !matches!(self.mode, UiMode::Panes) {
                     } else {
                         self.pane_size_control_requested = true;
                         if self.scroll_sidebar(mouse.column, 1) {
@@ -2523,18 +2542,38 @@ impl Ui {
             // Click outside buttons: ignore (keep dialog open).
             return Ok(false);
         }
-        if let Some(action) = control_action_at(
+        if let Some(hit) = control_bar_hit_at(
             self.sidebar_collapsed,
             self.sidebar_width,
             width,
             height,
             column,
             row,
+            self.control_bar_scroll,
         ) {
             self.sidebar_drag_workspace = None;
             self.pane_resize_drag = None;
             self.last_click = None;
-            return self.run_control_action(action);
+            match hit {
+                ControlBarHit::ScrollLeft => {
+                    self.control_bar_scroll = self.control_bar_scroll.saturating_sub(1);
+                    return Ok(false);
+                }
+                ControlBarHit::ScrollRight => {
+                    let area = Rect::new(
+                        self.layout_sidebar_cols(),
+                        height.saturating_sub(2),
+                        width.saturating_sub(self.layout_sidebar_cols()),
+                        1,
+                    );
+                    let max = control_bar_layout(area, self.control_bar_scroll).max_scroll;
+                    self.control_bar_scroll = (self.control_bar_scroll + 1).min(max);
+                    return Ok(false);
+                }
+                ControlBarHit::Action(action) => {
+                    return self.run_control_action(action);
+                }
+            }
         }
         // Overlays (settings/commands/picker/…) own the main area — do not
         // let clicks fall through to hidden pane × buttons (improve.md #19).
@@ -2654,14 +2693,18 @@ impl Ui {
 
     fn update_hover(&mut self, column: u16, row: u16) -> Result<()> {
         let (width, height) = terminal_size()?;
-        self.hover_control = control_action_at(
+        self.hover_control = match control_bar_hit_at(
             self.sidebar_collapsed,
             self.sidebar_width,
             width,
             height,
             column,
             row,
-        );
+            self.control_bar_scroll,
+        ) {
+            Some(ControlBarHit::Action(a)) => Some(a),
+            _ => None,
+        };
         let sidebar_scroll = self.sidebar_scroll;
         let list_height = height.saturating_sub(1);
         self.hover_workspace = self.snapshot.as_ref().and_then(|snapshot| {
@@ -2880,10 +2923,16 @@ impl Ui {
         let snapshot = self.snapshot.as_ref()?;
         let pane = snapshot.panes.get(&selection.pane)?;
         let area = self.pane_area_by_id(&selection.pane).ok().flatten()?;
+        let scroll_offset = self
+            .scroll_offsets
+            .get(&selection.pane)
+            .copied()
+            .unwrap_or(0);
         selected_text_from_pane(
             pane,
             pane_content_area(area, pane_has_tab_strip(pane)),
             selection,
+            scroll_offset,
         )
     }
 
@@ -3026,6 +3075,7 @@ fn draw(
     mobile_relay_allow_cgnat: bool,
     sidebar_responsive: bool,
     workspace_picker_selected: usize,
+    control_bar_scroll: usize,
 ) {
     let palette = theme.palette();
     let term_w = frame.size().width;
@@ -3268,7 +3318,15 @@ fn draw(
     if let Some(dialog) = rename {
         draw_rename_overlay(frame, main_chunks[0], dialog, theme);
     }
-    draw_control_bar(frame, main_chunks[1], mode, confirm, hover_control, theme);
+    draw_control_bar(
+        frame,
+        main_chunks[1],
+        mode,
+        confirm,
+        hover_control,
+        theme,
+        control_bar_scroll,
+    );
     frame.render_widget(
         Paragraph::new(session_footer_with_modals(
             snapshot,
@@ -4924,47 +4982,148 @@ fn detach_control_button() -> ControlButton {
     }
 }
 
-fn control_button_rects(area: Rect) -> Vec<(ControlAction, Rect)> {
+/// Width of the ◀ / ▶ scroll affordances on the control bar.
+const CONTROL_SCROLL_BTN_W: u16 = 3;
+
+/// Layout result for the scrollable control bar (left buttons + optional arrows).
+struct ControlBarLayout {
+    /// Buttons currently visible, with absolute rects.
+    buttons: Vec<(ControlAction, Rect)>,
+    /// Rect of the left scroll control, if shown.
+    scroll_left: Option<Rect>,
+    /// Rect of the right scroll control, if shown.
+    scroll_right: Option<Rect>,
+    /// Detach button rect (always far right when space allows).
+    detach: Option<(ControlAction, Rect)>,
+    /// Max useful scroll index (last first-visible button index).
+    max_scroll: usize,
+}
+
+fn control_bar_layout(area: Rect, scroll: usize) -> ControlBarLayout {
+    let buttons = control_buttons();
     let detach = detach_control_button();
     let detach_w = detach.width().min(area.width);
-    // Reserve the right edge for detach so left buttons never overlap it.
-    let left_limit = area.x.saturating_add(area.width).saturating_sub(detach_w);
+    let left_end = area.x.saturating_add(area.width).saturating_sub(detach_w);
 
-    let mut x = area.x;
-    let mut rects = Vec::new();
-    for button in control_buttons() {
-        if x >= left_limit {
+    // Total width of all left-side buttons.
+    let total_w: u16 = buttons.iter().map(|b| b.width()).sum();
+    let avail = left_end.saturating_sub(area.x);
+    let needs_scroll = total_w > avail && avail > CONTROL_SCROLL_BTN_W * 2 + 4;
+
+    let (start_x, end_x, scroll_left, scroll_right) = if needs_scroll {
+        let left_btn = Rect::new(area.x, area.y, CONTROL_SCROLL_BTN_W, area.height.max(1));
+        let right_btn = Rect::new(
+            left_end.saturating_sub(CONTROL_SCROLL_BTN_W),
+            area.y,
+            CONTROL_SCROLL_BTN_W,
+            area.height.max(1),
+        );
+        (
+            area.x.saturating_add(CONTROL_SCROLL_BTN_W),
+            left_end.saturating_sub(CONTROL_SCROLL_BTN_W),
+            Some(left_btn),
+            Some(right_btn),
+        )
+    } else {
+        (area.x, left_end, None, None)
+    };
+
+    let scroll = scroll.min(buttons.len().saturating_sub(1));
+    let mut x = start_x;
+    let mut visible = Vec::new();
+    for button in buttons.iter().skip(scroll) {
+        if x >= end_x {
             break;
         }
-        let remaining = left_limit.saturating_sub(x);
+        let remaining = end_x.saturating_sub(x);
         if remaining < 4 {
             break;
         }
         let width = button.width().min(remaining);
-        rects.push((
+        // Don't draw a severely clipped button — leave room for ▶.
+        if width + 1 < button.width() && remaining < button.width() {
+            break;
+        }
+        visible.push((
             button.action,
             Rect::new(x, area.y, width, area.height.max(1)),
         ));
         x = x.saturating_add(width);
     }
-    if detach_w > 0 && area.width >= detach_w {
+
+    // Compute max_scroll: largest start index that still shows the last button.
+    let mut max_scroll = 0usize;
+    if needs_scroll {
+        let track = end_x.saturating_sub(start_x);
+        for start in 0..buttons.len() {
+            let mut used = 0u16;
+            for b in buttons.iter().skip(start) {
+                used = used.saturating_add(b.width());
+                if used > track {
+                    break;
+                }
+            }
+            // Can we fit from `start` to the end?
+            let mut fit = 0u16;
+            let mut all = true;
+            for b in buttons.iter().skip(start) {
+                fit = fit.saturating_add(b.width());
+                if fit > track {
+                    all = false;
+                    break;
+                }
+            }
+            max_scroll = start;
+            if all {
+                break;
+            }
+        }
+    }
+
+    let detach_rect = if detach_w > 0 && area.width >= detach_w {
         let dx = area.x.saturating_add(area.width).saturating_sub(detach_w);
-        rects.push((
+        Some((
             ControlAction::Detach,
             Rect::new(dx, area.y, detach_w, area.height.max(1)),
-        ));
+        ))
+    } else {
+        None
+    };
+
+    ControlBarLayout {
+        buttons: visible,
+        scroll_left,
+        scroll_right,
+        detach: detach_rect,
+        max_scroll,
+    }
+}
+
+fn control_button_rects(area: Rect, scroll: usize) -> Vec<(ControlAction, Rect)> {
+    let layout = control_bar_layout(area, scroll);
+    let mut rects = layout.buttons;
+    if let Some(d) = layout.detach {
+        rects.push(d);
     }
     rects
 }
 
-fn control_action_at(
+/// Hit-test including scroll arrows. Returns action, or special scroll deltas via Option.
+enum ControlBarHit {
+    Action(ControlAction),
+    ScrollLeft,
+    ScrollRight,
+}
+
+fn control_bar_hit_at(
     sidebar_collapsed: bool,
     sidebar_expanded: u16,
     terminal_width: u16,
     terminal_height: u16,
     column: u16,
     row: u16,
-) -> Option<ControlAction> {
+    scroll: usize,
+) -> Option<ControlBarHit> {
     if terminal_height < CONTROL_BAR_HEIGHT || row != terminal_height.saturating_sub(2) {
         return None;
     }
@@ -4975,9 +5134,46 @@ fn control_action_at(
         terminal_width.saturating_sub(sidebar_width),
         1,
     );
-    control_button_rects(area)
-        .into_iter()
-        .find_map(|(action, rect)| point_in_rect(rect, column, row).then_some(action))
+    let layout = control_bar_layout(area, scroll);
+    if let Some(r) = layout.scroll_left {
+        if point_in_rect(r, column, row) {
+            return Some(ControlBarHit::ScrollLeft);
+        }
+    }
+    if let Some(r) = layout.scroll_right {
+        if point_in_rect(r, column, row) {
+            return Some(ControlBarHit::ScrollRight);
+        }
+    }
+    for (action, rect) in layout.buttons.into_iter().chain(layout.detach) {
+        if point_in_rect(rect, column, row) {
+            return Some(ControlBarHit::Action(action));
+        }
+    }
+    None
+}
+
+fn control_action_at(
+    sidebar_collapsed: bool,
+    sidebar_expanded: u16,
+    terminal_width: u16,
+    terminal_height: u16,
+    column: u16,
+    row: u16,
+) -> Option<ControlAction> {
+    // Legacy helper used by tests — no scroll offset.
+    match control_bar_hit_at(
+        sidebar_collapsed,
+        sidebar_expanded,
+        terminal_width,
+        terminal_height,
+        column,
+        row,
+        0,
+    ) {
+        Some(ControlBarHit::Action(a)) => Some(a),
+        _ => None,
+    }
 }
 
 fn control_button_style(
@@ -5040,50 +5236,52 @@ fn draw_control_bar(
     confirm: Option<&PendingConfirm>,
     hover: Option<ControlAction>,
     theme: UiTheme,
+    scroll: usize,
 ) {
     let palette = theme.palette();
-    let detach = detach_control_button();
-    let detach_w = detach.width().min(area.width);
-    let left_limit = area.width.saturating_sub(detach_w);
+    let layout = control_bar_layout(area, scroll);
+    let arrow_style = Style::default()
+        .fg(palette.active)
+        .bg(palette.surface)
+        .add_modifier(Modifier::BOLD);
+    let muted_arrow = Style::default().fg(palette.muted).bg(palette.surface);
 
-    let mut spans = Vec::new();
-    let mut used: u16 = 0;
-    for button in control_buttons() {
-        let bw = button.width();
-        if used.saturating_add(bw) > left_limit {
-            break;
-        }
-        let style = control_button_style(button, mode, confirm, hover, palette);
-        let text = button.text();
-        let pad = usize::from(bw).saturating_sub(UnicodeWidthStr::width(text.as_str()));
-        spans.push(Span::styled(text, style));
-        if pad > 0 {
-            spans.push(Span::styled(" ".repeat(pad), style));
-        }
-        used = used.saturating_add(bw);
-    }
-    // Flexible spacer pushes detach to the far right of the bar.
-    let spacer = left_limit.saturating_sub(used) as usize;
-    if spacer > 0 {
-        spans.push(Span::styled(
-            " ".repeat(spacer),
-            Style::default().bg(palette.surface),
-        ));
-    }
-    if detach_w > 0 {
-        let style = control_button_style(detach, mode, confirm, hover, palette);
-        let text = detach.text();
-        let pad = usize::from(detach_w).saturating_sub(UnicodeWidthStr::width(text.as_str()));
-        spans.push(Span::styled(text, style));
-        if pad > 0 {
-            spans.push(Span::styled(" ".repeat(pad), style));
-        }
-    }
+    // Paint full bar background first.
     frame.render_widget(
-        Paragraph::new(Line::from(spans))
-            .style(Style::default().fg(palette.text).bg(palette.surface)),
+        Paragraph::new(" ".repeat(area.width as usize))
+            .style(Style::default().bg(palette.surface)),
         area,
     );
+
+    if let Some(r) = layout.scroll_left {
+        let style = if scroll > 0 { arrow_style } else { muted_arrow };
+        frame.render_widget(Paragraph::new(" ◀ ").style(style), r);
+    }
+    if let Some(r) = layout.scroll_right {
+        let more = scroll < layout.max_scroll;
+        let style = if more { arrow_style } else { muted_arrow };
+        frame.render_widget(Paragraph::new(" ▶ ").style(style), r);
+    }
+
+    for (action, rect) in &layout.buttons {
+        let button = control_buttons()
+            .into_iter()
+            .find(|b| b.action == *action)
+            .unwrap_or(ControlButton {
+                icon: "?",
+                label: "?",
+                action: *action,
+            });
+        let style = control_button_style(button, mode, confirm, hover, palette);
+        let text = button.text();
+        frame.render_widget(Paragraph::new(text).style(style), *rect);
+    }
+    if let Some((action, rect)) = layout.detach {
+        let button = detach_control_button();
+        let style = control_button_style(button, mode, confirm, hover, palette);
+        frame.render_widget(Paragraph::new(button.text()).style(style), rect);
+        let _ = action;
+    }
 }
 
 fn draw_panes(
@@ -6111,22 +6309,44 @@ fn selected_text_from_pane(
     pane: &crate::model::Pane,
     content_area: Rect,
     selection: &TextSelection,
+    scroll_offset: usize,
 ) -> Option<String> {
     let (start_col, start_row, end_col, end_row) =
         selection_range_in_content(selection, content_area)?;
-    let lines = pane.output.lines().collect::<Vec<_>>();
+    // When scrolled back, copy from scrollback using the same window mapping
+    // as the renderer (improve.md #22).
+    let source = if scroll_offset > 0 && !pane.scrollback.is_empty() {
+        pane.scrollback.as_str()
+    } else {
+        pane.output.as_str()
+    };
+    let lines = source.lines().collect::<Vec<_>>();
+    let height = content_area.height.max(1) as usize;
+    // Live view (offset 0): historical behavior maps content row → line index
+    // in the full buffer (tests + simple selections). Scrolled view uses the
+    // same window as pane_text_for_view.
+    let window_start = if scroll_offset == 0 {
+        0usize
+    } else {
+        let window_end = lines.len().saturating_sub(scroll_offset).max(1);
+        window_end.saturating_sub(height)
+    };
     let mut selected = Vec::new();
     for row in start_row..=end_row {
-        let Some(line) = lines.get(row as usize) else {
+        let abs = window_start.saturating_add(row as usize);
+        let Some(line) = lines.get(abs) else {
             continue;
         };
+        // Column mapping: use display columns (wide glyphs = 2) then slice by char index
+        // approximated via chars — still imperfect for combining marks but better than raw
+        // char-index vs visual col mismatch for common CJK.
         let from = if row == start_row {
-            start_col as usize
+            display_col_to_char_index(line, start_col as usize)
         } else {
             0
         };
         let to = if row == end_row {
-            end_col as usize + 1
+            display_col_to_char_index(line, end_col as usize + 1)
         } else {
             line.chars().count()
         };
@@ -6138,6 +6358,18 @@ fn selected_text_from_pane(
         selected.push(text);
     }
     Some(selected.join("\n"))
+}
+
+/// Map a display-column offset into a char index (wide glyphs consume 2 cols).
+fn display_col_to_char_index(line: &str, target_col: usize) -> usize {
+    let mut col = 0usize;
+    for (i, ch) in line.chars().enumerate() {
+        if col >= target_col {
+            return i;
+        }
+        col = col.saturating_add(UnicodeWidthChar::width(ch).unwrap_or(0).max(1));
+    }
+    line.chars().count()
 }
 
 fn apply_sgr(sequence: &str, mut style: Style) -> Style {
@@ -7926,6 +8158,7 @@ mod tests {
                     true,
                     false, // keep sidebar visible in unit tests (not compact-hidden)
                     0,
+                    0, // control_bar_scroll
                 )
             })
             .unwrap();
@@ -8000,6 +8233,7 @@ mod tests {
                     true,
                     false, // keep sidebar visible in unit tests (not compact-hidden)
                     0,
+                    0, // control_bar_scroll
                 )
             })
             .unwrap();
@@ -8497,7 +8731,7 @@ mod tests {
         };
 
         assert_eq!(
-            selected_text_from_pane(&pane, content, &selection).as_deref(),
+            selected_text_from_pane(&pane, content, &selection, 0).as_deref(),
             Some("cdef\nsecon")
         );
     }
@@ -8524,7 +8758,7 @@ mod tests {
             Some((2, 0, 3, 1))
         );
         assert_eq!(
-            selected_text_from_pane(&pane, content, &selection).as_deref(),
+            selected_text_from_pane(&pane, content, &selection, 0).as_deref(),
             Some("c\nseco")
         );
     }

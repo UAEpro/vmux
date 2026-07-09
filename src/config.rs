@@ -295,8 +295,16 @@ pub fn save_to_path(path: &Path, config: &LmuxConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_vec_pretty(config)?)
-        .with_context(|| format!("write {}", path.display()))?;
+    // Atomic write (tmp + rename) so a crash mid-write cannot leave empty config.
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(config)?;
+    fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
 

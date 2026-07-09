@@ -1212,14 +1212,39 @@ pub fn merge_agent_status(
 
 /// True when the pane command looks like a coding agent CLI (Claude Code,
 /// Codex, Grok Build, Aider, Cursor, Gemini, etc.).
+///
+/// Matches the **basename of the first token** only — avoids false positives
+/// like `git rebase --continue` or `ssh-agent bash` (improve.md P3).
 pub fn is_coding_agent_command(command: &str) -> bool {
-    let c = command.to_ascii_lowercase();
-    [
-        "claude", "codex", "grok", "aider", "cursor", "gemini", "openai", "copilot", "opencode",
-        "goose", "devin", "continue", "amp ", " amp", "agent",
-    ]
-    .iter()
-    .any(|needle| c.contains(needle))
+    let first = command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '\'' || c == '"');
+    let base = std::path::Path::new(first)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first)
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "claude"
+            | "codex"
+            | "grok"
+            | "aider"
+            | "cursor"
+            | "gemini"
+            | "openai"
+            | "copilot"
+            | "opencode"
+            | "goose"
+            | "devin"
+            | "amp"
+            | "claude-code"
+            | "cursor-agent"
+    ) || base.starts_with("claude")
+        || base.starts_with("codex")
+        || base.starts_with("grok")
 }
 
 pub fn direction_axis(direction: SplitDirection) -> SplitAxis {

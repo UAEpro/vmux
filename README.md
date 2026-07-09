@@ -208,6 +208,7 @@ Default prefix is **`Ctrl-b`** (configurable via `vmux config set ui.prefix_key`
 | Right-click pane | Context menu (copy, paste, split, clear) |
 | Right-click workspace | Toggle pin |
 | Control bar **Detach** | Detach (far right) without stopping the daemon |
+| Control bar **◀ ▶** / wheel on bar | Horizontal scroll when buttons overflow |
 | **⚙ set** / Settings | Theme, sidebar, responsive layout, cursor, hooks |
 
 ### Responsive / mobile-friendly layout

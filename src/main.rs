@@ -1919,17 +1919,22 @@ fn relative_workspace_id(snapshot: &model::Session, delta: isize) -> Result<Stri
 }
 
 fn ssh_command(host: &str, remote_command: Option<&str>) -> String {
+    // `--` stops option injection via host (improve.md: ProxyCommand footgun).
     match remote_command {
         Some(command) if !command.trim().is_empty() => {
-            format!("ssh {} {}", shell_quote(host), shell_quote(command))
+            format!(
+                "ssh -- {} {}",
+                shell_quote(host),
+                shell_quote(command)
+            )
         }
-        _ => format!("ssh {}", shell_quote(host)),
+        _ => format!("ssh -- {}", shell_quote(host)),
     }
 }
 
 fn remote_tmux_command(host: &str, session: &str) -> String {
     format!(
-        "ssh {} -t tmux attach -t {}",
+        "ssh -- {} -t tmux attach -t {}",
         shell_quote(host),
         shell_quote(session)
     )
@@ -2041,10 +2046,49 @@ fn wait_timeout_ms(timeout: Option<u64>) -> Option<u64> {
 
 fn print_logs(session: &str, lines: usize) -> Result<()> {
     let path = paths::log_path(session)?;
-    let contents = std::fs::read_to_string(&path)
+    // Seek from the end in chunks so multi-GB logs do not load entirely (improve.md #41).
+    let text = tail_file_lines(&path, lines)
         .map_err(|err| anyhow!("read log {}: {err}", path.display()))?;
-    print!("{}", tail_text_lines(&contents, lines));
+    print!("{text}");
     Ok(())
+}
+
+fn tail_file_lines(path: &std::path::Path, lines: usize) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if lines == 0 {
+        return Ok(String::new());
+    }
+    let mut file = std::fs::File::open(path)?;
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        return Ok(String::new());
+    }
+    let mut pos = len;
+    let mut buf = Vec::new();
+    let mut found = 0usize;
+    let chunk = 8192u64;
+    while pos > 0 && found <= lines {
+        let read_size = chunk.min(pos);
+        pos -= read_size;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk_buf = vec![0u8; read_size as usize];
+        file.read_exact(&mut chunk_buf)?;
+        found += bytecount_newlines(&chunk_buf);
+        buf.splice(0..0, chunk_buf);
+        if found > lines && pos == 0 {
+            break;
+        }
+        if found > lines {
+            break;
+        }
+    }
+    // Lossy UTF-8 is fine for log tails.
+    let text = String::from_utf8_lossy(&buf);
+    Ok(tail_text_lines(&text, lines))
+}
+
+fn bytecount_newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == b'\n').count()
 }
 
 fn tail_text_lines(text: &str, lines: usize) -> String {
@@ -2919,15 +2963,15 @@ mod tests {
     fn remote_commands_quote_shell_arguments() {
         assert_eq!(
             ssh_command("user@example.com", None),
-            "ssh user@example.com"
+            "ssh -- user@example.com"
         );
         assert_eq!(
             ssh_command("host", Some("cd /srv/app && claude")),
-            "ssh host 'cd /srv/app && claude'"
+            "ssh -- host 'cd /srv/app && claude'"
         );
         assert_eq!(
             remote_tmux_command("build host", "agent's"),
-            "ssh 'build host' -t tmux attach -t 'agent'\\''s'"
+            "ssh -- 'build host' -t tmux attach -t 'agent'\\''s'"
         );
     }
 

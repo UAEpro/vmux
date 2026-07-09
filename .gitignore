@@ -19,7 +19,6 @@ Cargo.lock.bak
 
 # Local scratch
 test.md
-{
 *.log
 *.tmp
 
