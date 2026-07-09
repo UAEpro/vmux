@@ -196,6 +196,8 @@ struct Ui {
     /// Raw JSON of the last snapshot received, used to detect whether a refresh
     /// actually changed anything (drives dirty-flag rendering).
     last_snapshot_data: Option<serde_json::Value>,
+    /// Daemon snapshot generation — sent as Snapshot.since for unchanged short-circuit.
+    snapshot_generation: Option<u64>,
     /// Set by any state-changing RPC (via `rpc()`) so the run loop refreshes
     /// immediately instead of waiting for the periodic tick. This covers
     /// keystroke echo latency as well as pane/workspace creation and layout
@@ -311,21 +313,6 @@ struct UiAction {
 struct UiActionResponse {
     #[serde(default)]
     commands: Vec<UiAction>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-struct AgentPanelEntry {
-    workspace_id: String,
-    workspace_name: String,
-    pane_id: String,
-    title: String,
-    command: String,
-    surface: crate::model::SurfaceKind,
-    status: crate::model::PaneStatus,
-    agent_status: crate::model::AgentStatus,
-    progress: Option<u8>,
-    metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,6 +750,7 @@ impl Ui {
             sidebar_scroll: 0,
             sidebar_active_seen: None,
             last_snapshot_data: None,
+            snapshot_generation: None,
             pending_refresh: std::cell::Cell::new(false),
             last_typing_at: None,
             control_bar_scroll: 0,
@@ -917,17 +905,49 @@ impl Ui {
     }
 
     /// Fetches a fresh snapshot. Returns `true` if the snapshot changed since
-    /// the previous refresh (used to drive dirty-flag rendering). The raw JSON
-    /// value is compared because `Session` is defined elsewhere and may not be
-    /// cheap/available to compare directly.
+    /// the previous refresh (used to drive dirty-flag rendering).
+    ///
+    /// Uses Snapshot.since generation short-circuit when the daemon reports
+    /// unchanged (improve.md #35).
     fn refresh(&mut self) -> Result<bool> {
-        let response = protocol::request(&paths::socket_path(&self.session)?, &Request::Snapshot)?;
+        let response = protocol::request(
+            &paths::socket_path(&self.session)?,
+            &Request::Snapshot {
+                since: self.snapshot_generation,
+                full: true,
+            },
+        )?;
         if let Some(data) = response.data {
-            if self.last_snapshot_data.as_ref() == Some(&data) {
+            if data
+                .get("unchanged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                if let Some(gen) = data.get("generation").and_then(|v| v.as_u64()) {
+                    self.snapshot_generation = Some(gen);
+                }
                 return Ok(false);
             }
-            self.snapshot = Some(serde_json::from_value(data.clone())?);
-            self.last_snapshot_data = Some(data);
+            // New envelope: { generation, session } or legacy flat Session.
+            let (gen, session_val) = if let Some(session) = data.get("session") {
+                (
+                    data.get("generation").and_then(|v| v.as_u64()),
+                    session.clone(),
+                )
+            } else {
+                (None, data.clone())
+            };
+            if self.last_snapshot_data.as_ref() == Some(&session_val) {
+                if let Some(g) = gen {
+                    self.snapshot_generation = Some(g);
+                }
+                return Ok(false);
+            }
+            self.snapshot = Some(serde_json::from_value(session_val.clone())?);
+            self.last_snapshot_data = Some(session_val);
+            if let Some(g) = gen {
+                self.snapshot_generation = Some(g);
+            }
             self.maybe_bell_on_attention();
             return Ok(true);
         }
@@ -5538,152 +5558,9 @@ fn draw_single_pane(
     }
 }
 
-/// One laid-out cell in a pane's tab strip. The same layout drives rendering and
-/// hit-testing so a click always resolves to exactly the tab under the cursor.
-#[cfg(test)]
-struct TabCell {
-    /// Tab id to focus when this cell is clicked (for the overflow marker this is
-    /// the next hidden tab to reveal).
-    focus_id: String,
-    text: String,
-    active: bool,
-    overflow: bool,
-    /// Absolute start column (inclusive).
-    start: u16,
-    /// Absolute end column (exclusive).
-    end: u16,
-}
-
 /// Lays out a pane's tab strip into positioned cells within `strip`. The active
 /// tab is always kept visible; when tabs overflow the width a trailing `+N`
 /// marker is appended (clicking it reveals the next hidden tab).
-#[cfg(test)]
-fn pane_tab_cells(pane: &crate::model::Pane, strip: Rect) -> Vec<TabCell> {
-    let mut cells = Vec::new();
-    if pane.tabs.len() <= 1 || strip.width == 0 {
-        return cells;
-    }
-    let width = usize::from(strip.width);
-    let active_index = pane
-        .tabs
-        .iter()
-        .position(|tab| pane.active_tab.as_deref() == Some(tab.id.as_str()))
-        .unwrap_or(0);
-    let labels: Vec<String> = pane
-        .tabs
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| format!(" {}:{} ", index + 1, trim_label(&tab.title, 12)))
-        .collect();
-    let widths: Vec<usize> = labels
-        .iter()
-        .map(|label| UnicodeWidthStr::width(label.as_str()))
-        .collect();
-    let total: usize = widths.iter().sum();
-
-    let (start_idx, end_idx, overflow) = if total <= width {
-        (0, pane.tabs.len(), false)
-    } else {
-        let reserve = UnicodeWidthStr::width(format!(" +{} ", pane.tabs.len()).as_str());
-        let avail = width.saturating_sub(reserve).max(1);
-        let mut start = active_index;
-        let mut end = active_index + 1;
-        let mut used = widths[active_index];
-        loop {
-            let mut grew = false;
-            if end < pane.tabs.len() && used + widths[end] <= avail {
-                used += widths[end];
-                end += 1;
-                grew = true;
-            }
-            if start > 0 && used + widths[start - 1] <= avail {
-                start -= 1;
-                used += widths[start - 1];
-                grew = true;
-            }
-            if !grew {
-                break;
-            }
-        }
-        (start, end, true)
-    };
-
-    let strip_end = strip.x.saturating_add(strip.width);
-    let mut col = strip.x;
-    for index in start_idx..end_idx {
-        if col >= strip_end {
-            break;
-        }
-        let end = col.saturating_add(widths[index] as u16).min(strip_end);
-        cells.push(TabCell {
-            focus_id: pane.tabs[index].id.clone(),
-            text: labels[index].clone(),
-            active: index == active_index,
-            overflow: false,
-            start: col,
-            end,
-        });
-        col = end;
-    }
-    if overflow && col < strip_end {
-        let hidden = pane.tabs.len() - (end_idx - start_idx);
-        // Reveal the first tab after the window, wrapping to the ones before it.
-        let target = if end_idx < pane.tabs.len() {
-            end_idx
-        } else {
-            start_idx.saturating_sub(1)
-        };
-        let text = format!(" +{hidden} ");
-        let end = col
-            .saturating_add(UnicodeWidthStr::width(text.as_str()) as u16)
-            .min(strip_end);
-        cells.push(TabCell {
-            focus_id: pane.tabs[target].id.clone(),
-            text,
-            active: false,
-            overflow: true,
-            start: col,
-            end,
-        });
-    }
-    cells
-}
-
-#[cfg(test)]
-fn draw_pane_tab_strip(
-    frame: &mut ratatui::Frame,
-    pane: &crate::model::Pane,
-    strip: Rect,
-    palette: ThemePalette,
-) {
-    let cells = pane_tab_cells(pane, strip);
-    if cells.is_empty() {
-        return;
-    }
-    let spans = cells
-        .iter()
-        .map(|cell| {
-            let style = if cell.active {
-                Style::default()
-                    .fg(palette.background)
-                    .bg(palette.active)
-                    .add_modifier(Modifier::BOLD)
-            } else if cell.overflow {
-                Style::default()
-                    .fg(palette.warning)
-                    .bg(palette.background)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette.muted).bg(palette.background)
-            };
-            Span::styled(cell.text.clone(), style)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.background)),
-        strip,
-    );
-}
 
 fn pane_control_buttons_for(
     layout: Option<&LayoutNode>,
@@ -6493,30 +6370,6 @@ fn pane_title_text(pane: &crate::model::Pane, scroll_offset: usize) -> String {
     title
 }
 
-#[cfg(test)]
-fn active_pane_id(snapshot: &Session) -> Option<String> {
-    snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == snapshot.active_workspace)
-        .and_then(|workspace| workspace.active_pane.clone())
-}
-
-#[cfg(test)]
-fn relative_pane_tab(pane: &crate::model::Pane, delta: isize) -> Option<String> {
-    if pane.tabs.len() <= 1 {
-        return None;
-    }
-    let current = pane
-        .active_tab
-        .as_deref()
-        .and_then(|active| pane.tabs.iter().position(|tab| tab.id == active))
-        .unwrap_or(0);
-    let len = pane.tabs.len() as isize;
-    let next = (current as isize + delta).rem_euclid(len) as usize;
-    pane.tabs.get(next).map(|tab| tab.id.clone())
-}
-
 fn tail_lines(text: &str, height: usize) -> String {
     let lines = text.lines().collect::<Vec<_>>();
     let start = lines.len().saturating_sub(height);
@@ -6728,15 +6581,6 @@ fn pane_has_tab_strip(pane: &crate::model::Pane) -> bool {
 }
 
 /// Rectangle of the dedicated tab strip row (first row inside the block border).
-#[cfg(test)]
-fn pane_tab_strip_area(area: Rect) -> Rect {
-    Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        1,
-    )
-}
 
 /// Content rectangle inside the pane block. When a tab strip is present the top
 /// is pushed down one extra row so the PTY content never overlaps the strip.
@@ -6759,84 +6603,6 @@ fn sgr_mouse_sequence(button: MouseButtonCode, x: u16, y: u16, pressed: bool) ->
     };
     let suffix = if pressed { 'M' } else { 'm' };
     format!("\x1b[<{code};{x};{y}{suffix}")
-}
-
-#[cfg(test)]
-fn pane_tab_at(
-    snapshot: &Session,
-    node: Option<&LayoutNode>,
-    area: Rect,
-    column: u16,
-    row: u16,
-) -> Option<(String, String)> {
-    if !point_in_rect(area, column, row) {
-        return None;
-    }
-    let node = node?;
-    match node {
-        LayoutNode::Pane { pane } => snapshot
-            .panes
-            .get(pane)
-            .and_then(|item| pane_tab_hit(item, area, column, row))
-            .map(|tab| (pane.clone(), tab)),
-        LayoutNode::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } => {
-            let ratio = (*ratio).clamp(15, 85) as u32;
-            match axis {
-                SplitAxis::Horizontal => {
-                    let split = area.x + ((area.width as u32 * ratio) / 100) as u16;
-                    if column < split {
-                        let first_area =
-                            Rect::new(area.x, area.y, split.saturating_sub(area.x), area.height);
-                        pane_tab_at(snapshot, Some(first), first_area, column, row)
-                    } else {
-                        let second_area = Rect::new(
-                            split,
-                            area.y,
-                            area.x.saturating_add(area.width).saturating_sub(split),
-                            area.height,
-                        );
-                        pane_tab_at(snapshot, Some(second), second_area, column, row)
-                    }
-                }
-                SplitAxis::Vertical => {
-                    let split = area.y + ((area.height as u32 * ratio) / 100) as u16;
-                    if row < split {
-                        let first_area =
-                            Rect::new(area.x, area.y, area.width, split.saturating_sub(area.y));
-                        pane_tab_at(snapshot, Some(first), first_area, column, row)
-                    } else {
-                        let second_area = Rect::new(
-                            area.x,
-                            split,
-                            area.width,
-                            area.y.saturating_add(area.height).saturating_sub(split),
-                        );
-                        pane_tab_at(snapshot, Some(second), second_area, column, row)
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-fn pane_tab_hit(pane: &crate::model::Pane, area: Rect, column: u16, row: u16) -> Option<String> {
-    if !pane_has_tab_strip(pane) || area.width <= 2 || area.height < 3 {
-        return None;
-    }
-    let strip = pane_tab_strip_area(area);
-    if row != strip.y {
-        return None;
-    }
-    pane_tab_cells(pane, strip)
-        .into_iter()
-        .find(|cell| column >= cell.start && column < cell.end)
-        .map(|cell| cell.focus_id)
 }
 
 fn split_axis_at(
@@ -7191,61 +6957,6 @@ fn action_panel_lines(actions: &[UiAction], selected: usize, error: Option<&str>
                 title,
                 direction,
                 trim_label(&action.command, 80)
-            )
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn agent_panel_entries(snapshot: &Session) -> Vec<AgentPanelEntry> {
-    snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| {
-            workspace.panes.iter().filter_map(|pane_id| {
-                let pane = snapshot.panes.get(pane_id)?;
-                Some(AgentPanelEntry {
-                    workspace_id: workspace.id.clone(),
-                    workspace_name: workspace.name.clone(),
-                    pane_id: pane.id.clone(),
-                    title: pane.title.clone(),
-                    command: pane.command.clone(),
-                    surface: pane.surface_kind.clone(),
-                    status: pane.status.clone(),
-                    agent_status: pane.agent_status.clone(),
-                    progress: pane.progress,
-                    metadata: pane.metadata.clone(),
-                })
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn agent_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> {
-    agent_panel_entries(snapshot)
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let marker = if index == selected { "> " } else { "  " };
-            let progress = entry
-                .progress
-                .map(|progress| format!(" {progress}%"))
-                .unwrap_or_default();
-            let metadata = metadata_summary(&entry.metadata)
-                .map(|metadata| format!(" {{{metadata}}}"))
-                .unwrap_or_default();
-            format!(
-                "{marker}{} {}:{} [{}:{}:{}{}]{} {}",
-                trim_label(&entry.workspace_name, 14),
-                trim_label(&entry.pane_id, 10),
-                trim_label(&entry.title, 18),
-                surface_label(&entry.surface),
-                pane_status_label(&entry.status),
-                status_label(&entry.agent_status),
-                progress,
-                metadata,
-                trim_label(&entry.command, 80)
             )
         })
         .collect()
@@ -8033,26 +7744,6 @@ fn status_label(status: &crate::model::AgentStatus) -> &'static str {
     }
 }
 
-#[cfg(test)]
-fn pane_status_label(status: &crate::model::PaneStatus) -> &'static str {
-    match status {
-        crate::model::PaneStatus::Starting => "starting",
-        crate::model::PaneStatus::Running => "running",
-        crate::model::PaneStatus::Exited => "exited",
-        crate::model::PaneStatus::Restored => "restored",
-    }
-}
-
-#[cfg(test)]
-fn surface_label(kind: &crate::model::SurfaceKind) -> &'static str {
-    match kind {
-        crate::model::SurfaceKind::Terminal => "term",
-        crate::model::SurfaceKind::Browser => "browser",
-        crate::model::SurfaceKind::Agent => "agent",
-        crate::model::SurfaceKind::Markdown => "markdown",
-    }
-}
-
 fn surface_prefix(kind: &crate::model::SurfaceKind) -> &'static str {
     match kind {
         crate::model::SurfaceKind::Terminal => "",
@@ -8238,27 +7929,6 @@ mod tests {
             })
             .unwrap();
         terminal.backend().to_string()
-    }
-
-    fn make_tab(id: &str, title: &str) -> crate::model::PaneTab {
-        crate::model::PaneTab {
-            id: id.to_string(),
-            title: title.to_string(),
-            command: "bash".to_string(),
-            surface_kind: crate::model::SurfaceKind::Terminal,
-            status: None,
-            agent_status: None,
-            progress: None,
-            notification_color: None,
-            notification_message: None,
-            exit_code: None,
-            output: String::new(),
-            output_formatted: String::new(),
-            scrollback: String::new(),
-            scrollback_formatted: String::new(),
-            created_at: 1,
-            updated_at: 1,
-        }
     }
 
     fn mouse_test_session() -> Session {
@@ -9218,292 +8888,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_tab_cells_lay_out_and_mark_active_tab() {
-        let mut pane = crate::model::Pane::new(
-            "pane-1".to_string(),
-            "bash".to_string(),
-            SplitDirection::Right,
-        );
-        pane.tabs.push(crate::model::PaneTab {
-            id: "tab-1".to_string(),
-            title: "shell".to_string(),
-            command: "bash".to_string(),
-            surface_kind: crate::model::SurfaceKind::Terminal,
-            status: None,
-            agent_status: None,
-            progress: None,
-            notification_color: None,
-            notification_message: None,
-            exit_code: None,
-            output: String::new(),
-            output_formatted: String::new(),
-            scrollback: String::new(),
-            scrollback_formatted: String::new(),
-            created_at: 1,
-            updated_at: 1,
-        });
-        pane.tabs.push(crate::model::PaneTab {
-            id: "tab-2".to_string(),
-            title: "tests".to_string(),
-            command: "cargo test".to_string(),
-            surface_kind: crate::model::SurfaceKind::Terminal,
-            status: None,
-            agent_status: None,
-            progress: None,
-            notification_color: None,
-            notification_message: None,
-            exit_code: None,
-            output: String::new(),
-            output_formatted: String::new(),
-            scrollback: String::new(),
-            scrollback_formatted: String::new(),
-            created_at: 1,
-            updated_at: 1,
-        });
-        pane.active_tab = Some("tab-2".to_string());
-
-        let area = Rect::new(10, 0, 80, 20);
-        let cells = pane_tab_cells(&pane, pane_tab_strip_area(area));
-        assert_eq!(cells.len(), 2);
-        assert_eq!(cells[0].text, " 1:shell ");
-        assert!(!cells[0].active);
-        assert_eq!(cells[0].start, 11);
-        assert_eq!(cells[0].end, 20);
-        assert_eq!(cells[1].text, " 2:tests ");
-        assert!(cells[1].active);
-        assert!(!cells[1].overflow);
-    }
-
-    #[test]
-    fn pane_tab_hit_resolves_clicked_strip_tab() {
-        let mut pane = crate::model::Pane::new(
-            "pane-1".to_string(),
-            "bash".to_string(),
-            SplitDirection::Right,
-        );
-        pane.tabs.push(make_tab("tab-1", "shell"));
-        pane.tabs.push(make_tab("tab-2", "tests"));
-        pane.active_tab = Some("tab-2".to_string());
-        let area = Rect::new(10, 0, 80, 20);
-        let strip_row = pane_tab_strip_area(area).y;
-
-        // " 1:shell " spans columns 11..20, " 2:tests " spans 20..29.
-        assert_eq!(
-            pane_tab_hit(&pane, area, 13, strip_row).as_deref(),
-            Some("tab-1")
-        );
-        assert_eq!(
-            pane_tab_hit(&pane, area, 22, strip_row).as_deref(),
-            Some("tab-2")
-        );
-        // The title row (top border) no longer hosts tabs.
-        assert_eq!(pane_tab_hit(&pane, area, 13, area.y), None);
-    }
-
-    #[test]
-    fn pane_tab_hit_handles_unicode_titles() {
-        let mut pane = crate::model::Pane::new(
-            "pane-1".to_string(),
-            "bash".to_string(),
-            SplitDirection::Right,
-        );
-        // Wide (CJK) glyphs: each occupies two columns.
-        pane.tabs.push(make_tab("tab-1", "测试"));
-        pane.tabs.push(make_tab("tab-2", "日本"));
-        pane.active_tab = Some("tab-1".to_string());
-        let area = Rect::new(10, 0, 80, 20);
-        let strip = pane_tab_strip_area(area);
-        let strip_row = strip.y;
-        let cells = pane_tab_cells(&pane, strip);
-
-        // " 1:测试 " = 1 + 2 + 2*2 + 1 = 8 columns wide.
-        assert_eq!(UnicodeWidthStr::width(cells[0].text.as_str()), 8);
-        // Clicking inside the first tab's span resolves to it, not the second.
-        assert_eq!(
-            pane_tab_hit(&pane, area, cells[0].start + 1, strip_row).as_deref(),
-            Some("tab-1")
-        );
-        assert_eq!(
-            pane_tab_hit(&pane, area, cells[1].start + 1, strip_row).as_deref(),
-            Some("tab-2")
-        );
-    }
-
-    #[test]
-    fn pane_tab_strip_shows_overflow_and_keeps_active_visible() {
-        let mut pane = crate::model::Pane::new(
-            "pane-1".to_string(),
-            "bash".to_string(),
-            SplitDirection::Right,
-        );
-        for index in 1..=8 {
-            pane.tabs
-                .push(make_tab(&format!("tab-{index}"), &format!("name{index}")));
-        }
-        // A late tab is active; the narrow strip must scroll to reveal it.
-        pane.active_tab = Some("tab-8".to_string());
-        let area = Rect::new(0, 0, 22, 20);
-        let strip = pane_tab_strip_area(area);
-        let cells = pane_tab_cells(&pane, strip);
-
-        assert!(cells.iter().any(|cell| cell.active));
-        assert_eq!(
-            cells
-                .iter()
-                .find(|cell| cell.active)
-                .map(|cell| cell.focus_id.as_str()),
-            Some("tab-8")
-        );
-        let overflow = cells
-            .iter()
-            .find(|cell| cell.overflow)
-            .expect("overflow marker");
-        assert!(overflow.text.contains('+'));
-        // Every cell stays within the strip bounds.
-        assert!(cells.iter().all(|cell| cell.end <= strip.x + strip.width));
-        // Clicking the overflow marker reveals a currently hidden tab.
-        let hidden: Vec<&str> = pane
-            .tabs
-            .iter()
-            .map(|tab| tab.id.as_str())
-            .filter(|id| {
-                !cells
-                    .iter()
-                    .any(|cell| !cell.overflow && cell.focus_id == *id)
-            })
-            .collect();
-        assert!(hidden.contains(&overflow.focus_id.as_str()));
-    }
-
-    #[test]
-    fn pane_tab_at_walks_split_layout() {
-        let mut session = Session::new("test");
-        let mut pane = crate::model::Pane::new(
-            "pane-2".to_string(),
-            "bash".to_string(),
-            SplitDirection::Right,
-        );
-        pane.tabs.push(crate::model::PaneTab {
-            id: "tab-1".to_string(),
-            title: "shell".to_string(),
-            command: "bash".to_string(),
-            surface_kind: crate::model::SurfaceKind::Terminal,
-            status: None,
-            agent_status: None,
-            progress: None,
-            notification_color: None,
-            notification_message: None,
-            exit_code: None,
-            output: String::new(),
-            output_formatted: String::new(),
-            scrollback: String::new(),
-            scrollback_formatted: String::new(),
-            created_at: 1,
-            updated_at: 1,
-        });
-        pane.tabs.push(crate::model::PaneTab {
-            id: "tab-2".to_string(),
-            title: "tests".to_string(),
-            command: "cargo test".to_string(),
-            surface_kind: crate::model::SurfaceKind::Terminal,
-            status: None,
-            agent_status: None,
-            progress: None,
-            notification_color: None,
-            notification_message: None,
-            exit_code: None,
-            output: String::new(),
-            output_formatted: String::new(),
-            scrollback: String::new(),
-            scrollback_formatted: String::new(),
-            created_at: 1,
-            updated_at: 1,
-        });
-        pane.active_tab = Some("tab-1".to_string());
-        session.workspaces[0].panes = vec!["pane-1".to_string(), "pane-2".to_string()];
-        session.workspaces[0].layout = Some(LayoutNode::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: 50,
-            first: Box::new(LayoutNode::Pane {
-                pane: "pane-1".to_string(),
-            }),
-            second: Box::new(LayoutNode::Pane {
-                pane: "pane-2".to_string(),
-            }),
-        });
-        session.panes.insert(
-            "pane-1".to_string(),
-            crate::model::Pane::new(
-                "pane-1".to_string(),
-                "sh".to_string(),
-                SplitDirection::Right,
-            ),
-        );
-        session.panes.insert("pane-2".to_string(), pane);
-        let area = Rect::new(10, 0, 90, 30);
-
-        // Split boundary is at column 55; pane-2's tab strip is on inner row 1
-        // starting at column 56, so column 58 lands on its first tab.
-        assert_eq!(
-            pane_tab_at(&session, session.workspaces[0].layout.as_ref(), area, 58, 1,)
-                .as_ref()
-                .map(|(pane, tab)| (pane.as_str(), tab.as_str())),
-            Some(("pane-2", "tab-1"))
-        );
-    }
-
-    #[test]
-    fn relative_pane_tab_wraps_around_tabs() {
-        let mut pane = crate::model::Pane::new(
-            "pane-1".to_string(),
-            "bash".to_string(),
-            SplitDirection::Right,
-        );
-        pane.tabs.push(crate::model::PaneTab {
-            id: "tab-1".to_string(),
-            title: "shell".to_string(),
-            command: "bash".to_string(),
-            surface_kind: crate::model::SurfaceKind::Terminal,
-            status: None,
-            agent_status: None,
-            progress: None,
-            notification_color: None,
-            notification_message: None,
-            exit_code: None,
-            output: String::new(),
-            output_formatted: String::new(),
-            scrollback: String::new(),
-            scrollback_formatted: String::new(),
-            created_at: 1,
-            updated_at: 1,
-        });
-        pane.tabs.push(crate::model::PaneTab {
-            id: "tab-2".to_string(),
-            title: "tests".to_string(),
-            command: "cargo test".to_string(),
-            surface_kind: crate::model::SurfaceKind::Terminal,
-            status: None,
-            agent_status: None,
-            progress: None,
-            notification_color: None,
-            notification_message: None,
-            exit_code: None,
-            output: String::new(),
-            output_formatted: String::new(),
-            scrollback: String::new(),
-            scrollback_formatted: String::new(),
-            created_at: 1,
-            updated_at: 1,
-        });
-        pane.active_tab = Some("tab-2".to_string());
-
-        assert_eq!(relative_pane_tab(&pane, 1).as_deref(), Some("tab-1"));
-        assert_eq!(relative_pane_tab(&pane, -1).as_deref(), Some("tab-1"));
-        pane.tabs.pop();
-        assert_eq!(relative_pane_tab(&pane, 1), None);
-    }
-
-    #[test]
     fn command_palette_includes_pane_tab_actions() {
         let entries = command_palette_entries();
         assert!(entries.iter().any(|entry| entry.name == "next-tab"));
@@ -9766,38 +9150,6 @@ mod tests {
             .as_deref(),
             Some("cursor 3:5")
         );
-    }
-
-    #[test]
-    fn agent_panel_lines_include_workspace_status_progress_and_command() {
-        let mut session = Session::new("test");
-        let mut pane = crate::model::Pane::new(
-            "pane-1".to_string(),
-            "claude --dangerously-skip-permissions".to_string(),
-            SplitDirection::Right,
-        );
-        pane.title = "backend-agent".to_string();
-        pane.surface_kind = crate::model::SurfaceKind::Agent;
-        pane.status = crate::model::PaneStatus::Running;
-        pane.agent_status = crate::model::AgentStatus::Busy;
-        pane.progress = Some(42);
-        pane.metadata
-            .insert("task".to_string(), "auth-api".to_string());
-        session.workspaces[0].panes.push("pane-1".to_string());
-        session.workspaces[0].active_pane = Some("pane-1".to_string());
-        session.panes.insert("pane-1".to_string(), pane);
-
-        let entries = agent_panel_entries(&session);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].workspace_id, "ws-1");
-        assert_eq!(entries[0].pane_id, "pane-1");
-
-        let lines = agent_panel_lines(&session, 0);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("> main pane-1:backend-agent"));
-        assert!(lines[0].contains("[agent:running:busy 42%]"));
-        assert!(lines[0].contains("{task=auth-api}"));
-        assert!(lines[0].contains("claude --dangerously-skip-permissions"));
     }
 
     #[test]

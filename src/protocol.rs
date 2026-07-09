@@ -14,7 +14,16 @@ use crate::model::SurfaceKind;
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Request {
     Ping,
-    Snapshot,
+    /// Fetch session snapshot.
+    /// - `since`: if equal to the daemon generation, returns `{unchanged:true,generation}` only.
+    /// - `full`: when false, omits heavy per-pane scrollback strings (layout/status poll).
+    Snapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        /// Default true for backward-compatible full payloads.
+        #[serde(default = "default_true")]
+        full: bool,
+    },
     List,
     Agents,
     Identify {
@@ -385,6 +394,19 @@ fn read_timeout_for(request: &Request) -> Option<Duration> {
     }
 }
 
+/// Full snapshot request (CLI default).
+pub fn snapshot_full() -> Request {
+    Request::Snapshot {
+        since: None,
+        full: true,
+    }
+}
+
+/// Extract Session JSON from a Snapshot response (new envelope or legacy flat).
+pub fn session_data_from_snapshot(data: Value) -> Value {
+    data.get("session").cloned().unwrap_or(data)
+}
+
 pub fn request(path: &Path, request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(path)
         .with_context(|| format!("connect vmux socket {}", path.display()))?;
@@ -430,6 +452,43 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_request_defaults_and_since() {
+        let encoded = serde_json::to_string(&snapshot_full()).unwrap();
+        assert!(encoded.contains(r#""action":"snapshot""#));
+        assert!(encoded.contains(r#""full":true"#));
+        let with_since = serde_json::to_string(&Request::Snapshot {
+            since: Some(7),
+            full: false,
+        })
+        .unwrap();
+        assert!(with_since.contains(r#""since":7"#));
+        assert!(with_since.contains(r#""full":false"#));
+        // Legacy clients sending bare {"action":"snapshot"} still decode.
+        let bare: Request = serde_json::from_str(r#"{"action":"snapshot"}"#).unwrap();
+        match bare {
+            Request::Snapshot { since, full } => {
+                assert!(since.is_none());
+                assert!(full);
+            }
+            _ => panic!("expected Snapshot"),
+        }
+    }
+
+    #[test]
+    fn session_data_from_snapshot_unwraps_envelope() {
+        let nested = serde_json::json!({"generation": 3, "session": {"name": "default"}});
+        let session = session_data_from_snapshot(nested);
+        assert_eq!(session.get("name").and_then(|v| v.as_str()), Some("default"));
+        let flat = serde_json::json!({"name": "legacy"});
+        assert_eq!(
+            session_data_from_snapshot(flat)
+                .get("name")
+                .and_then(|v| v.as_str()),
+            Some("legacy")
+        );
+    }
 
     #[test]
     fn pane_sizes_request_uses_socket_protocol_shape() {

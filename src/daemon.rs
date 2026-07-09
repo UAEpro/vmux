@@ -352,6 +352,9 @@ struct Server {
     /// Debounced persistence: PTY reader threads set this; a background writer
     /// flushes within ~500ms instead of blocking on every OSC notification.
     save_dirty: std::sync::atomic::AtomicBool,
+    /// Monotonic generation bumped on any session/runtime change. Clients pass
+    /// this as Snapshot.since to skip full reserializations when idle.
+    generation: std::sync::atomic::AtomicU64,
     // Only one attached UI should drive PTY dimensions at a time. Without this,
     // a small phone terminal and a large desktop terminal can resize the same
     // panes back and forth on every refresh.
@@ -430,8 +433,18 @@ impl Server {
             next_runtime: Mutex::new(1),
             save_lock: Mutex::new(0),
             save_dirty: std::sync::atomic::AtomicBool::new(false),
+            generation: std::sync::atomic::AtomicU64::new(1),
             pane_size_owner: Mutex::new(None),
         })
+    }
+
+    fn touch(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn serve(self: Arc<Self>) -> Result<()> {
@@ -560,8 +573,24 @@ impl Server {
             Request::Ping => Ok(Response::ok(
                 serde_json::json!({ "session": self.session_name, "daemon": self.daemon_info() }),
             )),
-            Request::Snapshot => Ok(Response::ok(self.snapshot(true)?)),
-            Request::List => Ok(Response::ok(self.snapshot(false)?)),
+            Request::Snapshot { since, full } => {
+                let gen = self.generation();
+                if since == Some(gen) {
+                    return Ok(Response::ok(serde_json::json!({
+                        "unchanged": true,
+                        "generation": gen,
+                    })));
+                }
+                let session = self.snapshot(full)?;
+                Ok(Response::ok(serde_json::json!({
+                    "generation": gen,
+                    "session": session,
+                })))
+            }
+            Request::List => {
+                // List stays a flat Session for scripts; still bumps nothing.
+                Ok(Response::ok(self.snapshot(false)?))
+            }
             Request::Agents => Ok(Response::ok(self.agent_summary()?)),
             Request::Identify { pane } => {
                 let data = self.identify(pane)?;
@@ -2873,25 +2902,18 @@ impl Server {
     }
 
     fn append_output(&self, runtime_key: &str, pane_id: &str, generation: u64, bytes: &[u8]) {
-        let Some((runtime_pane, notifications)) = ({
+        // Hot path: update the vt100 parser + light metadata only. Heavy screen
+        // strings are materialized lazily in snapshot() (improve.md #36).
+        let Some((light, notifications)) = ({
             let mut panes = self.panes.lock_or_recover();
             let runtime = panes.get_mut(runtime_key);
             runtime.and_then(|runtime| {
                 if runtime.generation != generation {
                     return None;
                 }
-                // The vt100 parser buffers partial escape sequences itself, so
-                // it always gets the raw bytes.
                 runtime.parser.process(bytes);
-                // Mark the pane dirty so snapshot() rebuilds the styled
-                // scrollback lazily (never on this hot path).
                 runtime.output_generation = runtime.output_generation.wrapping_add(1);
-                // Decode only the valid UTF-8 prefix, carrying an incomplete
-                // trailing multibyte sequence into the next read so multibyte
-                // characters split across chunk boundaries are never corrupted.
                 let text = decode_utf8_stream(&mut runtime.pending, bytes);
-                // Scan for OSC notifications over an accumulated tail so
-                // sequences that straddle reads are still detected.
                 runtime.osc_tail.push_str(&text);
                 let (notifications, retain_from) = scan_osc_notifications(&runtime.osc_tail);
                 if retain_from > 0 {
@@ -2908,13 +2930,11 @@ impl Server {
                     touch_agent_status(&mut runtime.pane, next, pinned);
                 }
                 if let Some(message) = notifications.last() {
-                    // OSC notifications are explicit attention signals.
                     touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
                     runtime.pane.notification_color = Some("blue".to_string());
                     runtime.pane.notification_message = Some(message.clone());
                 }
-                runtime.pane.output = runtime.parser.screen().contents();
-                runtime.pane.output_formatted = screen_contents_formatted(runtime.parser.screen());
+                // Light fields only — no contents()/formatted/scrollback join here.
                 let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
                 runtime.pane.cursor_row = Some(cursor_row);
                 runtime.pane.cursor_col = Some(cursor_col);
@@ -2922,29 +2942,41 @@ impl Server {
                 runtime.pane.screen_rows = Some(screen_rows);
                 runtime.pane.screen_cols = Some(screen_cols);
                 update_pane_terminal_modes(&mut runtime.pane, runtime.parser.screen());
-                // The deque is byte-bounded to SCROLLBACK_CAP, so this join is
-                // O(cap) rather than O(total output) on every read.
-                runtime.pane.scrollback = trim_output(runtime.joined_output(), SCROLLBACK_CAP);
-                Some((runtime.pane.clone(), notifications))
+                // Clone light metadata for session merge (empty heavy strings).
+                let mut light = runtime.pane.clone();
+                light.output.clear();
+                light.output_formatted.clear();
+                light.scrollback.clear();
+                light.scrollback_formatted.clear();
+                Some((light, notifications))
             })
         }) else {
             return;
         };
+        self.touch();
         let mut should_save = false;
         {
             let mut session = self.session.lock_or_recover();
             if let Some(pane) = session.panes.get_mut(pane_id) {
                 if runtime_key_is_active_for_pane(pane, runtime_key) {
-                    let tabs = pane.tabs.clone();
-                    let active_tab = pane.active_tab.clone();
-                    let metadata = pane.metadata.clone();
-                    *pane = runtime_pane.clone();
-                    pane.tabs = tabs;
-                    pane.active_tab = active_tab;
-                    pane.metadata = metadata;
-                    sync_active_pane_tab(pane);
+                    // Merge light fields only; keep any previously snapshotted
+                    // screen buffers until the next full snapshot refreshes them.
+                    pane.updated_at = light.updated_at;
+                    pane.agent_status = light.agent_status.clone();
+                    pane.agent_status_pinned = light.agent_status_pinned;
+                    pane.agent_status_at = light.agent_status_at;
+                    pane.notification_color = light.notification_color.clone();
+                    pane.notification_message = light.notification_message.clone();
+                    pane.cursor_row = light.cursor_row;
+                    pane.cursor_col = light.cursor_col;
+                    pane.screen_rows = light.screen_rows;
+                    pane.screen_cols = light.screen_cols;
+                    pane.mouse_protocol_mode = light.mouse_protocol_mode.clone();
+                    pane.status = light.status.clone();
+                    pane.pid = light.pid;
+                    pane.progress = light.progress;
                 } else if let Some(tab_id) = runtime_key_tab(pane_id, runtime_key) {
-                    sync_tab_from_runtime_pane(pane, tab_id, &runtime_pane);
+                    sync_tab_from_runtime_pane(pane, tab_id, &light);
                 }
             }
             for message in notifications {
@@ -2984,6 +3016,7 @@ impl Server {
     }
 
     fn schedule_save(&self) {
+        self.touch();
         self.save_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3118,9 +3151,7 @@ impl Server {
                         pane.screen_rows = Some(screen_rows);
                         pane.screen_cols = Some(screen_cols);
                         update_pane_terminal_modes(&mut pane, runtime.parser.screen());
-                        // Rebuild the styled scrollback only when the pane
-                        // produced new output since the last snapshot; otherwise
-                        // reuse the cached string and skip the offset walk.
+                        // Rebuild styled scrollback only when output changed.
                         if runtime.scrollback_formatted_generation != runtime.output_generation {
                             runtime.scrollback_formatted_cache = screen_scrollback_formatted(
                                 &mut runtime.parser,
@@ -3128,13 +3159,28 @@ impl Server {
                             );
                             runtime.scrollback_formatted_generation = runtime.output_generation;
                         }
+                        // Also keep plain scrollback string in runtime for persist/save.
+                        let raw = runtime.joined_output();
+                        runtime.pane.scrollback = trim_output(raw.clone(), SCROLLBACK_CAP);
+                        runtime.pane.output = contents.clone();
+                        runtime.pane.output_formatted = formatted.clone();
+                        runtime.pane.scrollback_formatted =
+                            runtime.scrollback_formatted_cache.clone();
                         Some((
                             contents,
                             formatted,
-                            runtime.joined_output(),
+                            raw,
                             runtime.scrollback_formatted_cache.clone(),
                         ))
                     } else {
+                        // Light snapshot: cursor/status only, no heavy strings.
+                        let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
+                        pane.cursor_row = Some(cursor_row);
+                        pane.cursor_col = Some(cursor_col);
+                        let (screen_rows, screen_cols) = runtime.parser.screen().size();
+                        pane.screen_rows = Some(screen_rows);
+                        pane.screen_cols = Some(screen_cols);
+                        update_pane_terminal_modes(&mut pane, runtime.parser.screen());
                         None
                     };
                     Collected {
@@ -3305,6 +3351,7 @@ impl Server {
     }
 
     fn save(&self) -> Result<()> {
+        self.touch();
         // Keep active-tab records in sync with live layout fields before
         // persisting (inactive tabs already hold their own layout).
         {

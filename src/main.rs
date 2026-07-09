@@ -552,7 +552,14 @@ fn main() -> Result<()> {
         Command::Status => {
             daemon::ensure_running(session)?;
             let response =
-                protocol::request(&paths::socket_path(session)?, &protocol::Request::Snapshot)?;
+                protocol::request(&paths::socket_path(session)?, &protocol::snapshot_full())?;
+            // Flatten {generation,session} for human-friendly status output.
+            if response.ok {
+                if let Some(data) = response.data {
+                    let session = protocol::session_data_from_snapshot(data);
+                    return print_response(protocol::Response::ok(session));
+                }
+            }
             print_response(response)
         }
         Command::Sessions => {
@@ -1894,13 +1901,14 @@ fn move_pane_target_workspace(
 }
 
 fn relative_workspace_from_socket(socket: &std::path::Path, delta: isize) -> Result<String> {
-    let response = protocol::request(socket, &protocol::Request::Snapshot)?;
+    let response = protocol::request(socket, &protocol::snapshot_full())?;
     if !response.ok {
         return print_response(response).map(|_| String::new());
     }
     let snapshot = response
         .data
         .ok_or_else(|| anyhow!("snapshot response did not include session data"))?;
+    let snapshot = protocol::session_data_from_snapshot(snapshot);
     let snapshot = serde_json::from_value::<model::Session>(snapshot)?;
     relative_workspace_id(&snapshot, delta)
 }
@@ -2404,9 +2412,12 @@ fn smoke(keep: bool) -> Result<()> {
         )?;
         checks.push(smoke_check("notify", notify.ok));
 
-        let snapshot = protocol::request(&socket, &protocol::Request::Snapshot)?;
-        let notification_visible = snapshot
+        let snapshot = protocol::request(&socket, &protocol::snapshot_full())?;
+        let session_json = snapshot
             .data
+            .as_ref()
+            .map(|data| protocol::session_data_from_snapshot(data.clone()));
+        let notification_visible = session_json
             .as_ref()
             .and_then(|data| data.get("notifications"))
             .and_then(|notes| notes.as_array())
