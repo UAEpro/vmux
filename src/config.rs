@@ -20,11 +20,12 @@ pub struct LmuxConfig {
 pub struct RelaySettings {
     /// When true, `vmux attach` starts the phone relay if it is not already up.
     pub enabled: bool,
-    /// Where the relay listens: `auto` | `tailscale` | `local` | `all`.
-    /// - auto: Tailscale IP if available, else all interfaces
-    /// - tailscale: Tailscale IP only (falls back to all if TS offline)
+    /// Where the relay listens: `auto` | `tailscale` | `local`.
+    /// Never binds `0.0.0.0` (public/all interfaces) — phone access is
+    /// Tailscale or localhost only.
+    /// - auto: Tailscale IP if online, else localhost
+    /// - tailscale: Tailscale IP only (errors / falls back to local if offline)
     /// - local: 127.0.0.1 only
-    /// - all: 0.0.0.0 (LAN + Tailscale; auth still filters peers)
     pub bind: String,
     /// TCP port (default 4399, Cmux Remote default).
     pub port: u16,
@@ -335,11 +336,16 @@ pub fn supported_default_cwds() -> Vec<&'static str> {
 }
 
 pub fn supported_relay_binds() -> Vec<&'static str> {
-    vec!["auto", "tailscale", "local", "all"]
+    // Intentionally no "all" / 0.0.0.0 — keeps the relay off the public LAN.
+    vec!["auto", "tailscale", "local"]
 }
 
 fn normalize_relay_bind(value: &str) -> String {
     let normalized = value.trim().to_ascii_lowercase();
+    // Migrate removed "all" (insecure all-interfaces) to safe auto.
+    if normalized == "all" {
+        return "auto".to_string();
+    }
     if supported_relay_binds().contains(&normalized.as_str()) {
         normalized
     } else {

@@ -32,7 +32,8 @@ use crate::protocol::{self, Request, Response};
 use std::process::{Command as ProcessCommand, Stdio};
 
 const RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_LISTEN: &str = "0.0.0.0:4399";
+/// Safe default: localhost only. Never default to 0.0.0.0.
+const DEFAULT_LISTEN: &str = "127.0.0.1:4399";
 const DEFAULT_FPS: u32 = 15;
 const DEFAULT_IDLE_FPS: u32 = 5;
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
@@ -43,7 +44,7 @@ const MAX_WS_MSG: usize = 24 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RelayConfig {
-    /// `host:port` bind address (default `0.0.0.0:4399`).
+    /// `host:port` bind address (default `127.0.0.1:4399`; never `0.0.0.0`).
     pub listen: String,
     /// Tailscale login names allowed to register devices. Empty = any
     /// successful `tailscale whois` peer (or localhost when allowed).
@@ -274,6 +275,15 @@ pub fn serve(
     if !session.is_empty() && session != "default" {
         config.session = session.to_string();
     }
+    // Harden legacy configs that still say 0.0.0.0.
+    if assert_safe_listen(&config.listen).is_err() {
+        eprintln!(
+            "vmux relay: refusing listen {} — remapping to {}",
+            config.listen, DEFAULT_LISTEN
+        );
+        config.listen = DEFAULT_LISTEN.to_string();
+    }
+    assert_safe_listen(&config.listen)?;
 
     daemon::ensure_running(&config.session)?;
     let socket = paths::socket_path(&config.session)?;
@@ -393,6 +403,9 @@ pub fn managed_log_path() -> Result<PathBuf> {
 }
 
 /// Resolve listen address from settings bind mode + port.
+///
+/// **Never returns `0.0.0.0` / `::`.** Phone access is Tailscale CGNAT or
+/// localhost only, so the host is not exposed on every interface.
 pub fn resolve_listen(settings: &RelaySettings) -> String {
     let port = if settings.port == 0 {
         4399
@@ -401,17 +414,33 @@ pub fn resolve_listen(settings: &RelaySettings) -> String {
     };
     match settings.bind.as_str() {
         "local" => format!("127.0.0.1:{port}"),
-        "all" => format!("0.0.0.0:{port}"),
         "tailscale" => match tailscale_ipv4() {
             Some(ip) => format!("{ip}:{port}"),
-            None => format!("0.0.0.0:{port}"),
+            // Offline: stay local rather than opening all interfaces.
+            None => format!("127.0.0.1:{port}"),
         },
-        // auto
+        // auto (and any unknown / migrated "all")
         _ => match tailscale_ipv4() {
             Some(ip) => format!("{ip}:{port}"),
-            None => format!("0.0.0.0:{port}"),
+            None => format!("127.0.0.1:{port}"),
         },
     }
+}
+
+/// Reject binds that would listen on every interface (public exposure risk).
+pub fn assert_safe_listen(listen: &str) -> Result<()> {
+    let host = listen
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim())
+        .unwrap_or(listen.trim());
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host == "0.0.0.0" || host == "::" || host == "*" {
+        bail!(
+            "refusing to bind relay on {host} (all interfaces). \
+             Use Tailscale IP, 127.0.0.1, or relay.bind=auto|tailscale|local"
+        );
+    }
+    Ok(())
 }
 
 fn tailscale_ipv4() -> Option<String> {
@@ -500,6 +529,7 @@ pub fn ensure_from_config(session: &str, config: &LmuxConfig) -> Result<Option<S
 /// Start managed relay (or return existing). Returns a short status message.
 pub fn ensure_started(session: &str, settings: &RelaySettings) -> Result<Option<String>> {
     let listen = resolve_listen(settings);
+    assert_safe_listen(&listen)?;
     if is_healthy(&listen) {
         return Ok(Some(format!("mobile relay already running on {listen}")));
     }
@@ -2179,6 +2209,32 @@ mod tests {
         assert!(is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(100, 127, 1, 1))));
         assert!(!is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(100, 63, 0, 1))));
         assert!(!is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    }
+
+    #[test]
+    fn refuses_all_interfaces_listen() {
+        assert!(assert_safe_listen("0.0.0.0:4399").is_err());
+        assert!(assert_safe_listen("[::]:4399").is_err());
+        assert!(assert_safe_listen("127.0.0.1:4399").is_ok());
+        assert!(assert_safe_listen("100.92.56.118:4399").is_ok());
+    }
+
+    #[test]
+    fn resolve_listen_never_all_interfaces() {
+        let local = RelaySettings {
+            enabled: true,
+            bind: "local".into(),
+            port: 4399,
+            allow_localhost: false,
+            allow_tailnet_cgnat: true,
+        };
+        assert_eq!(resolve_listen(&local), "127.0.0.1:4399");
+        let all_migrated = RelaySettings {
+            bind: "all".into(),
+            ..local.clone()
+        };
+        // Unknown/removed modes fall through to auto → never 0.0.0.0
+        assert!(!resolve_listen(&all_migrated).starts_with("0.0.0.0"));
     }
 
     #[test]

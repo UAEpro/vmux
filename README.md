@@ -435,14 +435,17 @@ In **attach** open **⚙ set** → section **mobile relay**:
 | Setting | Meaning |
 |---------|---------|
 | **mobile relay** | `on` / `off` — when on, attach auto-starts the relay |
-| **relay bind** | `auto` (Tailscale IP if available, else all) · `tailscale` · `local` · `all` |
+| **relay bind** | `auto` (Tailscale IP if online, else localhost) · `tailscale` · `local` |
 | **relay localhost** | allow device register from `127.0.0.1` (dev) |
+
+**No “all interfaces” / `0.0.0.0` option** — the relay refuses that bind so the
+server is not exposed on every NIC. Phone access is **Tailscale** or **localhost**.
 
 Same via CLI:
 
 ```sh
 vmux config set relay.enabled true
-vmux config set relay.bind auto          # auto | tailscale | local | all
+vmux config set relay.bind auto          # auto | tailscale | local
 vmux config set relay.allow_localhost false
 ```
 
@@ -468,10 +471,10 @@ Config is created on first run at `~/.config/vmux/relay.json`:
 
 ```json
 {
-  "listen": "0.0.0.0:4399",
+  "listen": "127.0.0.1:4399",
   "allow_login": [],
   "allow_localhost": false,
-  "allow_tailnet_cgnat": false,
+  "allow_tailnet_cgnat": true,
   "default_fps": 15,
   "idle_fps": 5,
   "session": "default"
@@ -480,9 +483,10 @@ Config is created on first run at `~/.config/vmux/relay.json`:
 
 | Key | Meaning |
 |-----|---------|
+| `listen` | Host:port — **must not** be `0.0.0.0` / `::` (refused at start) |
 | `allow_login` | Tailscale login names allowed to pair (empty = any successful `tailscale whois`) |
 | `allow_localhost` | Allow `127.0.0.1` registration (or env `VMUX_RELAY_ALLOW_LOCALHOST=1`) |
-| `allow_tailnet_cgnat` | Accept `100.64.0.0/10` peers without whois (weaker; last resort) |
+| `allow_tailnet_cgnat` | Accept `100.64.0.0/10` peers without whois (practical with Tailscale) |
 | `bootstrap_secret` | Optional shared secret for restricted pairing flows |
 | `session` | vmux session name the relay attaches to |
 

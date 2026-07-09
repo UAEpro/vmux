@@ -166,7 +166,7 @@ struct Ui {
     bell_on_attention: bool,
     /// Settings: auto-start phone relay on attach.
     mobile_relay_enabled: bool,
-    /// Settings: `auto` | `tailscale` | `local` | `all`.
+    /// Settings: `auto` | `tailscale` | `local` (never all-interfaces).
     mobile_relay_bind: String,
     mobile_relay_port: u16,
     mobile_relay_allow_localhost: bool,
@@ -7246,7 +7246,7 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                     }
                 }
                 SettingsEntryId::SectionRelay => {
-                    "Cmux Remote / phone (Tailscale or LAN)".to_string()
+                    "Cmux Remote / phone (Tailscale or localhost only)".to_string()
                 }
                 SettingsEntryId::MobileRelay => {
                     let settings = crate::config::RelaySettings {
@@ -7261,8 +7261,7 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                 SettingsEntryId::MobileRelayBind => match view.mobile_relay_bind {
                     "tailscale" => "tailscale only".to_string(),
                     "local" => "localhost only".to_string(),
-                    "all" => "all interfaces".to_string(),
-                    _ => "auto (Tailscale → LAN)".to_string(),
+                    _ => "auto (Tailscale → localhost)".to_string(),
                 },
                 SettingsEntryId::MobileRelayLocalhost => {
                     if view.mobile_relay_allow_localhost {
