@@ -1,0 +1,29 @@
+# Rust build
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local agent / tool state (do not commit)
+.claude/
+.codex/
+.agents/
+.vmux/
+
+# Local scratch
+test.md
+{
+*.log
+*.tmp
+
+# Env / secrets
+.env
+.env.*
+!.env.example
