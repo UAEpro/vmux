@@ -9,6 +9,41 @@ use crate::paths;
 pub struct LmuxConfig {
     #[serde(default)]
     pub ui: UiConfig,
+    /// Opt-in mobile / Cmux Remote relay (started on attach when enabled).
+    #[serde(default)]
+    pub relay: RelaySettings,
+}
+
+/// Mobile relay preferences (settings UI + `vmux config set relay.*`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RelaySettings {
+    /// When true, `vmux attach` starts the phone relay if it is not already up.
+    pub enabled: bool,
+    /// Where the relay listens: `auto` | `tailscale` | `local` | `all`.
+    /// - auto: Tailscale IP if available, else all interfaces
+    /// - tailscale: Tailscale IP only (falls back to all if TS offline)
+    /// - local: 127.0.0.1 only
+    /// - all: 0.0.0.0 (LAN + Tailscale; auth still filters peers)
+    pub bind: String,
+    /// TCP port (default 4399, Cmux Remote default).
+    pub port: u16,
+    /// Allow localhost device registration (dev / same machine).
+    pub allow_localhost: bool,
+    /// Accept Tailscale CGNAT peers without whois (practical on Linux).
+    pub allow_tailnet_cgnat: bool,
+}
+
+impl Default for RelaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "auto".to_string(),
+            port: 4399,
+            allow_localhost: false,
+            allow_tailnet_cgnat: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +91,7 @@ impl Default for LmuxConfig {
     fn default() -> Self {
         Self {
             ui: UiConfig::default(),
+            relay: RelaySettings::default(),
         }
     }
 }
@@ -97,6 +133,10 @@ impl LmuxConfig {
         self.ui.status_markers = normalize_status_markers(&self.ui.status_markers);
         self.ui.default_shell = self.ui.default_shell.trim().to_string();
         self.ui.default_cwd = normalize_default_cwd(&self.ui.default_cwd);
+        self.relay.bind = normalize_relay_bind(&self.relay.bind);
+        if self.relay.port == 0 {
+            self.relay.port = 4399;
+        }
         self
     }
 }
@@ -210,6 +250,33 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
         "ui.bell_on_attention" => {
             config.ui.bell_on_attention = parse_bool(value)?;
         }
+        "relay.enabled" => {
+            config.relay.enabled = parse_bool(value)?;
+        }
+        "relay.bind" => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if !supported_relay_binds().contains(&normalized.as_str()) {
+                return Err(anyhow!(
+                    "relay.bind must be one of {}",
+                    supported_relay_binds().join(", ")
+                ));
+            }
+            config.relay.bind = normalized;
+        }
+        "relay.port" => {
+            config.relay.port = value
+                .parse::<u16>()
+                .map_err(|_| anyhow!("relay.port must be a port number"))?;
+            if config.relay.port == 0 {
+                return Err(anyhow!("relay.port must be non-zero"));
+            }
+        }
+        "relay.allow_localhost" => {
+            config.relay.allow_localhost = parse_bool(value)?;
+        }
+        "relay.allow_tailnet_cgnat" => {
+            config.relay.allow_tailnet_cgnat = parse_bool(value)?;
+        }
         other => return Err(anyhow!("unknown config key {other}")),
     }
     *config = config.clone().normalized();
@@ -265,6 +332,19 @@ pub fn supported_status_markers() -> Vec<&'static str> {
 
 pub fn supported_default_cwds() -> Vec<&'static str> {
     vec!["launch", "home"]
+}
+
+pub fn supported_relay_binds() -> Vec<&'static str> {
+    vec!["auto", "tailscale", "local", "all"]
+}
+
+fn normalize_relay_bind(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if supported_relay_binds().contains(&normalized.as_str()) {
+        normalized
+    } else {
+        "auto".to_string()
+    }
 }
 
 /// Common prefix keys the settings UI can cycle (must parse via `parse_key_binding`).

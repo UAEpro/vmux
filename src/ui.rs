@@ -35,6 +35,15 @@ pub fn attach(session: &str) -> Result<()> {
     // Load config before entering raw mode / the alternate screen so a config
     // error returns cleanly without leaving the user's shell in a broken state.
     let config = crate::config::load()?;
+    // Opt-in mobile relay: only when Settings → mobile relay is enabled.
+    // Failures are non-fatal so attach still works offline / without Tailscale.
+    if config.relay.enabled {
+        match crate::relay::ensure_from_config(session, &config) {
+            Ok(Some(msg)) => eprintln!("vmux: {msg}"),
+            Ok(None) => {}
+            Err(err) => eprintln!("vmux: mobile relay not started ({err:#})"),
+        }
+    }
     // Enable raw mode + the alternate screen behind an RAII guard so the TTY is
     // always restored, even if `Ui::new`, terminal init, an early RPC, or a
     // panic inside `run` bails out between here and normal teardown.
@@ -155,6 +164,13 @@ struct Ui {
     mouse: bool,
     tab_close_button: bool,
     bell_on_attention: bool,
+    /// Settings: auto-start phone relay on attach.
+    mobile_relay_enabled: bool,
+    /// Settings: `auto` | `tailscale` | `local` | `all`.
+    mobile_relay_bind: String,
+    mobile_relay_port: u16,
+    mobile_relay_allow_localhost: bool,
+    mobile_relay_allow_cgnat: bool,
     /// Pane ids last seen in Attention (for one-shot bell).
     prev_attention_panes: BTreeSet<String>,
     actions: Vec<UiAction>,
@@ -717,6 +733,11 @@ impl Ui {
             mouse: config.ui.mouse,
             tab_close_button: config.ui.tab_close_button,
             bell_on_attention: config.ui.bell_on_attention,
+            mobile_relay_enabled: config.relay.enabled,
+            mobile_relay_bind: config.relay.bind.clone(),
+            mobile_relay_port: config.relay.port,
+            mobile_relay_allow_localhost: config.relay.allow_localhost,
+            mobile_relay_allow_cgnat: config.relay.allow_tailnet_cgnat,
             prev_attention_panes: BTreeSet::new(),
             actions: Vec::new(),
             action_error: std::cell::RefCell::new(None),
@@ -834,6 +855,11 @@ impl Ui {
                             self.default_cwd.as_str(),
                             self.mouse,
                             self.bell_on_attention,
+                            self.mobile_relay_enabled,
+                            self.mobile_relay_bind.as_str(),
+                            self.mobile_relay_port,
+                            self.mobile_relay_allow_localhost,
+                            self.mobile_relay_allow_cgnat,
                         )
                     })?;
                 }
@@ -1499,7 +1525,10 @@ impl Ui {
             } else {
                 current.saturating_add(1).min(count.saturating_sub(1))
             };
-            if entries[current].id != SettingsEntryId::Section {
+            if !matches!(
+                entries[current].id,
+                SettingsEntryId::Section | SettingsEntryId::SectionRelay
+            ) {
                 break;
             }
             if (delta.is_negative() && current == 0)
@@ -1509,7 +1538,10 @@ impl Ui {
             }
         }
         // If we landed on a section (edge case), nudge off it.
-        if entries[current].id == SettingsEntryId::Section {
+        if matches!(
+            entries[current].id,
+            SettingsEntryId::Section | SettingsEntryId::SectionRelay
+        ) {
             if current + 1 < count {
                 current += 1;
             } else if current > 0 {
@@ -1616,6 +1648,40 @@ impl Ui {
                 self.bell_on_attention = !self.bell_on_attention;
                 self.save_ui_config("ui.bell_on_attention", &self.bell_on_attention.to_string())?;
             }
+            SettingsEntryId::MobileRelay => {
+                self.mobile_relay_enabled = !self.mobile_relay_enabled;
+                self.save_ui_config("relay.enabled", &self.mobile_relay_enabled.to_string())?;
+                let msg = crate::relay::apply_enabled(&self.session, &self.relay_settings())?;
+                *self.action_error.get_mut() = Some(msg);
+            }
+            SettingsEntryId::MobileRelayBind => {
+                let next = crate::config::cycle_choice(
+                    &crate::config::supported_relay_binds(),
+                    &self.mobile_relay_bind,
+                    delta,
+                );
+                self.mobile_relay_bind = next.clone();
+                self.save_ui_config("relay.bind", &next)?;
+                // Restart managed relay with new bind if enabled.
+                if self.mobile_relay_enabled {
+                    let _ = crate::relay::stop_managed();
+                    let msg = crate::relay::ensure_started(&self.session, &self.relay_settings())?;
+                    if let Some(msg) = msg {
+                        *self.action_error.get_mut() = Some(msg);
+                    }
+                }
+            }
+            SettingsEntryId::MobileRelayLocalhost => {
+                self.mobile_relay_allow_localhost = !self.mobile_relay_allow_localhost;
+                self.save_ui_config(
+                    "relay.allow_localhost",
+                    &self.mobile_relay_allow_localhost.to_string(),
+                )?;
+                if self.mobile_relay_enabled {
+                    let _ = crate::relay::stop_managed();
+                    let _ = crate::relay::ensure_started(&self.session, &self.relay_settings())?;
+                }
+            }
             SettingsEntryId::HookShell
             | SettingsEntryId::HookClaude
             | SettingsEntryId::HookCodex
@@ -1624,9 +1690,19 @@ impl Ui {
                 // Install / re-install agent hooks (Enter / l / h all install).
                 self.install_selected_agent_hooks(entry.id)?;
             }
-            SettingsEntryId::Section => {}
+            SettingsEntryId::Section | SettingsEntryId::SectionRelay => {}
         }
         Ok(())
+    }
+
+    fn relay_settings(&self) -> crate::config::RelaySettings {
+        crate::config::RelaySettings {
+            enabled: self.mobile_relay_enabled,
+            bind: self.mobile_relay_bind.clone(),
+            port: self.mobile_relay_port,
+            allow_localhost: self.mobile_relay_allow_localhost,
+            allow_tailnet_cgnat: self.mobile_relay_allow_cgnat,
+        }
     }
 
     fn apply_prefix_key(&mut self, binding: &str) -> Result<()> {
@@ -2759,6 +2835,11 @@ fn draw(
     default_cwd: &str,
     mouse: bool,
     bell_on_attention: bool,
+    mobile_relay_enabled: bool,
+    mobile_relay_bind: &str,
+    mobile_relay_port: u16,
+    mobile_relay_allow_localhost: bool,
+    mobile_relay_allow_cgnat: bool,
 ) {
     let palette = theme.palette();
     let sidebar_width = sidebar_width(sidebar_collapsed, sidebar_expanded);
@@ -2954,6 +3035,11 @@ fn draw(
                 mouse,
                 tab_close_button,
                 bell_on_attention,
+                mobile_relay_enabled,
+                mobile_relay_bind,
+                mobile_relay_port,
+                mobile_relay_allow_localhost,
+                mobile_relay_allow_cgnat,
                 selected: settings_selected,
             },
         ),
@@ -6952,6 +7038,10 @@ enum SettingsEntryId {
     Mouse,
     TabCloseButton,
     BellOnAttention,
+    SectionRelay,
+    MobileRelay,
+    MobileRelayBind,
+    MobileRelayLocalhost,
     Section,
     HookShell,
     HookClaude,
@@ -7024,6 +7114,22 @@ fn settings_entries() -> Vec<SettingsEntry> {
             name: "bell on attention",
         },
         SettingsEntry {
+            id: SettingsEntryId::SectionRelay,
+            name: "── mobile relay ──",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::MobileRelay,
+            name: "mobile relay",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::MobileRelayBind,
+            name: "relay bind",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::MobileRelayLocalhost,
+            name: "relay localhost",
+        },
+        SettingsEntry {
             id: SettingsEntryId::Section,
             name: "── agent hooks ──",
         },
@@ -7065,6 +7171,11 @@ struct SettingsView<'a> {
     mouse: bool,
     tab_close_button: bool,
     bell_on_attention: bool,
+    mobile_relay_enabled: bool,
+    mobile_relay_bind: &'a str,
+    mobile_relay_port: u16,
+    mobile_relay_allow_localhost: bool,
+    mobile_relay_allow_cgnat: bool,
     selected: usize,
 }
 
@@ -7134,6 +7245,32 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         "off".to_string()
                     }
                 }
+                SettingsEntryId::SectionRelay => {
+                    "Cmux Remote / phone (Tailscale or LAN)".to_string()
+                }
+                SettingsEntryId::MobileRelay => {
+                    let settings = crate::config::RelaySettings {
+                        enabled: view.mobile_relay_enabled,
+                        bind: view.mobile_relay_bind.to_string(),
+                        port: view.mobile_relay_port,
+                        allow_localhost: view.mobile_relay_allow_localhost,
+                        allow_tailnet_cgnat: view.mobile_relay_allow_cgnat,
+                    };
+                    crate::relay::runtime_status_line(&settings)
+                }
+                SettingsEntryId::MobileRelayBind => match view.mobile_relay_bind {
+                    "tailscale" => "tailscale only".to_string(),
+                    "local" => "localhost only".to_string(),
+                    "all" => "all interfaces".to_string(),
+                    _ => "auto (Tailscale → LAN)".to_string(),
+                },
+                SettingsEntryId::MobileRelayLocalhost => {
+                    if view.mobile_relay_allow_localhost {
+                        "allow register from 127.0.0.1".to_string()
+                    } else {
+                        "deny localhost register".to_string()
+                    }
+                }
                 SettingsEntryId::Section => "sidebar emoji for agents".to_string(),
                 SettingsEntryId::HookShell => {
                     hook_status_value(&hook_status, crate::agent_hooks::IntegrationKind::Shell)
@@ -7160,7 +7297,10 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                 }
             };
             let marker = if active { "›" } else { " " };
-            let style = if entry.id == SettingsEntryId::Section {
+            let style = if matches!(
+                entry.id,
+                SettingsEntryId::Section | SettingsEntryId::SectionRelay
+            ) {
                 Style::default().fg(theme.palette().muted)
             } else if active {
                 selected_row_style(theme.palette())
@@ -7439,6 +7579,11 @@ mod tests {
                     "launch",
                     true,
                     false,
+                    false,
+                    "auto",
+                    4399,
+                    false,
+                    true,
                 )
             })
             .unwrap();
@@ -7506,6 +7651,11 @@ mod tests {
                     "launch",
                     true,
                     false,
+                    false,
+                    "auto",
+                    4399,
+                    false,
+                    true,
                 )
             })
             .unwrap();
@@ -8950,6 +9100,11 @@ mod tests {
             mouse: true,
             tab_close_button: true,
             bell_on_attention: false,
+            mobile_relay_enabled: false,
+            mobile_relay_bind: "auto",
+            mobile_relay_port: 4399,
+            mobile_relay_allow_localhost: false,
+            mobile_relay_allow_cgnat: true,
             selected: 0,
         });
 
@@ -8967,6 +9122,12 @@ mod tests {
             line.spans
                 .first()
                 .map(|s| s.content.as_ref().contains("agent hooks"))
+                .unwrap_or(false)
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .first()
+                .map(|s| s.content.as_ref().contains("mobile relay"))
                 .unwrap_or(false)
         }));
         assert!(lines.iter().any(|line| {

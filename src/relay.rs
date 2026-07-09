@@ -25,9 +25,11 @@ use tungstenite::protocol::Role;
 use tungstenite::Message;
 
 use crate::cli::SplitDirection;
+use crate::config::{LmuxConfig, RelaySettings};
 use crate::daemon;
 use crate::paths;
 use crate::protocol::{self, Request, Response};
+use std::process::{Command as ProcessCommand, Stdio};
 
 const RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_LISTEN: &str = "0.0.0.0:4399";
@@ -378,6 +380,231 @@ pub fn devices_revoke(device_id: &str) -> Result<()> {
         bail!("device not found: {device_id}");
     }
     Ok(())
+}
+
+// ─── Managed lifecycle (settings / attach auto-start) ───────────────────────
+
+pub fn managed_pid_path() -> Result<PathBuf> {
+    Ok(paths::state_dir()?.join("relay.pid"))
+}
+
+pub fn managed_log_path() -> Result<PathBuf> {
+    Ok(paths::runtime_dir()?.join("relay.log"))
+}
+
+/// Resolve listen address from settings bind mode + port.
+pub fn resolve_listen(settings: &RelaySettings) -> String {
+    let port = if settings.port == 0 {
+        4399
+    } else {
+        settings.port
+    };
+    match settings.bind.as_str() {
+        "local" => format!("127.0.0.1:{port}"),
+        "all" => format!("0.0.0.0:{port}"),
+        "tailscale" => match tailscale_ipv4() {
+            Some(ip) => format!("{ip}:{port}"),
+            None => format!("0.0.0.0:{port}"),
+        },
+        // auto
+        _ => match tailscale_ipv4() {
+            Some(ip) => format!("{ip}:{port}"),
+            None => format!("0.0.0.0:{port}"),
+        },
+    }
+}
+
+fn tailscale_ipv4() -> Option<String> {
+    let output = ProcessCommand::new("tailscale")
+        .args(["ip", "-4"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ip = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if ip.is_empty() || !ip.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    Some(ip)
+}
+
+/// Probe whether something answers on the relay health endpoint for `listen`.
+pub fn is_healthy(listen: &str) -> bool {
+    let port = port_of(listen).unwrap_or(4399);
+    // Prefer loopback for health when bound to 0.0.0.0 or a remote interface IP.
+    let host = if listen.starts_with("127.") {
+        "127.0.0.1"
+    } else if let Some((h, _)) = listen.rsplit_once(':') {
+        if h == "0.0.0.0" || h == "[::]" || h == "::" {
+            "127.0.0.1"
+        } else {
+            h.trim_start_matches('[').trim_end_matches(']')
+        }
+    } else {
+        "127.0.0.1"
+    };
+    let url = format!("http://{host}:{port}/v1/health");
+    ureq_get_health(&url)
+        .map(|body| body.contains("\"ok\":true") || body.contains("\"ok\": true"))
+        .unwrap_or(false)
+}
+
+/// Human-readable status for the settings panel.
+pub fn runtime_status_line(settings: &RelaySettings) -> String {
+    let listen = resolve_listen(settings);
+    if is_healthy(&listen) {
+        format!("running · {listen}")
+    } else if settings.enabled {
+        format!("enabled · not running · {listen}")
+    } else {
+        format!("off · {listen}")
+    }
+}
+
+/// Sync main config relay section into `~/.config/vmux/relay.json` used by serve.
+pub fn sync_relay_json_from_settings(session: &str, settings: &RelaySettings) -> Result<PathBuf> {
+    let path = default_config_path()?;
+    let listen = resolve_listen(settings);
+    let mut file_cfg = if path.exists() {
+        load_or_init_config(&path)?
+    } else {
+        RelayConfig::default()
+    };
+    file_cfg.listen = listen;
+    file_cfg.session = session.to_string();
+    file_cfg.allow_localhost = settings.allow_localhost;
+    file_cfg.allow_tailnet_cgnat = settings.allow_tailnet_cgnat;
+    // Keep empty allow_login = any successful whois / CGNAT policy.
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(&file_cfg)? + "\n")?;
+    Ok(path)
+}
+
+/// If settings say enabled, start a managed relay process when not already healthy.
+/// Safe to call from attach: no-op when disabled or already running.
+pub fn ensure_from_config(session: &str, config: &LmuxConfig) -> Result<Option<String>> {
+    if !config.relay.enabled {
+        return Ok(None);
+    }
+    ensure_started(session, &config.relay)
+}
+
+/// Start managed relay (or return existing). Returns a short status message.
+pub fn ensure_started(session: &str, settings: &RelaySettings) -> Result<Option<String>> {
+    let listen = resolve_listen(settings);
+    if is_healthy(&listen) {
+        return Ok(Some(format!("mobile relay already running on {listen}")));
+    }
+    // Clean stale pid
+    let _ = stop_managed();
+
+    let cfg_path = sync_relay_json_from_settings(session, settings)?;
+    let log_path = managed_log_path()?;
+    let pid_path = managed_pid_path()?;
+    let exe = std::env::current_exe().context("resolve vmux executable")?;
+
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open relay log {}", log_path.display()))?;
+    let log_err = log_file.try_clone()?;
+
+    let mut cmd = ProcessCommand::new(exe);
+    cmd.arg("--session")
+        .arg(session)
+        .arg("relay")
+        .arg("serve")
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--listen")
+        .arg(&listen);
+    if settings.allow_localhost {
+        cmd.arg("--allow-localhost");
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_err));
+
+    // Detach from controlling terminal / process group so attach exit doesn't kill relay.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // setsid so SIGHUP from the attach TTY does not stop the relay.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().context("spawn vmux relay serve")?;
+    let pid = child.id();
+    fs::write(&pid_path, format!("{pid}\n"))
+        .with_context(|| format!("write {}", pid_path.display()))?;
+
+    // Wait briefly for health
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(100));
+        if is_healthy(&listen) {
+            return Ok(Some(format!(
+                "mobile relay started on {listen} (pid {pid})"
+            )));
+        }
+    }
+    Ok(Some(format!(
+        "mobile relay spawning on {listen} (pid {pid}; check {})",
+        log_path.display()
+    )))
+}
+
+/// Stop the managed relay process if we started it (pid file).
+pub fn stop_managed() -> Result<bool> {
+    let path = managed_pid_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    let pid: i32 = raw.trim().parse().unwrap_or(0);
+    let _ = fs::remove_file(&path);
+    if pid <= 1 {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        // Only kill if still looks like our relay (best-effort).
+        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+        thread::sleep(Duration::from_millis(150));
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    Ok(true)
+}
+
+/// Apply settings change: enable starts, disable stops.
+pub fn apply_enabled(session: &str, settings: &RelaySettings) -> Result<String> {
+    if settings.enabled {
+        Ok(ensure_started(session, settings)?.unwrap_or_else(|| "mobile relay on".into()))
+    } else {
+        let stopped = stop_managed()?;
+        // Also try to free port if someone else left a process — only if healthy
+        // and we don't know the pid; leave foreign processes alone.
+        if stopped {
+            Ok("mobile relay stopped".into())
+        } else if is_healthy(&resolve_listen(settings)) {
+            Ok("relay still reachable (not managed by this pid file)".into())
+        } else {
+            Ok("mobile relay off".into())
+        }
+    }
 }
 
 fn ureq_get_health(url: &str) -> Result<String> {

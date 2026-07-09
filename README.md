@@ -428,7 +428,28 @@ iPhone app and drive **vmux** workspaces/panes from your phone.
 iPhone (Cmux Remote)  ── Tailscale ──►  vmux relay :4399  ── Unix socket ──►  vmux daemon
 ```
 
-### Start
+### Settings (recommended)
+
+In **attach** open **⚙ set** → section **mobile relay**:
+
+| Setting | Meaning |
+|---------|---------|
+| **mobile relay** | `on` / `off` — when on, attach auto-starts the relay |
+| **relay bind** | `auto` (Tailscale IP if available, else all) · `tailscale` · `local` · `all` |
+| **relay localhost** | allow device register from `127.0.0.1` (dev) |
+
+Same via CLI:
+
+```sh
+vmux config set relay.enabled true
+vmux config set relay.bind auto          # auto | tailscale | local | all
+vmux config set relay.allow_localhost false
+```
+
+When enabled, the next `vmux attach` (or flipping the switch in Settings) starts a
+managed relay process. Turning it **off** stops the managed process.
+
+### Manual start
 
 ```sh
 # Ensure a session daemon is up (auto-started by the relay if needed)
