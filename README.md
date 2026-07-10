@@ -415,7 +415,7 @@ User config is managed by `vmux config` and mirrored in the attach **Settings** 
 | `ui.sidebar_collapsed` | `true` / `false` | Compact sidebar |
 | `ui.sidebar_width` | `28` | Expanded width |
 | `ui.scroll_step` | `8` | Scroll lines |
-| `ui.theme` | `default`, `contrast`, … | Color theme |
+| `ui.theme` | `midnight`, `daylight`, `contrast`, `nord`, `dracula`, `gruvbox`, `catppuccin`, `solarized-dark`, `solarized-light`, `tokyo-night`, `forest`, `rose-pine`, `ocean`, `ember`, `monokai` | Color theme (15) |
 | `ui.status_markers` | `emoji`, `ascii`, `off` | Sidebar markers |
 | `ui.cursor` | (settings panel) | Cursor style / blink |
 
