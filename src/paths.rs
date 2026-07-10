@@ -160,11 +160,99 @@ pub fn list_sessions() -> Result<Vec<SessionArtifact>> {
 }
 
 pub fn read_pid_file(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    read_pid_record(path).map(|r| r.pid)
+}
+
+/// PID file record: `pid` on line 1, optional process starttime (jiffies) on line 2.
+/// Starttime prevents signalling a recycled PID after a crash (bugs.md P1#2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidRecord {
+    pub pid: u32,
+    pub starttime: Option<u64>,
+}
+
+pub fn read_pid_record(path: &Path) -> Option<PidRecord> {
+    let raw = fs::read_to_string(path).ok()?;
+    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+    let pid = lines.next()?.trim().parse().ok()?;
+    let starttime = lines.next().and_then(|l| l.trim().parse().ok());
+    Some(PidRecord { pid, starttime })
+}
+
+pub fn write_pid_record(path: &Path, pid: u32) -> Result<()> {
+    let starttime = process_starttime(pid).unwrap_or(0);
+    fs::write(path, format!("{pid}\n{starttime}\n"))
+        .with_context(|| format!("write pid file {}", path.display()))
 }
 
 pub fn process_exists(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+/// Linux `/proc/<pid>/stat` field 22 (starttime in clock ticks).
+pub fn process_starttime(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm can contain spaces/parens: parse after the last `) `.
+    let after_comm = stat.rsplit_once(") ").map(|(_, rest)| rest)?;
+    let field = after_comm.split_whitespace().nth(19)?; // 22nd field overall → index 19 after comm
+    field.parse().ok()
+}
+
+/// True when `pid` is alive and matches the recorded starttime (if present).
+pub fn process_matches_record(record: PidRecord) -> bool {
+    if !process_exists(record.pid) {
+        return false;
+    }
+    match record.starttime {
+        None | Some(0) => true, // legacy pid files without starttime
+        Some(expected) => process_starttime(record.pid) == Some(expected),
+    }
+}
+
+/// Best-effort: does `/proc/<pid>/cmdline` look like a vmux daemon/relay?
+pub fn process_cmdline_contains(pid: u32, needle: &str) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|bytes| {
+            let text = String::from_utf8_lossy(&bytes);
+            text.contains(needle)
+        })
+        .unwrap_or(false)
+}
+
+/// Path of the exclusive session lock file.
+pub fn lock_path(session: &str) -> Result<PathBuf> {
+    validate_session_name(session)?;
+    Ok(runtime_dir()?.join(format!("{session}.lock")))
+}
+
+/// Acquire an exclusive non-blocking lock for this session (single-instance).
+/// Returns the held file so the OS releases the lock when the process exits.
+#[cfg(unix)]
+pub fn try_lock_session(session: &str) -> Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let path = lock_path(session)?;
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open lock {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        bail!(
+            "session {session:?} is already locked by another vmux daemon (lock {})",
+            path.display()
+        );
+    }
+    // Record our pid inside the lock for doctor/debug.
+    let _ = fs::write(&path, format!("{}\n", std::process::id()));
+    // Keep flock: rewriting path content doesn't drop the lock on the open fd.
+    Ok(Some(file))
 }
 
 fn collect_session_names(dir: &Path, extension: &str, names: &mut BTreeSet<String>) -> Result<()> {

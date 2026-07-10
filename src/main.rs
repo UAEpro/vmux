@@ -941,8 +941,7 @@ fn config_command(command: ConfigCommand) -> Result<()> {
             })))
         }
         ConfigCommand::Set { key, value } => {
-            let path = paths::config_path()?;
-            let mut config = config::load()?;
+            let (path, mut config) = config::load_for_mutation()?;
             config::set_value(&mut config, &key, &value)?;
             config::save_to_path(&path, &config)?;
             print_response(protocol::Response::ok(serde_json::json!({
@@ -1008,7 +1007,8 @@ Use this skill when an agent is running inside a vmux pane and needs to inspect 
 ## Control Panes
 
 - Create panes with `vmux new-pane --direction right --command "claude"`.
-- Group related terminal surfaces inside a pane with `vmux pane-tab add --pane PANE --title tests --command "cargo test"` and activate them with `vmux pane-tab switch tab-2 --pane PANE`.
+- Hierarchy is **Workspace → Tab → Pane**. Create a workspace tab with `vmux tab new --title tests --command "cargo test"` and switch with `vmux tab switch tab-2`.
+- Split panes with `vmux new-pane --direction right` / `down`.
 - Send text with `vmux send --pane PANE --enter "message"`.
 - Send keys with `vmux send-key --pane PANE C-c enter`.
 - Read output with `vmux read-screen --pane PANE --limit-bytes 64000`.
@@ -2115,7 +2115,7 @@ fn stop_session(session: &str) -> Result<()> {
         Err(socket_err) => {
             // No live socket: either the daemon already exited, or only a stale
             // pid file remains. Never treat "not running" as a hard failure.
-            let Some(pid) = paths::read_pid_file(&pid_path) else {
+            let Some(record) = paths::read_pid_record(&pid_path) else {
                 std::fs::remove_file(&socket).ok();
                 std::fs::remove_file(&pid_path).ok();
                 println!(
@@ -2133,7 +2133,10 @@ fn stop_session(session: &str) -> Result<()> {
                 let _ = socket_err;
                 return Ok(());
             };
-            if !paths::process_exists(pid) {
+            let pid = record.pid;
+            if !paths::process_matches_record(record)
+                || !paths::process_cmdline_contains(pid, "vmux")
+            {
                 std::fs::remove_file(&socket).ok();
                 std::fs::remove_file(&pid_path).ok();
                 println!(
@@ -2143,7 +2146,7 @@ fn stop_session(session: &str) -> Result<()> {
                         "status": "not_running",
                         "stale_pid": pid,
                         "message": format!(
-                            "session '{session}' is not running (stale pid {pid} cleaned up)"
+                            "session '{session}' is not running (stale/foreign pid {pid} cleaned up; not signalled)"
                         ),
                     })))?
                 );
@@ -2156,7 +2159,12 @@ fn stop_session(session: &str) -> Result<()> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            std::fs::remove_file(&pid_path).ok();
+            // Never SIGKILL an unverified process; only re-check starttime.
+            if paths::process_matches_record(record) {
+                // Process ignored SIGTERM; leave pid file so doctor can report.
+            } else {
+                std::fs::remove_file(&pid_path).ok();
+            }
             std::fs::remove_file(&socket).ok();
             println!(
                 "{}",
@@ -2507,20 +2515,21 @@ fn smoke(keep: bool) -> Result<()> {
         let live_after_hangup = read_screen_contains(&socket, &live_pane_id, "vmux-live", 20)?;
         checks.push(smoke_check("live-pane-after-sighup", live_after_hangup));
 
+        // Workspace tabs (Workspace → Tab → Pane), not the removed per-pane tab API.
         let tab = protocol::request(
             &socket,
-            &protocol::Request::AddPaneTab {
-                pane: Some(live_pane_id.clone()),
-                title: "smoke-tab".to_string(),
-                command:
+            &protocol::Request::NewTab {
+                workspace: None,
+                title: Some("smoke-tab".to_string()),
+                command: Some(
                     "/bin/sh -c 'printf vmux-tab-start; sleep 1; printf vmux-tab-late; sleep 20'"
                         .to_string(),
-                surface_kind: None,
+                ),
             },
         )?;
         if !tab.ok {
             return Err(anyhow!(
-                "pane-tab add smoke response failed: {:?}",
+                "workspace tab new smoke response failed: {:?}",
                 tab.error
             ));
         }
@@ -2530,47 +2539,67 @@ fn smoke(keep: bool) -> Result<()> {
             .and_then(|data| data.get("tab"))
             .and_then(|tab| tab.get("id"))
             .and_then(|id| id.as_str())
-            .ok_or_else(|| anyhow!("pane-tab add smoke response had no tab id"))?
+            .ok_or_else(|| anyhow!("tab new smoke response had no tab id"))?
             .to_string();
-        checks.push(smoke_check("pane-tab-add", !tab_id.is_empty()));
-        let tab_start = read_screen_contains(&socket, &live_pane_id, "vmux-tab-start", 20)?;
-        checks.push(smoke_check("pane-tab-active-output", tab_start));
+        let tab_pane_id = tab
+            .data
+            .as_ref()
+            .and_then(|data| {
+                data.get("pane")
+                    .and_then(|p| p.get("id"))
+                    .and_then(|id| id.as_str())
+                    .or_else(|| {
+                        data.get("tab")
+                            .and_then(|t| t.get("active_pane"))
+                            .and_then(|p| p.as_str())
+                    })
+            })
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| live_pane_id.clone());
+        checks.push(smoke_check("workspace-tab-add", !tab_id.is_empty()));
+        let tab_start = read_screen_contains(&socket, &tab_pane_id, "vmux-tab-start", 20)?;
+        checks.push(smoke_check("workspace-tab-active-output", tab_start));
 
         let switch_base = protocol::request(
             &socket,
-            &protocol::Request::SwitchPaneTab {
-                pane: Some(live_pane_id.clone()),
+            &protocol::Request::SwitchTab {
+                workspace: None,
                 tab: "tab-1".to_string(),
             },
         )?;
-        checks.push(smoke_check("pane-tab-switch-base", switch_base.ok));
+        checks.push(smoke_check("workspace-tab-switch-base", switch_base.ok));
         let base_output = read_screen_contains(&socket, &live_pane_id, "vmux-live", 20)?;
-        checks.push(smoke_check("pane-tab-base-output", base_output));
+        checks.push(smoke_check("workspace-tab-base-output", base_output));
 
-        let inactive_tab_output =
-            pane_tab_output_contains(&socket, &live_pane_id, &tab_id, "vmux-tab-late", 40)?;
-        checks.push(smoke_check("pane-tab-inactive-output", inactive_tab_output));
+        // Background tab continues producing output while inactive.
+        let inactive_tab_output = read_screen_contains(&socket, &tab_pane_id, "vmux-tab-late", 40)?;
+        checks.push(smoke_check(
+            "workspace-tab-inactive-output",
+            inactive_tab_output,
+        ));
 
         let switch_tab = protocol::request(
             &socket,
-            &protocol::Request::SwitchPaneTab {
-                pane: Some(live_pane_id.clone()),
+            &protocol::Request::SwitchTab {
+                workspace: None,
                 tab: tab_id.clone(),
             },
         )?;
-        checks.push(smoke_check("pane-tab-switch-back", switch_tab.ok));
-        let restored_tab_output =
-            read_screen_contains(&socket, &live_pane_id, "vmux-tab-late", 20)?;
-        checks.push(smoke_check("pane-tab-restored-output", restored_tab_output));
+        checks.push(smoke_check("workspace-tab-switch-back", switch_tab.ok));
+        let restored_tab_output = read_screen_contains(&socket, &tab_pane_id, "vmux-tab-late", 20)?;
+        checks.push(smoke_check(
+            "workspace-tab-restored-output",
+            restored_tab_output,
+        ));
 
         let restore_base = protocol::request(
             &socket,
-            &protocol::Request::SwitchPaneTab {
-                pane: Some(live_pane_id.clone()),
+            &protocol::Request::SwitchTab {
+                workspace: None,
                 tab: "tab-1".to_string(),
             },
         )?;
-        checks.push(smoke_check("pane-tab-restore-base", restore_base.ok));
+        checks.push(smoke_check("workspace-tab-restore-base", restore_base.ok));
 
         if command_on_path("script") && command_on_path("timeout") {
             let attach_rendered = attach_pty_smoke(&session, "vmux-live")?;
@@ -2832,44 +2861,6 @@ fn send_hangup_signal(pid: u32) -> Result<()> {
 #[cfg(not(unix))]
 fn send_hangup_signal(_pid: u32) -> Result<()> {
     Ok(())
-}
-
-fn pane_tab_output_contains(
-    socket: &std::path::Path,
-    pane_id: &str,
-    tab_id: &str,
-    needle: &str,
-    attempts: usize,
-) -> Result<bool> {
-    for _ in 0..attempts.max(1) {
-        let tabs = protocol::request(
-            socket,
-            &protocol::Request::PaneTabs {
-                pane: Some(pane_id.to_string()),
-            },
-        )?;
-        let contains = tabs
-            .data
-            .as_ref()
-            .and_then(|data| data.get("tabs"))
-            .and_then(|tabs| tabs.as_array())
-            .and_then(|tabs| {
-                tabs.iter()
-                    .find(|tab| tab.get("id").and_then(|id| id.as_str()) == Some(tab_id))
-            })
-            .and_then(|tab| {
-                tab.get("output")
-                    .or_else(|| tab.get("scrollback"))
-                    .and_then(|text| text.as_str())
-            })
-            .map(|text| text.contains(needle))
-            .unwrap_or(false);
-        if contains {
-            return Ok(true);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    Ok(false)
 }
 
 fn attach_pty_smoke(session: &str, needle: &str) -> Result<bool> {

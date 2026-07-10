@@ -304,7 +304,7 @@ fn push_bounded_output(output: &mut VecDeque<String>, output_bytes: &mut usize, 
 
 /// Cached per-workspace metadata populated by a background thread so the
 /// snapshot hot path never spawns git/gh/ss subprocesses.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct WorkspaceMeta {
     git_branch: Option<String>,
     pull_request: Option<PullRequestInfo>,
@@ -359,6 +359,11 @@ struct Server {
     // a small phone terminal and a large desktop terminal can resize the same
     // panes back and forth on every refresh.
     pane_size_owner: Mutex<Option<String>>,
+    /// Wakes `wait` when a pane exits (instead of 50 ms polling only).
+    exit_notify: (Mutex<()>, std::sync::Condvar),
+    /// Session lock file fd held for the daemon lifetime (single-instance).
+    #[cfg(unix)]
+    _session_lock: Option<std::fs::File>,
 }
 
 impl Server {
@@ -418,6 +423,9 @@ impl Server {
                 .map(|workspace| workspace.id.as_str()),
         );
 
+        #[cfg(unix)]
+        let session_lock = paths::try_lock_session(session_name)?;
+
         Ok(Self {
             session_name: session_name.to_string(),
             socket_path: paths::socket_path(session_name)?,
@@ -435,6 +443,9 @@ impl Server {
             save_dirty: std::sync::atomic::AtomicBool::new(false),
             generation: std::sync::atomic::AtomicU64::new(1),
             pane_size_owner: Mutex::new(None),
+            exit_notify: (Mutex::new(()), std::sync::Condvar::new()),
+            #[cfg(unix)]
+            _session_lock: session_lock,
         })
     }
 
@@ -509,7 +520,11 @@ impl Server {
                     (
                         workspace.id.clone(),
                         workspace.cwd.clone(),
-                        workspace.panes.clone(),
+                        workspace
+                            .all_pane_ids()
+                            .into_iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -537,7 +552,12 @@ impl Server {
                 },
             );
         }
-        *self.workspace_meta.lock_or_recover() = updated;
+        let mut cache = self.workspace_meta.lock_or_recover();
+        if *cache != updated {
+            *cache = updated;
+            // Metadata changes must invalidate Snapshot.since (bugs.md P2#9).
+            self.touch();
+        }
     }
 
     /// Kick off a one-shot metadata refresh on a detached thread so a freshly
@@ -1569,7 +1589,7 @@ impl Server {
         // Close every pane in every tab of the workspace — not only the active
         // tab's live `panes` view (improve.md #3).
         for pane in closed.all_pane_ids() {
-            self.remove_pane_runtimes(&pane);
+            self.remove_pane_runtimes(pane);
         }
 
         self.save()?;
@@ -1987,6 +2007,7 @@ impl Server {
         push_event(
             &mut session,
             EventRecord {
+                id: 0,
                 time: updated_at,
                 kind: "metadata".to_string(),
                 pane: Some(pane_id.clone()),
@@ -2275,7 +2296,17 @@ impl Server {
             {
                 return Err(anyhow!("timed out waiting for panes {}", targets.join(",")));
             }
-            thread::sleep(Duration::from_millis(50));
+            // Sleep on the exit condvar (woken by mark_exited) with a short
+            // timeout so we still re-check if a notification is missed.
+            let (lock, cvar) = &self.exit_notify;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let wait = timeout_ms
+                .map(|t| {
+                    let remaining = Duration::from_millis(t).saturating_sub(started.elapsed());
+                    remaining.min(Duration::from_millis(200))
+                })
+                .unwrap_or(Duration::from_millis(200));
+            let _ = cvar.wait_timeout(guard, wait);
         }
     }
 
@@ -2305,7 +2336,13 @@ impl Server {
                 .workspaces
                 .iter()
                 .find(|item| item.id == workspace)
-                .map(|workspace| workspace.panes.clone())
+                .map(|workspace| {
+                    workspace
+                        .all_pane_ids()
+                        .into_iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                })
                 .ok_or_else(|| anyhow!("unknown workspace {workspace}"))?;
             if targets.is_empty() {
                 return Err(anyhow!("workspace has no panes"));
@@ -2366,6 +2403,7 @@ impl Server {
         push_event(
             &mut session,
             EventRecord {
+                id: 0,
                 time: note.time,
                 kind: "notification".to_string(),
                 pane: target_pane.clone(),
@@ -2467,8 +2505,11 @@ impl Server {
                     })
                     .or_else(|| {
                         event.pane.as_ref().and_then(|pane_id| {
-                            snapshot.workspaces.iter().find(|workspace| {
-                                workspace.panes.iter().any(|item| item == pane_id)
+                            snapshot.find_pane_location(pane_id).and_then(|loc| {
+                                snapshot
+                                    .workspaces
+                                    .iter()
+                                    .find(|workspace| workspace.id == loc.workspace_id)
                             })
                         })
                     });
@@ -2477,6 +2518,7 @@ impl Server {
                     .as_ref()
                     .and_then(|pane_id| snapshot.panes.get(pane_id));
                 serde_json::json!({
+                    "id": event.id,
                     "time": event.time,
                     "kind": event.kind,
                     "pane": event.pane,
@@ -2564,6 +2606,7 @@ impl Server {
         push_event(
             &mut session,
             EventRecord {
+                id: 0,
                 time: updated_at,
                 kind: "progress".to_string(),
                 pane: Some(pane_id.clone()),
@@ -2993,6 +3036,7 @@ impl Server {
                 push_event(
                     &mut session,
                     EventRecord {
+                        id: 0,
                         time: unix_time(),
                         kind: "notification".to_string(),
                         pane: Some(pane_id.to_string()),
@@ -3062,6 +3106,12 @@ impl Server {
                 runtime.pane.notification_message = None;
                 runtime.pane.notification_color = None;
                 runtime.pane.updated_at = unix_time();
+                // Materialize final screen/scrollback into the pane record so
+                // save/restart keep history even when no full snapshot runs.
+                let contents = runtime.parser.screen().contents();
+                let raw = runtime.joined_output();
+                runtime.pane.output = contents;
+                runtime.pane.scrollback = trim_output(raw, SCROLLBACK_CAP);
                 runtime_pane = Some(runtime.pane.clone());
                 // Release the PTY OS handles now that the child is gone; the
                 // parser/output stay so the UI keeps the final screen state.
@@ -3092,6 +3142,7 @@ impl Server {
             push_event(
                 &mut session,
                 EventRecord {
+                    id: 0,
                     time: unix_time(),
                     kind: "pane-exit".to_string(),
                     pane: Some(pane_id.to_string()),
@@ -3103,6 +3154,7 @@ impl Server {
                 },
             );
         }
+        self.exit_notify.1.notify_all();
         self.save().ok();
     }
 
@@ -3235,7 +3287,8 @@ impl Server {
             .workspaces
             .iter()
             .flat_map(|workspace| {
-                workspace.panes.iter().filter_map(|pane_id| {
+                // Include panes on every tab, not only the active-tab live view.
+                workspace.all_pane_ids().into_iter().filter_map(|pane_id| {
                     let pane = snapshot.panes.get(pane_id)?;
                     Some(serde_json::json!({
                         "workspace": workspace.id,
@@ -3275,10 +3328,13 @@ impl Server {
             })
             .ok_or_else(|| anyhow!("no active pane"))?;
 
+        let location = snapshot
+            .find_pane_location(&target_pane)
+            .ok_or_else(|| anyhow!("pane {target_pane} is not attached to a workspace"))?;
         let workspace = snapshot
             .workspaces
             .iter()
-            .find(|workspace| workspace.panes.iter().any(|item| item == &target_pane))
+            .find(|workspace| workspace.id == location.workspace_id)
             .ok_or_else(|| anyhow!("pane {target_pane} is not attached to a workspace"))?;
         let pane = snapshot
             .panes
@@ -3290,6 +3346,7 @@ impl Server {
             "session": snapshot.name,
             "workspace": workspace.id,
             "workspace_name": workspace.name,
+            "tab": location.tab_id,
             "pane": pane.id,
             "surface_kind": pane.surface_kind,
             "title": pane.title,
@@ -3331,8 +3388,7 @@ impl Server {
     }
 
     fn write_pid_file(&self) -> Result<()> {
-        fs::write(&self.pid_path, format!("{}\n", std::process::id()))
-            .with_context(|| format!("write pid file {}", self.pid_path.display()))
+        paths::write_pid_record(&self.pid_path, std::process::id())
     }
 
     fn log(&self, message: &str) -> Result<()> {
@@ -3358,7 +3414,10 @@ impl Server {
             let mut session = self.session.lock_or_recover();
             session.flush_tabs();
         }
-        let mut snapshot = self.snapshot(false)?;
+        // Persist must materialize runtime screen/scrollback (bugs.md P0#1).
+        // Light `snapshot(false)` leaves empty strings from append_output's
+        // hot path and loses history across daemon restart.
+        let mut snapshot = self.snapshot(true)?;
         snapshot.daemon = None;
         let payload = serde_json::to_vec_pretty(&snapshot)?;
         // Serialize writes so concurrent handlers can't interleave into a shared
@@ -3423,7 +3482,15 @@ fn runtime_key_is_active_for_pane(pane: &Pane, runtime_key: &str) -> bool {
         || (pane.active_tab.is_none() && legacy_runtime_key(&pane.id) == runtime_key)
 }
 
-fn push_event(session: &mut Session, event: EventRecord) {
+fn push_event(session: &mut Session, mut event: EventRecord) {
+    session.next_event_id = session.next_event_id.saturating_add(1).max(1);
+    event.id = session.next_event_id;
+    // Bound message length at the protocol boundary (newimp §9).
+    const MAX_EVENT_MSG: usize = 4_096;
+    if event.message.len() > MAX_EVENT_MSG {
+        event.message.truncate(MAX_EVENT_MSG);
+        event.message.push('…');
+    }
     session.events.push(event);
     let len = session.events.len();
     if len > 500 {
@@ -3664,798 +3731,8 @@ fn default_shell() -> String {
     crate::config::resolve_default_shell()
 }
 
-fn validate_url(url: &str) -> Result<()> {
-    // This is a local dev tool: opening localhost/private previews is a core use
-    // case, so we deliberately do NOT block private or loopback hosts. We only
-    // harden parsing: reject empty input, whitespace/control characters, an
-    // unsupported scheme, and a missing host (finding 15).
-    if url.is_empty() {
-        return Err(anyhow!("open-url requires a URL"));
-    }
-    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(anyhow!(
-            "URL must not contain whitespace or control characters"
-        ));
-    }
-    let lower = url.to_ascii_lowercase();
-    let rest = if let Some(rest) = lower.strip_prefix("http://") {
-        rest
-    } else if let Some(rest) = lower.strip_prefix("https://") {
-        rest
-    } else {
-        return Err(anyhow!("open-url only supports http:// and https:// URLs"));
-    };
-    // Host is everything up to the first path/query/fragment separator, minus
-    // any userinfo and port.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
-    if host.is_empty() {
-        return Err(anyhow!("URL is missing a host"));
-    }
-    Ok(())
-}
-
-fn url_open_command(url: &str) -> String {
-    let browser = ["w3m", "lynx", "links", "elinks", "browsh"]
-        .into_iter()
-        .find(|candidate| command_exists(candidate));
-    let argv = if let Some(browser) = browser {
-        vec![browser.to_string(), url.to_string()]
-    } else {
-        vec![
-            "curl".to_string(),
-            "-L".to_string(),
-            "--max-time".to_string(),
-            "30".to_string(),
-            url.to_string(),
-        ]
-    };
-    shell_words::join(argv)
-}
-
-fn url_snapshot(url: &str) -> Result<serde_json::Value> {
-    validate_url(url)?;
-    let body = fetch_url_body(url, "url snapshot")?;
-    let title = html_title(&body);
-    let links = html_links(&body, url);
-    let text = html_to_text(&body);
-    Ok(serde_json::json!({
-        "url": url,
-        "title": title,
-        "text": trim_output(text, 32_000),
-        "links": links,
-    }))
-}
-
-fn url_links(url: &str) -> Result<serde_json::Value> {
-    let snapshot = url_snapshot(url)?;
-    let links = snapshot
-        .get("links")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-    Ok(serde_json::json!({
-        "url": url,
-        "title": snapshot.get("title").cloned().unwrap_or(serde_json::Value::Null),
-        "links": links,
-    }))
-}
-
-fn url_forms(url: &str) -> Result<serde_json::Value> {
-    validate_url(url)?;
-    let body = fetch_url_body(url, "url forms")?;
-    Ok(serde_json::json!({
-        "url": url,
-        "title": html_title(&body),
-        "forms": html_forms(&body, url),
-    }))
-}
-
-fn url_evaluate(url: &str, expression: &str) -> Result<serde_json::Value> {
-    validate_url(url)?;
-    let body = fetch_url_body(url, "url evaluate")?;
-    let expression = expression.trim();
-    if expression.is_empty() {
-        return Err(anyhow!("browser evaluate expression cannot be empty"));
-    }
-    let links = html_links(&body, url);
-    let forms = html_forms(&body, url);
-    let value = evaluate_static_expression(expression, &body, &links, &forms)?;
-    Ok(serde_json::json!({
-        "url": url,
-        "engine": "static-html",
-        "expression": expression,
-        "value": value,
-    }))
-}
-
-fn url_console(url: &str) -> Result<serde_json::Value> {
-    validate_url(url)?;
-    let body = fetch_url_body(url, "url console")?;
-    let scripts = html_scripts(&body, url);
-    Ok(serde_json::json!({
-        "url": url,
-        "engine": "static-html",
-        "scripts": scripts,
-        "console_calls": html_console_calls(&body),
-        "noscript": html_noscript_blocks(&body),
-    }))
-}
-
-fn url_network(url: &str) -> Result<serde_json::Value> {
-    validate_url(url)?;
-    let started = Instant::now();
-    let output = Command::new("curl")
-        .arg("-L")
-        .arg("--max-time")
-        .arg("30")
-        .arg("-sS")
-        .arg("-D")
-        .arg("-")
-        .arg("-o")
-        .arg("/dev/null")
-        .arg("-w")
-        .arg("\nVMUX_CURL_META\t%{http_code}\t%{url_effective}\t%{content_type}\t%{size_download}\t%{time_total}\t%{num_redirects}\n")
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("run curl for url network")?;
-    let elapsed_ms = started.elapsed().as_millis();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let (headers, meta) = parse_curl_network_output(&stdout);
-    if !output.status.success() {
-        return Err(anyhow!(
-            "url network failed: {}",
-            if stderr.is_empty() {
-                "curl failed"
-            } else {
-                &stderr
-            }
-        ));
-    }
-    Ok(serde_json::json!({
-        "url": url,
-        "elapsed_ms": elapsed_ms,
-        "status": meta.status,
-        "effective_url": meta.effective_url,
-        "content_type": meta.content_type,
-        "bytes": meta.bytes,
-        "curl_time_total": meta.time_total,
-        "redirects": meta.redirects,
-        "headers": headers,
-    }))
-}
-
-fn fetch_url_body(url: &str, label: &str) -> Result<String> {
-    let output = Command::new("curl")
-        .arg("-L")
-        .arg("--max-time")
-        .arg("30")
-        .arg("-sS")
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("run curl for {label}"))?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!(
-            "{label} failed: {}",
-            if error.is_empty() {
-                "curl failed"
-            } else {
-                &error
-            }
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-#[derive(Debug, Default, PartialEq)]
-struct CurlNetworkMeta {
-    status: Option<u16>,
-    effective_url: Option<String>,
-    content_type: Option<String>,
-    bytes: Option<u64>,
-    time_total: Option<f64>,
-    redirects: Option<u64>,
-}
-
-fn parse_curl_network_output(output: &str) -> (Vec<serde_json::Value>, CurlNetworkMeta) {
-    let mut headers = Vec::new();
-    let mut meta = CurlNetworkMeta::default();
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("VMUX_CURL_META\t") {
-            let parts = rest.split('\t').collect::<Vec<_>>();
-            meta.status = parts.first().and_then(|value| value.parse().ok());
-            meta.effective_url = parts
-                .get(1)
-                .filter(|value| !value.is_empty())
-                .map(|value| (*value).to_string());
-            meta.content_type = parts
-                .get(2)
-                .filter(|value| !value.is_empty())
-                .map(|value| (*value).to_string());
-            meta.bytes = parts.get(3).and_then(|value| value.parse().ok());
-            meta.time_total = parts.get(4).and_then(|value| value.parse().ok());
-            meta.redirects = parts.get(5).and_then(|value| value.parse().ok());
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim();
-            if !name.is_empty() {
-                headers.push(serde_json::json!({
-                    "name": name,
-                    "value": value.trim(),
-                }));
-            }
-        }
-    }
-    (headers, meta)
-}
-
-fn evaluate_static_expression(
-    expression: &str,
-    html: &str,
-    links: &[serde_json::Value],
-    forms: &[serde_json::Value],
-) -> Result<serde_json::Value> {
-    match expression {
-        "title" | "document.title" => Ok(html_title(html)
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null)),
-        "text" | "document.body.innerText" | "body.innerText" => Ok(serde_json::Value::String(
-            trim_output(html_to_text(html), 32_000),
-        )),
-        "links" => Ok(serde_json::Value::Array(links.to_vec())),
-        "forms" => Ok(serde_json::Value::Array(forms.to_vec())),
-        expression => {
-            if let Some(index) = indexed_expression(expression, "links") {
-                return links
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("link index {} out of range", index + 1));
-            }
-            if let Some(index) = indexed_expression(expression, "forms") {
-                return forms
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("form index {} out of range", index + 1));
-            }
-            if let Some((index, field)) = indexed_field_expression(expression, "links") {
-                return links
-                    .get(index)
-                    .and_then(|link| link.get(field))
-                    .cloned()
-                    .ok_or_else(|| anyhow!("link index {} has no field {field}", index + 1));
-            }
-            if let Some((index, field)) = indexed_field_expression(expression, "forms") {
-                return forms
-                    .get(index)
-                    .and_then(|form| form.get(field))
-                    .cloned()
-                    .ok_or_else(|| anyhow!("form index {} has no field {field}", index + 1));
-            }
-            if let Some(selector) = expression.strip_prefix("text:") {
-                return Ok(serde_json::Value::String(trim_output(
-                    html_elements_text(html, selector).join("\n"),
-                    32_000,
-                )));
-            }
-            if let Some(selector) = expression.strip_prefix("selector:") {
-                return Ok(serde_json::Value::Array(
-                    html_elements_text(html, selector)
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ));
-            }
-            Err(anyhow!(
-                "unsupported static browser expression {expression}; try title, text, links, forms, links[1], links[1].href, text:h1, or selector:p"
-            ))
-        }
-    }
-}
-
-fn indexed_expression(expression: &str, name: &str) -> Option<usize> {
-    let rest = expression.strip_prefix(name)?.strip_prefix('[')?;
-    let (index, suffix) = rest.split_once(']')?;
-    if !suffix.is_empty() {
-        return None;
-    }
-    one_based_index(index)
-}
-
-fn indexed_field_expression<'a>(expression: &'a str, name: &str) -> Option<(usize, &'a str)> {
-    let rest = expression.strip_prefix(name)?.strip_prefix('[')?;
-    let (index, suffix) = rest.split_once("].")?;
-    let field = suffix.trim();
-    if field.is_empty() {
-        return None;
-    }
-    Some((one_based_index(index)?, field))
-}
-
-fn one_based_index(value: &str) -> Option<usize> {
-    value.trim().parse::<usize>().ok()?.checked_sub(1)
-}
-
-fn html_scripts(html: &str, base_url: &str) -> Vec<serde_json::Value> {
-    html_tag_blocks(html, "script")
-        .into_iter()
-        .enumerate()
-        .map(|(index, (attrs, body))| {
-            let src = html_attr(attrs, "src").map(|src| absolutize_url(base_url, &src));
-            let inline = src.is_none();
-            let script_type = html_attr(attrs, "type").unwrap_or_else(|| "text/javascript".into());
-            serde_json::json!({
-                "index": index + 1,
-                "src": src,
-                "type": script_type,
-                "inline": inline,
-                "bytes": body.len(),
-                "preview": trim_output(body.trim().to_string(), 500),
-            })
-        })
-        .collect()
-}
-
-fn html_console_calls(html: &str) -> Vec<serde_json::Value> {
-    let mut calls = Vec::new();
-    for (_, body) in html_tag_blocks(html, "script") {
-        let mut rest = body.as_str();
-        while let Some(index) = rest.find("console.") {
-            rest = &rest[index + "console.".len()..];
-            let method = rest
-                .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                .collect::<String>();
-            if method.is_empty() {
-                continue;
-            }
-            let preview = rest
-                .find(';')
-                .map(|end| &rest[..end])
-                .unwrap_or(rest)
-                .trim();
-            calls.push(serde_json::json!({
-                "method": method,
-                "preview": trim_output(preview.to_string(), 500),
-            }));
-            rest = preview
-                .len()
-                .checked_add(1)
-                .and_then(|offset| rest.get(offset..))
-                .unwrap_or("");
-        }
-    }
-    calls
-}
-
-fn html_noscript_blocks(html: &str) -> Vec<String> {
-    html_tag_blocks(html, "noscript")
-        .into_iter()
-        .map(|(_, body)| html_to_text(&body))
-        .filter(|text| !text.trim().is_empty())
-        .collect()
-}
-
-fn html_tag_blocks<'a>(html: &'a str, tag: &str) -> Vec<(&'a str, String)> {
-    let mut blocks = Vec::new();
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut rest = html;
-    while let Some(index) = rest.to_ascii_lowercase().find(&open) {
-        rest = &rest[index + open.len()..];
-        let Some(tag_end) = rest.find('>') else {
-            break;
-        };
-        let attrs = &rest[..tag_end];
-        let after = &rest[tag_end + 1..];
-        let lower_after = after.to_ascii_lowercase();
-        let Some(body_end) = lower_after.find(&close) else {
-            break;
-        };
-        blocks.push((attrs, after[..body_end].to_string()));
-        rest = &after[body_end + close.len()..];
-    }
-    blocks
-}
-
-fn html_elements_text(html: &str, selector: &str) -> Vec<String> {
-    let selector = selector.trim().trim_start_matches('.');
-    if selector.is_empty()
-        || !selector
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-    {
-        return Vec::new();
-    }
-    html_tag_blocks(html, selector)
-        .into_iter()
-        .map(|(_, body)| html_to_text(&body))
-        .filter(|text| !text.trim().is_empty())
-        .collect()
-}
-
-fn form_default_fields(form: &serde_json::Value) -> BTreeMap<String, String> {
-    let mut values = BTreeMap::new();
-    if let Some(fields) = form.get("fields").and_then(|fields| fields.as_array()) {
-        for field in fields {
-            let Some(name) = field.get("name").and_then(|name| name.as_str()) else {
-                continue;
-            };
-            let value = field
-                .get("value")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            values.insert(name.to_string(), value.to_string());
-        }
-    }
-    values
-}
-
-fn form_submission_target(
-    action: &str,
-    method: &str,
-    values: &BTreeMap<String, String>,
-) -> Result<String> {
-    match method {
-        "get" => Ok(url_with_query(action, values)),
-        "post" => {
-            let mut argv = vec![
-                "curl".to_string(),
-                "-L".to_string(),
-                "-X".to_string(),
-                "POST".to_string(),
-            ];
-            for (name, value) in values {
-                argv.push("--data-urlencode".to_string());
-                argv.push(format!("{name}={value}"));
-            }
-            argv.push(action.to_string());
-            Ok(shell_words::join(argv))
-        }
-        other => Err(anyhow!("unsupported form method {other}")),
-    }
-}
-
-fn url_with_query(url: &str, values: &BTreeMap<String, String>) -> String {
-    if values.is_empty() {
-        return url.to_string();
-    }
-    let query = values
-        .iter()
-        .map(|(name, value)| format!("{}={}", url_encode(name), url_encode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let separator = if url.contains('?') { "&" } else { "?" };
-    format!("{url}{separator}{query}")
-}
-
-fn url_encode(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else if byte == b' ' {
-            out.push('+');
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
-fn compact_url_title(url: &str) -> String {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    rest.split('/').next().unwrap_or(rest).to_string()
-}
-
-fn command_exists(command: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
-}
-
-fn html_title(html: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let start = lower.find("<title")?;
-    let after_tag = html[start..].find('>')? + start + 1;
-    let end = lower[after_tag..].find("</title>")? + after_tag;
-    let title = html_unescape(&html[after_tag..end]).trim().to_string();
-    if title.is_empty() {
-        None
-    } else {
-        Some(title)
-    }
-}
-
-fn html_links(html: &str, base_url: &str) -> Vec<serde_json::Value> {
-    let mut links = Vec::new();
-    let mut rest = html;
-    while let Some(index) = rest.to_ascii_lowercase().find("<a ") {
-        rest = &rest[index + 3..];
-        let Some(end) = rest.find('>') else {
-            break;
-        };
-        let attrs = &rest[..end];
-        if let Some(href) = html_attr(attrs, "href") {
-            let after = &rest[end + 1..];
-            let lower_after = after.to_ascii_lowercase();
-            let text = lower_after
-                .find("</a>")
-                .map(|end| html_to_text(&after[..end]))
-                .unwrap_or_default();
-            links.push(serde_json::json!({
-                "href": absolutize_url(base_url, &href),
-                "text": text.trim(),
-            }));
-        }
-        rest = &rest[end + 1..];
-    }
-    links
-}
-
-fn html_forms(html: &str, base_url: &str) -> Vec<serde_json::Value> {
-    let mut forms = Vec::new();
-    let mut rest = html;
-    while let Some(index) = rest.to_ascii_lowercase().find("<form") {
-        rest = &rest[index + 5..];
-        let Some(tag_end) = rest.find('>') else {
-            break;
-        };
-        let attrs = &rest[..tag_end];
-        let after = &rest[tag_end + 1..];
-        let lower_after = after.to_ascii_lowercase();
-        let body_end = lower_after.find("</form>").unwrap_or(after.len());
-        let body = &after[..body_end];
-        let method = html_attr(attrs, "method")
-            .unwrap_or_else(|| "get".to_string())
-            .to_ascii_lowercase();
-        let action = html_attr(attrs, "action")
-            .map(|action| absolutize_url(base_url, &action))
-            .unwrap_or_else(|| base_url.to_string());
-        let label = html_attr(attrs, "aria-label")
-            .or_else(|| html_attr(attrs, "name"))
-            .or_else(|| html_attr(attrs, "id"));
-        forms.push(serde_json::json!({
-            "index": forms.len() + 1,
-            "method": method,
-            "action": action,
-            "label": label,
-            "fields": html_form_fields(body),
-        }));
-        rest = if body_end < after.len() {
-            &after[body_end + "</form>".len()..]
-        } else {
-            ""
-        };
-    }
-    forms
-}
-
-fn html_form_fields(html: &str) -> Vec<serde_json::Value> {
-    let mut fields = Vec::new();
-    let mut rest = html;
-    while let Some(index) = rest.to_ascii_lowercase().find("<input") {
-        rest = &rest[index + 6..];
-        let Some(end) = rest.find('>') else {
-            break;
-        };
-        let attrs = &rest[..end];
-        if let Some(name) = html_attr(attrs, "name") {
-            let field_type = html_attr(attrs, "type").unwrap_or_else(|| "text".to_string());
-            if !matches!(field_type.as_str(), "submit" | "button" | "reset" | "image") {
-                fields.push(serde_json::json!({
-                    "name": name,
-                    "type": field_type,
-                    "value": html_attr(attrs, "value").unwrap_or_default(),
-                }));
-            }
-        }
-        rest = &rest[end + 1..];
-    }
-
-    let mut rest = html;
-    while let Some(index) = rest.to_ascii_lowercase().find("<textarea") {
-        rest = &rest[index + 9..];
-        let Some(end) = rest.find('>') else {
-            break;
-        };
-        let attrs = &rest[..end];
-        let after = &rest[end + 1..];
-        let lower_after = after.to_ascii_lowercase();
-        let value_end = lower_after.find("</textarea>").unwrap_or(0);
-        if let Some(name) = html_attr(attrs, "name") {
-            fields.push(serde_json::json!({
-                "name": name,
-                "type": "textarea",
-                "value": html_unescape(&after[..value_end]).trim(),
-            }));
-        }
-        rest = if value_end < after.len() {
-            &after[value_end + "</textarea>".len()..]
-        } else {
-            ""
-        };
-    }
-
-    let mut rest = html;
-    while let Some(index) = rest.to_ascii_lowercase().find("<select") {
-        rest = &rest[index + 7..];
-        let Some(end) = rest.find('>') else {
-            break;
-        };
-        let attrs = &rest[..end];
-        let after = &rest[end + 1..];
-        let lower_after = after.to_ascii_lowercase();
-        let body_end = lower_after.find("</select>").unwrap_or(0);
-        if let Some(name) = html_attr(attrs, "name") {
-            fields.push(serde_json::json!({
-                "name": name,
-                "type": "select",
-                "value": selected_option_value(&after[..body_end]).unwrap_or_default(),
-            }));
-        }
-        rest = if body_end < after.len() {
-            &after[body_end + "</select>".len()..]
-        } else {
-            ""
-        };
-    }
-
-    fields
-}
-
-fn selected_option_value(html: &str) -> Option<String> {
-    let mut first = None;
-    let mut rest = html;
-    while let Some(index) = rest.to_ascii_lowercase().find("<option") {
-        rest = &rest[index + 7..];
-        let Some(end) = rest.find('>') else {
-            break;
-        };
-        let attrs = &rest[..end];
-        let value = html_attr(attrs, "value").unwrap_or_else(|| {
-            let after = &rest[end + 1..];
-            let lower_after = after.to_ascii_lowercase();
-            lower_after
-                .find("</option>")
-                .map(|end| html_to_text(&after[..end]))
-                .unwrap_or_default()
-                .trim()
-                .to_string()
-        });
-        if first.is_none() {
-            first = Some(value.clone());
-        }
-        if attrs.to_ascii_lowercase().contains("selected") {
-            return Some(value);
-        }
-        rest = &rest[end + 1..];
-    }
-    first
-}
-
-fn html_attr(attrs: &str, name: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let needle = format!("{name}={quote}");
-        if let Some(start) = attrs.to_ascii_lowercase().find(&needle) {
-            let value_start = start + needle.len();
-            let value_end = attrs[value_start..].find(quote)? + value_start;
-            return Some(html_unescape(&attrs[value_start..value_end]));
-        }
-    }
-    None
-}
-
-fn html_to_text(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    let mut entity = String::new();
-    let mut in_entity = false;
-    for ch in html.chars() {
-        if in_tag {
-            if ch == '>' {
-                in_tag = false;
-                out.push(' ');
-            }
-            continue;
-        }
-        if in_entity {
-            if ch == ';' {
-                out.push_str(&html_unescape_entity(&entity));
-                entity.clear();
-                in_entity = false;
-            } else if entity.len() < 16 {
-                entity.push(ch);
-            } else {
-                out.push('&');
-                out.push_str(&entity);
-                entity.clear();
-                in_entity = false;
-            }
-            continue;
-        }
-        match ch {
-            '<' => in_tag = true,
-            '&' => in_entity = true,
-            ch => out.push(ch),
-        }
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn html_unescape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '&' {
-            out.push(ch);
-            continue;
-        }
-        let mut entity = String::new();
-        while let Some(next) = chars.peek().copied() {
-            if next == ';' {
-                chars.next();
-                out.push_str(&html_unescape_entity(&entity));
-                entity.clear();
-                break;
-            }
-            if entity.len() >= 16 || !(next.is_ascii_alphanumeric() || next == '#') {
-                out.push('&');
-                out.push_str(&entity);
-                entity.clear();
-                break;
-            }
-            entity.push(next);
-            chars.next();
-        }
-        if !entity.is_empty() {
-            out.push('&');
-            out.push_str(&entity);
-        }
-    }
-    out
-}
-
-fn html_unescape_entity(entity: &str) -> String {
-    match entity {
-        "amp" => "&".to_string(),
-        "lt" => "<".to_string(),
-        "gt" => ">".to_string(),
-        "quot" => "\"".to_string(),
-        "apos" => "'".to_string(),
-        _ => format!("&{entity};"),
-    }
-}
-
-fn absolutize_url(base_url: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return href.to_string();
-    }
-    let Some((scheme, rest)) = base_url.split_once("://") else {
-        return href.to_string();
-    };
-    let host = rest.split('/').next().unwrap_or(rest);
-    if href.starts_with('/') {
-        format!("{scheme}://{host}{href}")
-    } else {
-        let base_dir = rest
-            .rsplit_once('/')
-            .map(|(dir, _)| dir)
-            .filter(|dir| dir.contains('/'))
-            .unwrap_or(host);
-        format!("{scheme}://{base_dir}/{href}")
-    }
-}
+mod browser;
+pub(crate) use browser::*;
 
 fn parse_agent_status(status: &str) -> AgentStatus {
     match status {
@@ -4972,7 +4249,7 @@ fn format_osc_notification(payload: &str) -> Option<String> {
     }
 }
 
-fn trim_output(output: String, max_len: usize) -> String {
+pub(crate) fn trim_output(output: String, max_len: usize) -> String {
     if output.len() <= max_len {
         output
     } else {
@@ -5794,5 +5071,189 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 }
             }
         }
+    }
+
+    #[test]
+    fn push_event_assigns_monotonic_ids() {
+        let mut session = Session::new("evt");
+        push_event(
+            &mut session,
+            EventRecord {
+                id: 0,
+                time: 1,
+                kind: "a".into(),
+                pane: None,
+                workspace: None,
+                status: None,
+                key: None,
+                value: None,
+                message: String::new(),
+            },
+        );
+        push_event(
+            &mut session,
+            EventRecord {
+                id: 0,
+                time: 2,
+                kind: "b".into(),
+                pane: None,
+                workspace: None,
+                status: None,
+                key: None,
+                value: None,
+                message: String::new(),
+            },
+        );
+        assert_eq!(session.events[0].id, 1);
+        assert_eq!(session.events[1].id, 2);
+        assert_eq!(session.next_event_id, 2);
+    }
+
+    #[test]
+    fn full_snapshot_materializes_runtime_output_for_persist() {
+        // Light path clears heavy strings; persist/full path must refill them.
+        let session_name = format!("vmux-persist-{}-{}", std::process::id(), unix_time());
+        let server = Server::load(&session_name).unwrap();
+        {
+            let mut panes = server.panes.lock_or_recover();
+            let mut runtime = PaneRuntime {
+                generation: 1,
+                pane: Pane::new("pane-1".into(), "echo".into(), SplitDirection::Right),
+                master: None,
+                writer: None,
+                killer: None,
+                output: std::collections::VecDeque::new(),
+                output_bytes: 0,
+                pending: Vec::new(),
+                osc_tail: String::new(),
+                parser: vt100::Parser::new(24, 80, 1000),
+                size: PaneSize { cols: 80, rows: 24 },
+                output_generation: 1,
+                scrollback_formatted_cache: String::new(),
+                scrollback_formatted_generation: u64::MAX,
+            };
+            runtime.parser.process(b"hello-persist-marker\r\n");
+            runtime.push_output("hello-persist-marker\n".into());
+            runtime.pane.output.clear();
+            runtime.pane.scrollback.clear();
+            panes.insert("pane-1".into(), runtime);
+        }
+        {
+            let mut session = server.session.lock_or_recover();
+            session.panes.insert(
+                "pane-1".into(),
+                Pane::new("pane-1".into(), "echo".into(), SplitDirection::Right),
+            );
+            if let Some(ws) = session.workspaces.first_mut() {
+                ws.panes = vec!["pane-1".into()];
+                ws.active_pane = Some("pane-1".into());
+                ws.ensure_layout();
+            }
+        }
+        let light = server.snapshot(false).unwrap();
+        // Light snapshot may still copy empty stored strings.
+        let full = server.snapshot(true).unwrap();
+        let pane = full.panes.get("pane-1").expect("pane present");
+        assert!(
+            pane.output.contains("hello-persist-marker")
+                || pane.scrollback.contains("hello-persist-marker"),
+            "full snapshot must materialize output; got out={:?} sb={:?}",
+            pane.output,
+            pane.scrollback
+        );
+        let _ = light;
+        // cleanup lock/state
+        drop(server);
+        let _ = fs::remove_file(paths::state_path(&session_name).unwrap());
+        let _ = fs::remove_file(paths::lock_path(&session_name).unwrap());
+    }
+
+    /// End-to-end: live runtime output → save → drop server → reload → history intact.
+    #[test]
+    fn e2e_restart_preserves_scrollback_across_save_reload() {
+        let session_name = format!("vmux-e2e-restart-{}-{}", std::process::id(), unix_time());
+        let state_path = paths::state_path(&session_name).unwrap();
+        let lock_path = paths::lock_path(&session_name).unwrap();
+        let marker = "vmux-e2e-restart-marker-42";
+
+        // Phase 1: live daemon with output only in the runtime deque.
+        {
+            let server = Server::load(&session_name).unwrap();
+            {
+                let mut session = server.session.lock_or_recover();
+                let mut pane =
+                    Pane::new("pane-1".into(), "printf e2e".into(), SplitDirection::Right);
+                pane.status = PaneStatus::Running;
+                session.panes.insert("pane-1".into(), pane);
+                if let Some(ws) = session.workspaces.first_mut() {
+                    ws.cwd = std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .display()
+                        .to_string();
+                    ws.panes = vec!["pane-1".into()];
+                    ws.active_pane = Some("pane-1".into());
+                    ws.ensure_layout();
+                }
+            }
+            {
+                let mut panes = server.panes.lock_or_recover();
+                let mut runtime = PaneRuntime {
+                    generation: 1,
+                    pane: Pane::new("pane-1".into(), "printf e2e".into(), SplitDirection::Right),
+                    master: None,
+                    writer: None,
+                    killer: None,
+                    output: VecDeque::new(),
+                    output_bytes: 0,
+                    pending: Vec::new(),
+                    osc_tail: String::new(),
+                    parser: vt100::Parser::new(24, 80, 1000),
+                    size: PaneSize { cols: 80, rows: 24 },
+                    output_generation: 1,
+                    scrollback_formatted_cache: String::new(),
+                    scrollback_formatted_generation: u64::MAX,
+                };
+                runtime.pane.status = PaneStatus::Running;
+                runtime.push_output(format!("{marker}\n"));
+                runtime.parser.process(format!("{marker}\r\n").as_bytes());
+                runtime.pane.output.clear();
+                runtime.pane.scrollback.clear();
+                panes.insert("pane-1".into(), runtime);
+            }
+            server.save().unwrap();
+        }
+
+        assert!(state_path.exists(), "state file should exist after save");
+        let on_disk: Session =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        let disk_pane = on_disk.panes.get("pane-1").expect("pane on disk");
+        assert!(
+            disk_pane.output.contains(marker) || disk_pane.scrollback.contains(marker),
+            "state file must contain marker; out={:?} sb={:?}",
+            disk_pane.output,
+            disk_pane.scrollback
+        );
+
+        // Phase 2: cold start from disk (lock re-acquired after drop).
+        {
+            let server = Server::load(&session_name).unwrap();
+            let loaded = server.session.lock_or_recover();
+            let pane = loaded.panes.get("pane-1").expect("pane after reload");
+            assert!(
+                pane.output.contains(marker) || pane.scrollback.contains(marker),
+                "reload must keep history; out={:?} sb={:?}",
+                pane.output,
+                pane.scrollback
+            );
+            assert!(matches!(
+                pane.status,
+                PaneStatus::Restored | PaneStatus::Running | PaneStatus::Exited
+            ));
+        }
+
+        fs::remove_file(state_path).ok();
+        fs::remove_file(lock_path).ok();
+        fs::remove_file(paths::pid_path(&session_name).unwrap()).ok();
+        fs::remove_file(paths::socket_path(&session_name).unwrap()).ok();
     }
 }

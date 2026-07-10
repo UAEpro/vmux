@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::paths;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct LmuxConfig {
     #[serde(default)]
     pub ui: UiConfig,
@@ -42,7 +42,9 @@ impl Default for RelaySettings {
             bind: "auto".to_string(),
             port: 4399,
             allow_localhost: false,
-            allow_tailnet_cgnat: true,
+            // Safer default: require Tailscale whois (or bootstrap) rather than
+            // trusting any CGNAT peer (newimp §8).
+            allow_tailnet_cgnat: false,
         }
     }
 }
@@ -52,8 +54,12 @@ pub struct UiConfig {
     #[serde(default)]
     pub sidebar_collapsed: bool,
     /// Expanded sidebar width in terminal columns (clamped on load).
+    /// When `sidebar_fit` is true this is the **maximum** width.
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u16,
+    /// Fit sidebar width to workspace name text (up to `sidebar_width` max).
+    #[serde(default)]
+    pub sidebar_fit: bool,
     #[serde(default = "default_prefix_key")]
     pub prefix_key: String,
     #[serde(default = "default_scroll_step")]
@@ -91,20 +97,12 @@ pub struct UiConfig {
     pub sidebar_responsive: bool,
 }
 
-impl Default for LmuxConfig {
-    fn default() -> Self {
-        Self {
-            ui: UiConfig::default(),
-            relay: RelaySettings::default(),
-        }
-    }
-}
-
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             sidebar_collapsed: false,
             sidebar_width: default_sidebar_width(),
+            sidebar_fit: false,
             prefix_key: default_prefix_key(),
             scroll_step: default_scroll_step(),
             theme: default_theme(),
@@ -184,6 +182,9 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
                 .parse::<u16>()
                 .map_err(|_| anyhow!("ui.sidebar_width must be an integer"))?;
             config.ui.sidebar_width = clamp_sidebar_width(width);
+        }
+        "ui.sidebar_fit" => {
+            config.ui.sidebar_fit = parse_bool(value)?;
         }
         "ui.prefix_key" => {
             crate::input::parse_key_binding(value)
@@ -456,10 +457,11 @@ pub fn load() -> Result<LmuxConfig> {
     load_from_path(&path)
 }
 
+/// Load config for read-only use. Malformed files fall back to defaults with a
+/// warning so doctor/status still work.
 pub fn load_from_path(path: &Path) -> Result<LmuxConfig> {
-    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    match serde_json::from_str::<LmuxConfig>(&contents) {
-        Ok(config) => Ok(config.normalized()),
+    match load_from_path_strict(path) {
+        Ok(config) => Ok(config),
         Err(err) => {
             eprintln!(
                 "warning: ignoring malformed config at {} ({err}); using defaults",
@@ -468,6 +470,28 @@ pub fn load_from_path(path: &Path) -> Result<LmuxConfig> {
             Ok(LmuxConfig::default())
         }
     }
+}
+
+/// Load config for mutating commands (`config set`, Settings panel). Fails closed
+/// on parse errors so a typo cannot be overwritten with defaults (bugs.md P1#5).
+pub fn load_for_mutation() -> Result<(std::path::PathBuf, LmuxConfig)> {
+    let path = paths::config_path()?;
+    if !path.exists() {
+        return Ok((path, LmuxConfig::default()));
+    }
+    let config = load_from_path_strict(&path)?;
+    Ok((path, config))
+}
+
+pub fn load_from_path_strict(path: &Path) -> Result<LmuxConfig> {
+    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let config: LmuxConfig = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "parse config at {} (refusing to overwrite malformed file; fix or delete it first)",
+            path.display()
+        )
+    })?;
+    Ok(config.normalized())
 }
 
 pub fn write_default(path: &Path, force: bool) -> Result<()> {
@@ -557,6 +581,20 @@ mod tests {
         let config = load_from_path(&path).unwrap();
         fs::remove_dir_all(dir).ok();
         assert_eq!(config, LmuxConfig::default());
+    }
+
+    #[test]
+    fn malformed_config_strict_load_fails() {
+        let dir = std::env::temp_dir().join(format!("vmux-config-strict-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, "{ this is not valid json ").unwrap();
+        let err = load_from_path_strict(&path).unwrap_err().to_string();
+        fs::remove_dir_all(dir).ok();
+        assert!(
+            err.contains("refusing to overwrite") || err.contains("parse config"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -382,7 +382,19 @@ fn install_shell(home: &Path) -> Result<InstallResult> {
 }
 
 fn append_source_once(path: &Path, source_line: &str) -> Result<()> {
-    let existing = fs::read_to_string(path).unwrap_or_default();
+    // Only treat missing file as empty; fail closed on other I/O (bugs.md P1#4).
+    let existing = match fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes).with_context(|| {
+            format!(
+                "shell rc {} is not valid UTF-8; refusing to rewrite",
+                path.display()
+            )
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read shell rc {}", path.display()));
+        }
+    };
     if existing.lines().any(|line| line.trim() == source_line) {
         return Ok(());
     }
@@ -391,6 +403,20 @@ fn append_source_once(path: &Path, source_line: &str) -> Result<()> {
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         fs::create_dir_all(parent)?;
+    }
+    // Byte-for-byte backup before first mutation.
+    if path.is_file() {
+        let backup = path.with_extension(format!(
+            "{}vmux-bak",
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!("{e}."))
+                .unwrap_or_default()
+        ));
+        if !backup.exists() {
+            fs::copy(path, &backup)
+                .with_context(|| format!("backup {} → {}", path.display(), backup.display()))?;
+        }
     }
     let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
@@ -403,23 +429,59 @@ fn append_source_once(path: &Path, source_line: &str) -> Result<()> {
     Ok(())
 }
 
+fn read_json_object_file(path: &Path) -> Result<(String, Value)> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let previous = String::from_utf8(bytes).with_context(|| {
+                format!("{} is not valid UTF-8; refusing to rewrite", path.display())
+            })?;
+            let root: Value = serde_json::from_str(&previous).with_context(|| {
+                format!(
+                    "parse {} failed; refusing to replace with defaults (fix the file first)",
+                    path.display()
+                )
+            })?;
+            if !root.is_object() {
+                anyhow::bail!(
+                    "{} root must be a JSON object; refusing to rewrite",
+                    path.display()
+                );
+            }
+            Ok((previous, root))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(("{}".to_string(), json!({}))),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn backup_file_bytes(path: &Path, previous: &str) -> Result<()> {
+    if !path.is_file() || previous.contains(VMUX_HOOK_MARKER) {
+        return Ok(());
+    }
+    let backup = path.with_extension("json.vmux-bak");
+    if backup.exists() {
+        return Ok(());
+    }
+    fs::write(&backup, previous)
+        .with_context(|| format!("backup {} → {}", path.display(), backup.display()))
+}
+
 fn install_claude(home: &Path) -> Result<InstallResult> {
     let path = claude_settings_path(home);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let previous = fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
-    let mut root: Value = serde_json::from_str(&previous).unwrap_or_else(|_| json!({}));
-    if !root.is_object() {
-        root = json!({});
-    }
+    let (previous, mut root) = read_json_object_file(&path)?;
     let hooks = root
         .as_object_mut()
         .unwrap()
         .entry("hooks")
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        anyhow::bail!(
+            "{} has a non-object \"hooks\" value; refusing to overwrite without confirmation",
+            path.display()
+        );
     }
     let hooks_obj = hooks.as_object_mut().unwrap();
     ensure_event_hook(hooks_obj, "Notification");
@@ -434,11 +496,7 @@ fn install_claude(home: &Path) -> Result<InstallResult> {
     let next = format!("{next}\n");
     let changed = previous.trim() != next.trim();
     if changed {
-        // Backup once before first vmux write if file already existed.
-        if path.is_file() && !previous.contains(VMUX_HOOK_MARKER) {
-            let backup = path.with_extension("json.vmux-bak");
-            fs::write(&backup, &previous).ok();
-        }
+        backup_file_bytes(&path, &previous)?;
         fs::write(&path, next)?;
     }
     Ok(InstallResult {
@@ -454,18 +512,17 @@ fn install_codex(home: &Path) -> Result<InstallResult> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let previous = fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
-    let mut root: Value = serde_json::from_str(&previous).unwrap_or_else(|_| json!({}));
-    if !root.is_object() {
-        root = json!({});
-    }
+    let (previous, mut root) = read_json_object_file(&path)?;
     let hooks = root
         .as_object_mut()
         .unwrap()
         .entry("hooks")
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        anyhow::bail!(
+            "{} has a non-object \"hooks\" value; refusing to overwrite without confirmation",
+            path.display()
+        );
     }
     let hooks_obj = hooks.as_object_mut().unwrap();
     // Lifecycle → sidebar emoji:
@@ -482,10 +539,7 @@ fn install_codex(home: &Path) -> Result<InstallResult> {
     let next = format!("{next}\n");
     let changed = previous.trim() != next.trim();
     if changed {
-        if path.is_file() && !previous.contains(VMUX_HOOK_MARKER) {
-            let backup = path.with_extension("json.vmux-bak");
-            fs::write(&backup, &previous).ok();
-        }
+        backup_file_bytes(&path, &previous)?;
         fs::write(&path, next)?;
     }
     Ok(InstallResult {
@@ -650,7 +704,7 @@ mod tests {
             .unwrap_or("")
             .contains("keep-me")));
         assert!(pre.iter().any(group_has_vmux_hook));
-        assert!(root["hooks"]["Stop"].as_array().unwrap().len() >= 1);
+        assert!(!root["hooks"]["Stop"].as_array().unwrap().is_empty());
         assert!(group_has_vmux_hook(&root["hooks"]["Stop"][0]));
 
         fs::remove_dir_all(home).ok();

@@ -14,10 +14,21 @@ pub struct Session {
     pub notifications: Vec<Notification>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<EventRecord>,
+    /// Monotonic counter for [`EventRecord::id`] (persisted so IDs stay unique).
+    #[serde(default)]
+    pub next_event_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clipboard: Option<ClipboardItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<DaemonInfo>,
+}
+
+/// Where a pane lives in the Workspace → Tab → Pane hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLocation {
+    pub workspace_id: String,
+    pub tab_id: Option<String>,
+    pub pane_id: String,
 }
 
 impl Session {
@@ -29,9 +40,33 @@ impl Session {
             panes: BTreeMap::new(),
             notifications: Vec::new(),
             events: Vec::new(),
+            next_event_id: 0,
             clipboard: None,
             daemon: None,
         }
+    }
+
+    /// Locate a pane across every tab of every workspace (not just active-tab live views).
+    pub fn find_pane_location(&self, pane_id: &str) -> Option<PaneLocation> {
+        for workspace in &self.workspaces {
+            for tab in &workspace.tabs {
+                if tab.panes.iter().any(|p| p == pane_id) {
+                    return Some(PaneLocation {
+                        workspace_id: workspace.id.clone(),
+                        tab_id: Some(tab.id.clone()),
+                        pane_id: pane_id.to_string(),
+                    });
+                }
+            }
+            if workspace.panes.iter().any(|p| p == pane_id) {
+                return Some(PaneLocation {
+                    workspace_id: workspace.id.clone(),
+                    tab_id: workspace.active_tab.clone(),
+                    pane_id: pane_id.to_string(),
+                });
+            }
+        }
+        None
     }
 
     /// Push a fresh default workspace if none exist. Guards against a
@@ -378,7 +413,13 @@ impl WorkspaceTab {
     pub fn ensure_layout(&mut self) {
         self.panes.retain(|pane| !pane.is_empty());
         self.layout = normalize_layout(self.layout.take(), &self.panes);
-        if self.active_pane.is_none() {
+        // Reset dangling focus the same way as zoomed_pane (bugs.md P3#17).
+        if self
+            .active_pane
+            .as_ref()
+            .map(|pane| !self.panes.iter().any(|item| item == pane))
+            .unwrap_or(true)
+        {
             self.active_pane = self.first_pane();
         }
         if self
@@ -681,7 +722,13 @@ impl Workspace {
         }
         self.panes.retain(|pane| !pane.is_empty());
         self.layout = normalize_layout(self.layout.take(), &self.panes);
-        if self.active_pane.is_none() {
+        // Reset dangling focus the same way as zoomed_pane (bugs.md P3#17).
+        if self
+            .active_pane
+            .as_ref()
+            .map(|pane| !self.panes.iter().any(|item| item == pane))
+            .unwrap_or(true)
+        {
             self.active_pane = self.first_pane();
         }
         if self
@@ -1043,6 +1090,9 @@ pub struct Notification {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
+    /// Monotonic id (unique per session); used for CLI follow and relay dedupe.
+    #[serde(default)]
+    pub id: u64,
     pub time: u64,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,6 +1107,23 @@ pub struct EventRecord {
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
+}
+
+impl EventRecord {
+    #[allow(dead_code)]
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            id: 0,
+            time: unix_time(),
+            kind: kind.into(),
+            pane: None,
+            workspace: None,
+            status: None,
+            key: None,
+            value: None,
+            message: String::new(),
+        }
+    }
 }
 
 pub fn unix_time() -> u64 {
@@ -1612,6 +1679,42 @@ mod tests {
         // Live view still usable by existing code paths.
         assert_eq!(ws.panes, vec!["pane-1", "pane-2"]);
         assert_eq!(ws.active_pane.as_deref(), Some("pane-2"));
+    }
+
+    #[test]
+    fn find_pane_location_searches_all_tabs() {
+        let mut session = Session::new("test");
+        let mut ws = session.workspaces.remove(0);
+        ws.tabs = vec![
+            WorkspaceTab {
+                id: "tab-1".into(),
+                title: "main".into(),
+                panes: vec!["pane-1".into()],
+                active_pane: Some("pane-1".into()),
+                zoomed_pane: None,
+                layout: Some(LayoutNode::Pane {
+                    pane: "pane-1".into(),
+                }),
+            },
+            WorkspaceTab {
+                id: "tab-2".into(),
+                title: "bg".into(),
+                panes: vec!["pane-2".into()],
+                active_pane: Some("pane-2".into()),
+                zoomed_pane: None,
+                layout: Some(LayoutNode::Pane {
+                    pane: "pane-2".into(),
+                }),
+            },
+        ];
+        ws.active_tab = Some("tab-1".into());
+        ws.panes = vec!["pane-1".into()];
+        ws.active_pane = Some("pane-1".into());
+        session.workspaces.push(ws);
+        let loc = session.find_pane_location("pane-2").expect("bg pane");
+        assert_eq!(loc.workspace_id, "ws-1");
+        assert_eq!(loc.tab_id.as_deref(), Some("tab-2"));
+        assert_eq!(loc.pane_id, "pane-2");
     }
 
     #[test]

@@ -1,3 +1,7 @@
+#![allow(clippy::too_many_arguments)]
+
+mod input_batch;
+
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -121,8 +125,10 @@ struct Ui {
     prefix_label: String,
     mode: UiMode,
     sidebar_collapsed: bool,
-    /// Expanded sidebar width in columns (when not collapsed).
+    /// Expanded sidebar width in columns (when not collapsed), or max when fit.
     sidebar_width: u16,
+    /// Fit sidebar to workspace name length (capped by sidebar_width).
+    sidebar_fit: bool,
     /// True while dragging the sidebar right edge to resize.
     sidebar_resize_drag: bool,
     sidebar_drag_workspace: Option<String>,
@@ -204,6 +210,11 @@ struct Ui {
     /// changes, which would otherwise appear only after the next 150ms tick.
     /// `Cell` so the `&self` `rpc()` helper can set it.
     pending_refresh: std::cell::Cell<bool>,
+    /// Coalesced keystroke payload for the active pane (newimp §6).
+    /// Flushed after ~8 ms idle, on paste/navigation, or when the buffer is large.
+    input_batch: String,
+    input_batch_pane: Option<String>,
+    input_batch_started: Option<Instant>,
     /// Last keystroke/paste into a pane — keeps the caret solid (no blink) while typing.
     last_typing_at: Option<Instant>,
     /// Horizontal scroll offset (button index) for the bottom control bar.
@@ -701,6 +712,7 @@ impl Ui {
             mode: UiMode::Panes,
             sidebar_collapsed: config.ui.sidebar_collapsed,
             sidebar_width: crate::config::clamp_sidebar_width(config.ui.sidebar_width),
+            sidebar_fit: config.ui.sidebar_fit,
             sidebar_resize_drag: false,
             sidebar_drag_workspace: None,
             pane_resize_drag: None,
@@ -754,6 +766,9 @@ impl Ui {
             pending_refresh: std::cell::Cell::new(false),
             last_typing_at: None,
             control_bar_scroll: 0,
+            input_batch: String::new(),
+            input_batch_pane: None,
+            input_batch_started: None,
         }
     }
 
@@ -792,9 +807,26 @@ impl Ui {
                 }
             }
 
-            // Periodic refresh so external changes (other clients, notifications)
-            // still appear while idle.
-            if last_refresh.elapsed() > Duration::from_millis(150) {
+            // Flush coalesced keystrokes after a short idle window.
+            if self.should_flush_input_batch() {
+                self.flush_input_batch()?;
+                dirty = true;
+            }
+
+            // Adaptive poll: faster while typing/active, slower when idle (newimp §6).
+            let active_recently = self
+                .last_typing_at
+                .map(|t| t.elapsed() < Duration::from_millis(800))
+                .unwrap_or(false)
+                || self.pending_refresh.get()
+                || !self.input_batch.is_empty();
+            let refresh_interval = if active_recently {
+                Duration::from_millis(40)
+            } else {
+                Duration::from_millis(250)
+            };
+            if last_refresh.elapsed() > refresh_interval {
+                self.flush_input_batch()?;
                 if self.refresh()? {
                     dirty = true;
                 }
@@ -819,6 +851,9 @@ impl Ui {
                         } else {
                             self.hover_pane_control.as_ref()
                         };
+                    // Compute before the draw closure to avoid E0502 (self borrow).
+                    let sidebar_expanded = self.expanded_sidebar_width(self.snapshot.as_ref());
+                    let sidebar_fit = self.sidebar_fit;
                     self.terminal.draw(|frame| {
                         draw(
                             frame,
@@ -827,7 +862,7 @@ impl Ui {
                             &self.scroll_offsets,
                             self.mode,
                             self.sidebar_collapsed,
-                            self.sidebar_width,
+                            sidebar_expanded,
                             self.sidebar_scroll,
                             self.notification_selected,
                             &self.actions,
@@ -864,6 +899,7 @@ impl Ui {
                             self.mobile_relay_allow_localhost,
                             self.mobile_relay_allow_cgnat,
                             self.sidebar_responsive,
+                            sidebar_fit,
                             self.workspace_picker_selected,
                             self.control_bar_scroll,
                         )
@@ -873,14 +909,17 @@ impl Ui {
                 dirty = false;
             }
 
+            // While keystrokes are buffering, wake sooner so the 8 ms batch flushes.
+            let poll_ms = if self.input_batch.is_empty() { 50 } else { 8 };
             // Block for the first event (so the loop still ticks for the
             // periodic refresh), then drain everything already queued and draw
             // at most once. Exit promptly if any event requests quit.
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(Duration::from_millis(poll_ms))? {
                 self.pending_refresh.set(false);
                 loop {
                     let event = event::read()?;
                     if self.handle_event(event)? {
+                        self.flush_input_batch()?;
                         return Ok(());
                     }
                     // Any handled event can change what's on screen (including
@@ -889,6 +928,10 @@ impl Ui {
                     if !event::poll(Duration::ZERO)? {
                         break;
                     }
+                }
+                // End of burst: if batch window elapsed, send now.
+                if self.should_flush_input_batch() {
+                    self.flush_input_batch()?;
                 }
                 // If any drained event sent input to a pane, refresh now so the
                 // echo appears immediately rather than at the next 150ms tick.
@@ -1147,10 +1190,7 @@ impl Ui {
                 if let Some(data) = key_to_input(key.code, key.modifiers) {
                     if let Some(pane) = self.active_pane() {
                         self.note_typing();
-                        self.rpc(&Request::Input {
-                            pane: Some(pane),
-                            data,
-                        })?;
+                        self.queue_input(pane, data)?;
                     }
                 }
             }
@@ -1162,6 +1202,13 @@ impl Ui {
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
+                    // Ignore drags under modals/overlays (bugs.md P2#10).
+                    if self.pending_confirm.is_some()
+                        || self.rename_dialog.is_some()
+                        || !matches!(self.mode, UiMode::Panes)
+                    {
+                        return Ok(false);
+                    }
                     self.pane_size_control_requested = true;
                     if self.sidebar_resize_drag {
                         self.handle_sidebar_resize_drag(mouse.column)?;
@@ -1172,6 +1219,14 @@ impl Ui {
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
+                    if self.pending_confirm.is_some()
+                        || self.rename_dialog.is_some()
+                        || !matches!(self.mode, UiMode::Panes | UiMode::ContextMenu)
+                    {
+                        self.sidebar_drag_workspace = None;
+                        self.pane_resize_drag = None;
+                        return Ok(false);
+                    }
                     if self.sidebar_resize_drag {
                         self.finish_sidebar_resize()?;
                     } else if !self.forward_mouse_to_pane(
@@ -1186,6 +1241,12 @@ impl Ui {
                     self.pane_resize_drag = None;
                 }
                 MouseEventKind::Down(MouseButton::Right) => {
+                    if self.pending_confirm.is_some() || self.rename_dialog.is_some() {
+                        return Ok(false);
+                    }
+                    if !matches!(self.mode, UiMode::Panes | UiMode::ContextMenu) {
+                        return Ok(false);
+                    }
                     self.pane_size_control_requested = true;
                     self.handle_right_click(mouse.column, mouse.row)?;
                 }
@@ -1220,7 +1281,12 @@ impl Ui {
                             _tw.saturating_sub(self.layout_sidebar_cols()),
                             1,
                         );
-                        let max = control_bar_layout(area, self.control_bar_scroll).max_scroll;
+                        let max = control_bar_layout(
+                            area,
+                            self.control_bar_scroll,
+                            self.is_compact_layout(),
+                        )
+                        .max_scroll;
                         self.control_bar_scroll = (self.control_bar_scroll + 1).min(max);
                     } else if !matches!(self.mode, UiMode::Panes) {
                     } else {
@@ -1239,9 +1305,23 @@ impl Ui {
                 _ => {}
             },
             Event::Paste(text) => {
+                // Never paste into a hidden pane under overlays/modals (bugs.md P2#10).
+                if self.pending_confirm.is_some()
+                    || self.rename_dialog.is_some()
+                    || !matches!(self.mode, UiMode::Panes)
+                {
+                    if self.rename_dialog.is_some() {
+                        if let Some(dialog) = self.rename_dialog.as_mut() {
+                            dialog.draft.push_str(&text);
+                        }
+                    }
+                    return Ok(false);
+                }
                 self.pane_size_control_requested = true;
                 if let Some(pane) = self.active_pane() {
                     self.note_typing();
+                    // Paste is already a bulk payload — flush any keystroke batch first.
+                    self.flush_input_batch()?;
                     self.rpc(&Request::Input {
                         pane: Some(pane),
                         data: text,
@@ -1259,6 +1339,56 @@ impl Ui {
 
     fn note_typing(&mut self) {
         self.last_typing_at = Some(Instant::now());
+    }
+
+    /// Coalesce printable keystrokes into one Input RPC (≈8 ms window).
+    fn queue_input(&mut self, pane: String, data: String) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        // Switch pane or control sequence (esc/arrows) → flush first for ordering.
+        if input_batch::is_control_payload(&data) {
+            self.flush_input_batch()?;
+            return self.rpc(&Request::Input {
+                pane: Some(pane),
+                data,
+            });
+        }
+        if self.input_batch_pane.as_ref() != Some(&pane) {
+            self.flush_input_batch()?;
+            self.input_batch_pane = Some(pane);
+            self.input_batch_started = Some(Instant::now());
+        } else if self.input_batch_started.is_none() {
+            self.input_batch_started = Some(Instant::now());
+        }
+        self.input_batch.push_str(&data);
+        // Bound worst-case latency/memory for huge pastes typed as keys.
+        if self.input_batch.len() >= input_batch::INPUT_BATCH_MAX_CHARS {
+            self.flush_input_batch()?;
+        }
+        Ok(())
+    }
+
+    fn should_flush_input_batch(&self) -> bool {
+        input_batch::batch_ready(self.input_batch_started, self.input_batch.is_empty())
+    }
+
+    fn flush_input_batch(&mut self) -> Result<()> {
+        if self.input_batch.is_empty() {
+            self.input_batch_pane = None;
+            self.input_batch_started = None;
+            return Ok(());
+        }
+        let pane = self.input_batch_pane.take();
+        let data = std::mem::take(&mut self.input_batch);
+        self.input_batch_started = None;
+        if let Some(pane) = pane {
+            self.rpc(&Request::Input {
+                pane: Some(pane),
+                data,
+            })?;
+        }
+        Ok(())
     }
 
     fn request(&self, request: &Request) -> Result<protocol::Response> {
@@ -1667,13 +1797,38 @@ impl Ui {
     }
 
     /// Sidebar column count after responsive rules (0 = fully hidden).
+    ///
+    /// Must match what `draw()` uses for layout so control-bar hit testing
+    /// lines up with painted buttons (especially in compact/mobile mode).
     fn layout_sidebar_cols(&self) -> u16 {
         let (term_w, _) = terminal_size().unwrap_or((80, 24));
         if self.sidebar_responsive && term_w < COMPACT_TERM_WIDTH {
-            0
-        } else {
-            sidebar_width(self.sidebar_collapsed, self.sidebar_width)
+            return 0;
         }
+        if self.sidebar_collapsed {
+            return crate::config::SIDEBAR_COLLAPSED_WIDTH;
+        }
+        let expanded = self.expanded_sidebar_width(self.snapshot.as_ref());
+        crate::config::clamp_sidebar_width(expanded)
+    }
+
+    /// Expanded (non-collapsed) width: fixed or fit-to-workspace-names with max.
+    fn expanded_sidebar_width(&self, snapshot: Option<&Session>) -> u16 {
+        let max = crate::config::clamp_sidebar_width(self.sidebar_width);
+        if !self.sidebar_fit {
+            return max;
+        }
+        let Some(snapshot) = snapshot else {
+            return max;
+        };
+        let mut need = crate::config::SIDEBAR_MIN_WIDTH;
+        for ws in &snapshot.workspaces {
+            // padding + optional pin/status glyphs + name
+            let name_w = UnicodeWidthStr::width(ws.name.as_str()) as u16;
+            let row = name_w.saturating_add(10); // markers / padding budget
+            need = need.max(row);
+        }
+        need.clamp(crate::config::SIDEBAR_MIN_WIDTH, max)
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
@@ -1709,8 +1864,8 @@ impl Ui {
         ) {
             if current + 1 < count {
                 current += 1;
-            } else if current > 0 {
-                current -= 1;
+            } else {
+                current = current.saturating_sub(1);
             }
         }
         self.settings_selected = current;
@@ -1736,6 +1891,10 @@ impl Ui {
                     "ui.sidebar_responsive",
                     &self.sidebar_responsive.to_string(),
                 )?;
+            }
+            SettingsEntryId::SidebarFit => {
+                self.sidebar_fit = !self.sidebar_fit;
+                self.save_ui_config("ui.sidebar_fit", &self.sidebar_fit.to_string())?;
             }
             SettingsEntryId::SidebarWidth => {
                 let next = if delta.is_negative() {
@@ -1974,8 +2133,7 @@ impl Ui {
     }
 
     fn save_ui_config(&self, key: &str, value: &str) -> Result<()> {
-        let path = paths::config_path()?;
-        let mut config = crate::config::load()?;
+        let (path, mut config) = crate::config::load_for_mutation()?;
         crate::config::set_value(&mut config, key, value)?;
         crate::config::save_to_path(&path, &config)?;
         // Keep in-memory config path linked: re-read normalized values for display.
@@ -2467,7 +2625,7 @@ impl Ui {
     /// Scrolls the sidebar by wheel input. Returns `true` if the pointer was over
     /// the sidebar (and thus the wheel event was consumed).
     fn scroll_sidebar(&mut self, column: u16, delta: isize) -> bool {
-        if column >= sidebar_width(self.sidebar_collapsed, self.sidebar_width) {
+        if column >= self.layout_sidebar_cols() {
             return false;
         }
         let next = if delta.is_negative() {
@@ -2496,6 +2654,35 @@ impl Ui {
         self.update_hover(column, row)?;
         let (width, height) = terminal_size()?;
         let layout_cols = self.layout_sidebar_cols();
+        // Modal-first: dialogs own input before sidebar resize / chrome (bugs.md P2#10).
+        if self.rename_dialog.is_some() {
+            let main = confirm_main_area(layout_cols, width, height);
+            if let Some((ok, cancel)) = rename_button_rects(main) {
+                if point_in_rect(ok, column, row) {
+                    self.submit_rename()?;
+                    return Ok(false);
+                }
+                if point_in_rect(cancel, column, row) {
+                    self.cancel_rename();
+                    return Ok(false);
+                }
+            }
+            return Ok(false);
+        }
+        if self.pending_confirm.is_some() {
+            let main = confirm_main_area(layout_cols, width, height);
+            if let Some((yes, no)) = confirm_button_rects(main) {
+                if point_in_rect(yes, column, row) {
+                    self.confirm_pending()?;
+                    return Ok(false);
+                }
+                if point_in_rect(no, column, row) {
+                    self.cancel_confirm();
+                    return Ok(false);
+                }
+            }
+            return Ok(false);
+        }
         // Start sidebar resize when grabbing the right edge (expanded only).
         let cols = layout_cols;
         if !self.sidebar_collapsed
@@ -2510,7 +2697,7 @@ impl Ui {
         }
         // ☰ workspace picker: click a row to switch.
         if self.mode == UiMode::WorkspacePicker {
-            let main = confirm_main_area(self.sidebar_collapsed, self.sidebar_width, width, height);
+            let main = confirm_main_area(layout_cols, width, height);
             // List starts one row below the border title.
             if column > main.x
                 && column < main.x.saturating_add(main.width)
@@ -2533,45 +2720,14 @@ impl Ui {
             self.toggle_workspace_picker();
             return Ok(false);
         }
-        // Rename dialog: OK / Cancel / ignore outside.
-        if self.rename_dialog.is_some() {
-            let main = confirm_main_area(self.sidebar_collapsed, self.sidebar_width, width, height);
-            if let Some((ok, cancel)) = rename_button_rects(main) {
-                if point_in_rect(ok, column, row) {
-                    self.submit_rename()?;
-                    return Ok(false);
-                }
-                if point_in_rect(cancel, column, row) {
-                    self.cancel_rename();
-                    return Ok(false);
-                }
-            }
-            return Ok(false);
-        }
-        // Modal alert captures clicks on Yes / Cancel (and swallows the rest).
-        if self.pending_confirm.is_some() {
-            let main = confirm_main_area(self.sidebar_collapsed, self.sidebar_width, width, height);
-            if let Some((yes, no)) = confirm_button_rects(main) {
-                if point_in_rect(yes, column, row) {
-                    self.confirm_pending()?;
-                    return Ok(false);
-                }
-                if point_in_rect(no, column, row) {
-                    self.cancel_confirm();
-                    return Ok(false);
-                }
-            }
-            // Click outside buttons: ignore (keep dialog open).
-            return Ok(false);
-        }
         if let Some(hit) = control_bar_hit_at(
-            self.sidebar_collapsed,
-            self.sidebar_width,
+            self.layout_sidebar_cols(),
             width,
             height,
             column,
             row,
             self.control_bar_scroll,
+            self.is_compact_layout(),
         ) {
             self.sidebar_drag_workspace = None;
             self.pane_resize_drag = None;
@@ -2588,7 +2744,9 @@ impl Ui {
                         width.saturating_sub(self.layout_sidebar_cols()),
                         1,
                     );
-                    let max = control_bar_layout(area, self.control_bar_scroll).max_scroll;
+                    let max =
+                        control_bar_layout(area, self.control_bar_scroll, self.is_compact_layout())
+                            .max_scroll;
                     self.control_bar_scroll = (self.control_bar_scroll + 1).min(max);
                     return Ok(false);
                 }
@@ -2597,25 +2755,27 @@ impl Ui {
                 }
             }
         }
+        // Context menu is an overlay but must accept item clicks (bugs.md P2#11).
+        if self.mode == UiMode::ContextMenu {
+            if self.handle_context_click(row)? {
+                return Ok(false);
+            }
+            self.close_context_menu();
+            return Ok(false);
+        }
         // Overlays (settings/commands/picker/…) own the main area — do not
         // let clicks fall through to hidden pane × buttons (improve.md #19).
         if !matches!(self.mode, UiMode::Panes) {
             return Ok(false);
         }
         if self.mode == UiMode::Panes && self.active_workspace_is_empty() {
-            let area = pane_area(self.sidebar_collapsed, self.sidebar_width, width, height);
+            let area = pane_area(layout_cols, width, height);
             if let Some(rect) = empty_create_pane_rect(area) {
                 if point_in_rect(rect, column, row) {
                     self.new_pane(SplitDirection::Right)?;
                     return Ok(false);
                 }
             }
-        }
-        if self.mode == UiMode::ContextMenu {
-            if self.handle_context_click(row)? {
-                return Ok(false);
-            }
-            self.close_context_menu();
         }
         let Some(snapshot) = &self.snapshot else {
             return Ok(false);
@@ -2625,7 +2785,7 @@ impl Ui {
             snapshot,
             self.sidebar_scroll,
             self.sidebar_collapsed,
-            self.sidebar_width,
+            layout_cols,
             width,
             height,
             column,
@@ -2647,15 +2807,7 @@ impl Ui {
         if self.forward_mouse_to_pane(column, row, MouseButtonCode::Left, true)? {
             return Ok(false);
         }
-        if let Some(hit) = pane_control_at(
-            snapshot,
-            self.sidebar_collapsed,
-            self.sidebar_width,
-            width,
-            height,
-            column,
-            row,
-        ) {
+        if let Some(hit) = pane_control_at(snapshot, layout_cols, width, height, column, row) {
             self.sidebar_drag_workspace = None;
             self.pane_resize_drag = None;
             self.run_pane_control(hit)?;
@@ -2665,7 +2817,7 @@ impl Ui {
             snapshot,
             self.sidebar_scroll,
             self.sidebar_collapsed,
-            self.sidebar_width,
+            layout_cols,
             width,
             height,
             column,
@@ -2716,21 +2868,22 @@ impl Ui {
     fn update_hover(&mut self, column: u16, row: u16) -> Result<()> {
         let (width, height) = terminal_size()?;
         self.hover_control = match control_bar_hit_at(
-            self.sidebar_collapsed,
-            self.sidebar_width,
+            self.layout_sidebar_cols(),
             width,
             height,
             column,
             row,
             self.control_bar_scroll,
+            self.is_compact_layout(),
         ) {
             Some(ControlBarHit::Action(a)) => Some(a),
             _ => None,
         };
         let sidebar_scroll = self.sidebar_scroll;
         let list_height = height.saturating_sub(1);
+        let live_sidebar_cols = self.layout_sidebar_cols();
         self.hover_workspace = self.snapshot.as_ref().and_then(|snapshot| {
-            (column < sidebar_width(self.sidebar_collapsed, self.sidebar_width))
+            (column < live_sidebar_cols)
                 .then(|| {
                     workspace_at_sidebar_row(
                         snapshot,
@@ -2744,26 +2897,13 @@ impl Ui {
                 .flatten()
         });
         self.hover_pane_control = self.snapshot.as_ref().and_then(|snapshot| {
-            pane_control_at(
-                snapshot,
-                self.sidebar_collapsed,
-                self.sidebar_width,
-                width,
-                height,
-                column,
-                row,
-            )
+            pane_control_at(snapshot, live_sidebar_cols, width, height, column, row)
         });
         self.hover_empty_create = self.mode == UiMode::Panes
             && self.active_workspace_is_empty()
-            && empty_create_pane_rect(pane_area(
-                self.sidebar_collapsed,
-                self.sidebar_width,
-                width,
-                height,
-            ))
-            .map(|rect| point_in_rect(rect, column, row))
-            .unwrap_or(false);
+            && empty_create_pane_rect(pane_area(live_sidebar_cols, width, height))
+                .map(|rect| point_in_rect(rect, column, row))
+                .unwrap_or(false);
         Ok(())
     }
 
@@ -2791,7 +2931,7 @@ impl Ui {
         let Some(snapshot) = &self.snapshot else {
             return Ok(());
         };
-        if column >= sidebar_width(self.sidebar_collapsed, self.sidebar_width) {
+        if column >= self.layout_sidebar_cols() {
             return Ok(());
         }
         let Some(position) = sidebar_position_from_row(
@@ -2842,8 +2982,8 @@ impl Ui {
         let Some(snapshot) = &self.snapshot else {
             return Ok(());
         };
-        let sidebar_width = sidebar_width(self.sidebar_collapsed, self.sidebar_width);
-        if column < sidebar_width {
+        let sidebar_cols = self.layout_sidebar_cols();
+        if column < sidebar_cols {
             if let Some(workspace) = workspace_at_sidebar_row(
                 snapshot,
                 sidebar_scroll,
@@ -2999,8 +3139,8 @@ impl Ui {
     }
 
     fn pane_area_at_position(&self, column: u16, row: u16) -> Result<Option<(String, Rect)>> {
-        let sidebar_width = sidebar_width(self.sidebar_collapsed, self.sidebar_width);
-        if column < sidebar_width {
+        let sidebar_cols = self.layout_sidebar_cols();
+        if column < sidebar_cols {
             return Ok(None);
         }
         let Some(snapshot) = &self.snapshot else {
@@ -3022,13 +3162,10 @@ impl Ui {
             .filter(|pane| active.panes.iter().any(|item| item == *pane))
         {
             let (width, height) = terminal_size()?;
-            return Ok(Some((
-                pane.clone(),
-                pane_area(self.sidebar_collapsed, self.sidebar_width, width, height),
-            )));
+            return Ok(Some((pane.clone(), pane_area(sidebar_cols, width, height))));
         }
         let (width, height) = terminal_size()?;
-        let area = pane_area(self.sidebar_collapsed, self.sidebar_width, width, height);
+        let area = pane_area(sidebar_cols, width, height);
         Ok(pane_area_at(active.layout.as_ref(), area, column, row))
     }
 
@@ -3044,7 +3181,7 @@ impl Ui {
             return Ok(None);
         };
         let (width, height) = terminal_size()?;
-        let area = pane_area(self.sidebar_collapsed, self.sidebar_width, width, height);
+        let area = pane_area(self.layout_sidebar_cols(), width, height);
         if active.zoomed_pane.as_deref() == Some(pane_id) {
             return Ok(Some(area));
         }
@@ -3096,6 +3233,7 @@ fn draw(
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
     sidebar_responsive: bool,
+    sidebar_fit: bool,
     workspace_picker_selected: usize,
     control_bar_scroll: usize,
 ) {
@@ -3293,6 +3431,7 @@ fn draw(
                 workspace_second_line,
                 sidebar_collapsed,
                 sidebar_responsive,
+                sidebar_fit,
                 sidebar_width: sidebar_expanded,
                 prefix_label,
                 scroll_step,
@@ -3344,6 +3483,7 @@ fn draw(
         hover_control,
         theme,
         control_bar_scroll,
+        compact,
     );
     frame.render_widget(
         Paragraph::new(session_footer_with_modals(
@@ -3670,17 +3810,12 @@ fn confirm_dialog_rect(area: Rect) -> Option<Rect> {
 }
 
 /// Main content area used for the confirm overlay (matches draw() layout).
-fn confirm_main_area(
-    sidebar_collapsed: bool,
-    sidebar_expanded: u16,
-    terminal_width: u16,
-    terminal_height: u16,
-) -> Rect {
-    let sw = sidebar_width(sidebar_collapsed, sidebar_expanded);
+/// `sidebar_cols` must be the live painted width (`layout_sidebar_cols()`).
+fn confirm_main_area(sidebar_cols: u16, terminal_width: u16, terminal_height: u16) -> Rect {
     Rect::new(
-        sw,
+        sidebar_cols,
         0,
-        terminal_width.saturating_sub(sw),
+        terminal_width.saturating_sub(sidebar_cols),
         terminal_height.saturating_sub(CONTROL_BAR_HEIGHT),
     )
 }
@@ -4527,7 +4662,8 @@ fn primary_mouse_action(
     snapshot: &Session,
     sidebar_offset: usize,
     sidebar_collapsed: bool,
-    sidebar_expanded: u16,
+    // Live painted sidebar width (`layout_sidebar_cols()`); 0 when compact-hidden.
+    sidebar_cols: u16,
     terminal_width: u16,
     terminal_height: u16,
     column: u16,
@@ -4535,8 +4671,7 @@ fn primary_mouse_action(
     status_markers: &str,
     tab_close_button: bool,
 ) -> PrimaryMouseAction {
-    let sidebar_width = sidebar_width(sidebar_collapsed, sidebar_expanded);
-    if column < sidebar_width {
+    if column < sidebar_cols {
         let list_height = terminal_height.saturating_sub(1);
         return workspace_at_sidebar_row(
             snapshot,
@@ -4558,7 +4693,7 @@ fn primary_mouse_action(
     if active.panes.is_empty() {
         return PrimaryMouseAction::None;
     }
-    let tab_area = workspace_tab_bar_area(sidebar_collapsed, sidebar_expanded, terminal_width);
+    let tab_area = workspace_tab_bar_area(sidebar_cols, terminal_width);
     if let Some(action) = workspace_tab_bar_hit(
         snapshot,
         active,
@@ -4570,12 +4705,7 @@ fn primary_mouse_action(
     ) {
         return action;
     }
-    let area = pane_area(
-        sidebar_collapsed,
-        sidebar_expanded,
-        terminal_width,
-        terminal_height,
-    );
+    let area = pane_area(sidebar_cols, terminal_width, terminal_height);
     if !point_in_rect(area, column, row) {
         return PrimaryMouseAction::None;
     }
@@ -4596,33 +4726,23 @@ fn primary_mouse_action(
         .unwrap_or(PrimaryMouseAction::None)
 }
 
-fn pane_area(
-    sidebar_collapsed: bool,
-    sidebar_expanded: u16,
-    terminal_width: u16,
-    terminal_height: u16,
-) -> Rect {
-    let sidebar_width = sidebar_width(sidebar_collapsed, sidebar_expanded);
+/// Pane grid rect. `sidebar_cols` is the live painted width (0 when compact).
+fn pane_area(sidebar_cols: u16, terminal_width: u16, terminal_height: u16) -> Rect {
     Rect::new(
-        sidebar_width,
+        sidebar_cols,
         TAB_BAR_HEIGHT,
-        terminal_width.saturating_sub(sidebar_width),
+        terminal_width.saturating_sub(sidebar_cols),
         terminal_height
             .saturating_sub(CONTROL_BAR_HEIGHT)
             .saturating_sub(TAB_BAR_HEIGHT),
     )
 }
 
-fn workspace_tab_bar_area(
-    sidebar_collapsed: bool,
-    sidebar_expanded: u16,
-    terminal_width: u16,
-) -> Rect {
-    let sidebar_width = sidebar_width(sidebar_collapsed, sidebar_expanded);
+fn workspace_tab_bar_area(sidebar_cols: u16, terminal_width: u16) -> Rect {
     Rect::new(
-        sidebar_width,
+        sidebar_cols,
         0,
-        terminal_width.saturating_sub(sidebar_width),
+        terminal_width.saturating_sub(sidebar_cols),
         TAB_BAR_HEIGHT,
     )
 }
@@ -4632,15 +4752,14 @@ fn rename_target_at(
     snapshot: &Session,
     sidebar_offset: usize,
     sidebar_collapsed: bool,
-    sidebar_expanded: u16,
+    sidebar_cols: u16,
     terminal_width: u16,
     terminal_height: u16,
     column: u16,
     row: u16,
 ) -> Option<(RenameTarget, String)> {
-    let sw = sidebar_width(sidebar_collapsed, sidebar_expanded);
     // Workspace name in the sidebar.
-    if column < sw {
+    if column < sidebar_cols {
         let list_height = terminal_height.saturating_sub(1);
         let ws = workspace_at_sidebar_row(
             snapshot,
@@ -4659,7 +4778,7 @@ fn rename_target_at(
         .iter()
         .find(|workspace| workspace.id == snapshot.active_workspace)?;
     // Tab title in the tab bar (not the "+" control or close ×).
-    let tab_area = workspace_tab_bar_area(sidebar_collapsed, sidebar_expanded, terminal_width);
+    let tab_area = workspace_tab_bar_area(sidebar_cols, terminal_width);
     if point_in_rect(tab_area, column, row) {
         let mut x = tab_area.x;
         for chip in workspace_tab_chips(snapshot, active, "emoji", true) {
@@ -4688,12 +4807,7 @@ fn rename_target_at(
         return None;
     }
     // Pane title on the top border row of a pane.
-    let area = pane_area(
-        sidebar_collapsed,
-        sidebar_expanded,
-        terminal_width,
-        terminal_height,
-    );
+    let area = pane_area(sidebar_cols, terminal_width, terminal_height);
     if !point_in_rect(area, column, row) {
         return None;
     }
@@ -4932,63 +5046,118 @@ fn workspace_tab_bar_hit(
     None
 }
 
-fn control_buttons() -> Vec<ControlButton> {
+/// Control-bar buttons. `compact` (mobile / narrow) includes the ☰ workspace
+/// menu; desktop keeps the permanent sidebar and omits that button.
+fn control_buttons(compact: bool) -> Vec<ControlButton> {
     // Icons use emoji presentation (VS16 where needed) so every glyph is
     // double-width — avoids the uneven gaps from mixed 1-cell / 2-cell symbols.
-    // Note: ☰ is typically single-width in terminals; keep a short label.
-    vec![
-        ControlButton {
-            // Burger / workspace menu (double-width emoji for control-bar alignment).
+    let mut buttons = Vec::new();
+    if compact {
+        buttons.push(ControlButton {
             icon: "📱",
             label: "menu",
             action: ControlAction::Workspaces,
-        },
-        ControlButton {
-            icon: "📁",
-            label: "workspace",
-            action: ControlAction::NewWorkspace,
-        },
-        ControlButton {
-            icon: "📑",
-            label: "tab",
-            action: ControlAction::NewTab,
-        },
-        ControlButton {
-            icon: "➡️",
-            label: "split→",
-            action: ControlAction::SplitRight,
-        },
-        ControlButton {
-            icon: "⬇️",
-            label: "split↓",
-            action: ControlAction::SplitDown,
-        },
-        ControlButton {
-            icon: "🗑️",
-            label: "del-ws",
-            action: ControlAction::DeleteWorkspace,
-        },
-        ControlButton {
-            icon: "⌨️",
-            label: "commands",
-            action: ControlAction::Commands,
-        },
-        ControlButton {
-            icon: "🔔",
-            label: "notes",
-            action: ControlAction::Notifications,
-        },
-        ControlButton {
-            icon: "⚙️",
-            label: "settings",
-            action: ControlAction::Settings,
-        },
-        ControlButton {
-            icon: "❌",
-            label: "close",
-            action: ControlAction::KillPane,
-        },
-    ]
+        });
+    }
+    // Compact uses shorter labels so more full-width buttons fit (and hit).
+    if compact {
+        buttons.extend([
+            ControlButton {
+                icon: "📁",
+                label: "ws",
+                action: ControlAction::NewWorkspace,
+            },
+            ControlButton {
+                icon: "📑",
+                label: "tab",
+                action: ControlAction::NewTab,
+            },
+            ControlButton {
+                icon: "➡️",
+                label: "→",
+                action: ControlAction::SplitRight,
+            },
+            ControlButton {
+                icon: "⬇️",
+                label: "↓",
+                action: ControlAction::SplitDown,
+            },
+            ControlButton {
+                icon: "🗑️",
+                label: "del",
+                action: ControlAction::DeleteWorkspace,
+            },
+            ControlButton {
+                icon: "⌨️",
+                label: "cmd",
+                action: ControlAction::Commands,
+            },
+            ControlButton {
+                icon: "🔔",
+                label: "note",
+                action: ControlAction::Notifications,
+            },
+            ControlButton {
+                icon: "⚙️",
+                label: "set",
+                action: ControlAction::Settings,
+            },
+            ControlButton {
+                icon: "❌",
+                label: "×",
+                action: ControlAction::KillPane,
+            },
+        ]);
+    } else {
+        buttons.extend([
+            ControlButton {
+                icon: "📁",
+                label: "workspace",
+                action: ControlAction::NewWorkspace,
+            },
+            ControlButton {
+                icon: "📑",
+                label: "tab",
+                action: ControlAction::NewTab,
+            },
+            ControlButton {
+                icon: "➡️",
+                label: "split→",
+                action: ControlAction::SplitRight,
+            },
+            ControlButton {
+                icon: "⬇️",
+                label: "split↓",
+                action: ControlAction::SplitDown,
+            },
+            ControlButton {
+                icon: "🗑️",
+                label: "del-ws",
+                action: ControlAction::DeleteWorkspace,
+            },
+            ControlButton {
+                icon: "⌨️",
+                label: "commands",
+                action: ControlAction::Commands,
+            },
+            ControlButton {
+                icon: "🔔",
+                label: "notes",
+                action: ControlAction::Notifications,
+            },
+            ControlButton {
+                icon: "⚙️",
+                label: "settings",
+                action: ControlAction::Settings,
+            },
+            ControlButton {
+                icon: "❌",
+                label: "close",
+                action: ControlAction::KillPane,
+            },
+        ]);
+    }
+    buttons
 }
 
 /// Detach is drawn and hit-tested on the far right of the control bar.
@@ -5017,9 +5186,16 @@ struct ControlBarLayout {
     max_scroll: usize,
 }
 
-fn control_bar_layout(area: Rect, scroll: usize) -> ControlBarLayout {
-    let buttons = control_buttons();
+fn control_bar_layout(area: Rect, scroll: usize, compact: bool) -> ControlBarLayout {
+    let buttons = control_buttons(compact);
     let detach = detach_control_button();
+
+    // Compact / mobile: equal-width tiles across the full bar so every column
+    // is clickable and touch targets are large (no dead gaps between labels).
+    if compact && area.width > 0 && !buttons.is_empty() {
+        return control_bar_layout_compact(area, scroll, &buttons, detach);
+    }
+
     let detach_w = detach.width().min(area.width);
     let left_end = area.x.saturating_add(area.width).saturating_sub(detach_w);
 
@@ -5053,20 +5229,14 @@ fn control_bar_layout(area: Rect, scroll: usize) -> ControlBarLayout {
         if x >= end_x {
             break;
         }
+        let bw = button.width();
         let remaining = end_x.saturating_sub(x);
-        if remaining < 4 {
+        // Never paint a partial button — clipped hits feel "unclickable".
+        if remaining < bw {
             break;
         }
-        let width = button.width().min(remaining);
-        // Don't draw a severely clipped button — leave room for ▶.
-        if width + 1 < button.width() && remaining < button.width() {
-            break;
-        }
-        visible.push((
-            button.action,
-            Rect::new(x, area.y, width, area.height.max(1)),
-        ));
-        x = x.saturating_add(width);
+        visible.push((button.action, Rect::new(x, area.y, bw, area.height.max(1))));
+        x = x.saturating_add(bw);
     }
 
     // Compute max_scroll: largest start index that still shows the last button.
@@ -5074,14 +5244,6 @@ fn control_bar_layout(area: Rect, scroll: usize) -> ControlBarLayout {
     if needs_scroll {
         let track = end_x.saturating_sub(start_x);
         for start in 0..buttons.len() {
-            let mut used = 0u16;
-            for b in buttons.iter().skip(start) {
-                used = used.saturating_add(b.width());
-                if used > track {
-                    break;
-                }
-            }
-            // Can we fit from `start` to the end?
             let mut fit = 0u16;
             let mut all = true;
             for b in buttons.iter().skip(start) {
@@ -5117,33 +5279,161 @@ fn control_bar_layout(area: Rect, scroll: usize) -> ControlBarLayout {
     }
 }
 
+/// Compact control bar: equal-width tiles (icon-only when narrow) with scroll.
+fn control_bar_layout_compact(
+    area: Rect,
+    scroll: usize,
+    buttons: &[ControlButton],
+    _detach: ControlButton,
+) -> ControlBarLayout {
+    // Minimum tile width: icon + padding (" XX "). Prefer content width when
+    // wider so short labels still show.
+    let content_ws: Vec<u16> = buttons.iter().map(|b| b.width().max(4)).collect();
+    let min_tile = content_ws.iter().copied().min().unwrap_or(4).min(6);
+
+    // How many left buttons fit alongside detach at min_tile size?
+    let max_slots = (area.width / min_tile).max(1) as usize;
+    // Reserve one slot for detach when possible.
+    let left_slots = if max_slots > 1 {
+        max_slots - 1
+    } else {
+        max_slots
+    };
+    let needs_scroll = buttons.len() > left_slots && left_slots > 0;
+    let scroll = scroll.min(buttons.len().saturating_sub(1));
+
+    let (scroll_left, scroll_right, track_x, track_w) = if needs_scroll {
+        let left = Rect::new(area.x, area.y, CONTROL_SCROLL_BTN_W, area.height.max(1));
+        let right = Rect::new(
+            area.x
+                .saturating_add(area.width)
+                .saturating_sub(CONTROL_SCROLL_BTN_W),
+            area.y,
+            CONTROL_SCROLL_BTN_W,
+            area.height.max(1),
+        );
+        let track_x = area.x.saturating_add(CONTROL_SCROLL_BTN_W);
+        let track_w = area
+            .width
+            .saturating_sub(CONTROL_SCROLL_BTN_W.saturating_mul(2));
+        (Some(left), Some(right), track_x, track_w)
+    } else {
+        (None, None, area.x, area.width)
+    };
+
+    // Detach sits on the right of the track (or full area when no scroll).
+    let show_detach = track_w >= min_tile.saturating_mul(2) || buttons.is_empty();
+    let detach_w = if show_detach {
+        // Equal share with visible left buttons when possible.
+        let visible_n = buttons.len().saturating_sub(scroll).min(left_slots.max(1));
+        let n = (visible_n + 1).max(1) as u16;
+        (track_w / n).max(min_tile)
+    } else {
+        0
+    };
+    let left_w = track_w.saturating_sub(detach_w);
+    let visible_cap = if left_w == 0 {
+        0
+    } else {
+        // Prefer equal tiles that still fit content when possible.
+        let ideal = content_ws
+            .iter()
+            .skip(scroll)
+            .take(left_slots.max(1))
+            .copied()
+            .max()
+            .unwrap_or(min_tile)
+            .max(min_tile);
+        let n_fit = (left_w / ideal).max(1) as usize;
+        n_fit.min(buttons.len().saturating_sub(scroll))
+    };
+
+    let tile_w = if visible_cap == 0 {
+        min_tile
+    } else {
+        (left_w / visible_cap as u16).max(min_tile)
+    };
+
+    let mut x = track_x;
+    let mut visible = Vec::new();
+    for button in buttons.iter().skip(scroll).take(visible_cap) {
+        let remaining = track_x.saturating_add(left_w).saturating_sub(x);
+        if remaining < min_tile {
+            break;
+        }
+        let bw = tile_w.min(remaining);
+        visible.push((button.action, Rect::new(x, area.y, bw, area.height.max(1))));
+        x = x.saturating_add(bw);
+    }
+
+    // Absorb leftover columns into the last left button so no dead gap remains.
+    if let Some((_, last)) = visible.last_mut() {
+        let end = track_x.saturating_add(left_w);
+        if last.x.saturating_add(last.width) < end {
+            last.width = end.saturating_sub(last.x);
+        }
+    }
+
+    let mut max_scroll = 0usize;
+    if needs_scroll {
+        let per_page = visible_cap.max(1);
+        max_scroll = buttons.len().saturating_sub(per_page);
+    }
+
+    let detach_rect = if detach_w > 0 {
+        let dx = track_x.saturating_add(left_w);
+        Some((
+            ControlAction::Detach,
+            Rect::new(
+                dx,
+                area.y,
+                track_w.saturating_sub(left_w).max(detach_w),
+                area.height.max(1),
+            ),
+        ))
+    } else {
+        None
+    };
+
+    ControlBarLayout {
+        buttons: visible,
+        scroll_left,
+        scroll_right,
+        detach: detach_rect,
+        max_scroll,
+    }
+}
+
 /// Hit-test including scroll arrows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlBarHit {
     Action(ControlAction),
     ScrollLeft,
     ScrollRight,
 }
 
+/// Hit-test control bar. `sidebar_cols` must match the live layout width
+/// (`layout_sidebar_cols()`), not the configured expanded width alone.
 fn control_bar_hit_at(
-    sidebar_collapsed: bool,
-    sidebar_expanded: u16,
+    sidebar_cols: u16,
     terminal_width: u16,
     terminal_height: u16,
     column: u16,
     row: u16,
     scroll: usize,
+    compact: bool,
 ) -> Option<ControlBarHit> {
+    // Control bar is main_chunks[1]: second-to-last row (footer is last).
     if terminal_height < CONTROL_BAR_HEIGHT || row != terminal_height.saturating_sub(2) {
         return None;
     }
-    let sidebar_width = sidebar_width(sidebar_collapsed, sidebar_expanded);
     let area = Rect::new(
-        sidebar_width,
+        sidebar_cols,
         terminal_height.saturating_sub(2),
-        terminal_width.saturating_sub(sidebar_width),
+        terminal_width.saturating_sub(sidebar_cols),
         1,
     );
-    let layout = control_bar_layout(area, scroll);
+    let layout = control_bar_layout(area, scroll, compact);
     if let Some(r) = layout.scroll_left {
         if point_in_rect(r, column, row) {
             return Some(ControlBarHit::ScrollLeft);
@@ -5162,7 +5452,7 @@ fn control_bar_hit_at(
     None
 }
 
-/// Test helper: hit-test with scroll offset 0.
+/// Test helper: hit-test with scroll offset 0, desktop (non-compact) buttons.
 #[cfg(test)]
 fn control_action_at(
     sidebar_collapsed: bool,
@@ -5172,15 +5462,8 @@ fn control_action_at(
     column: u16,
     row: u16,
 ) -> Option<ControlAction> {
-    match control_bar_hit_at(
-        sidebar_collapsed,
-        sidebar_expanded,
-        terminal_width,
-        terminal_height,
-        column,
-        row,
-        0,
-    ) {
+    let cols = sidebar_width(sidebar_collapsed, sidebar_expanded);
+    match control_bar_hit_at(cols, terminal_width, terminal_height, column, row, 0, false) {
         Some(ControlBarHit::Action(a)) => Some(a),
         _ => None,
     }
@@ -5247,9 +5530,10 @@ fn draw_control_bar(
     hover: Option<ControlAction>,
     theme: UiTheme,
     scroll: usize,
+    compact: bool,
 ) {
     let palette = theme.palette();
-    let layout = control_bar_layout(area, scroll);
+    let layout = control_bar_layout(area, scroll, compact);
     let arrow_style = Style::default()
         .fg(palette.active)
         .bg(palette.surface)
@@ -5273,7 +5557,7 @@ fn draw_control_bar(
     }
 
     for (action, rect) in &layout.buttons {
-        let button = control_buttons()
+        let button = control_buttons(compact)
             .into_iter()
             .find(|b| b.action == *action)
             .unwrap_or(ControlButton {
@@ -5282,15 +5566,30 @@ fn draw_control_bar(
                 action: *action,
             });
         let style = control_button_style(button, mode, confirm, hover, palette);
-        let text = button.text();
+        let text = control_button_label(button, rect.width, compact);
         frame.render_widget(Paragraph::new(text).style(style), *rect);
     }
     if let Some((action, rect)) = layout.detach {
         let button = detach_control_button();
         let style = control_button_style(button, mode, confirm, hover, palette);
-        frame.render_widget(Paragraph::new(button.text()).style(style), rect);
+        let text = control_button_label(button, rect.width, compact);
+        frame.render_widget(Paragraph::new(text).style(style), rect);
         let _ = action;
     }
+}
+
+/// Label for a control-bar button, clipped/icon-only when the tile is narrow.
+fn control_button_label(button: ControlButton, width: u16, compact: bool) -> String {
+    let full = button.text();
+    if UnicodeWidthStr::width(full.as_str()) as u16 <= width {
+        return full;
+    }
+    // Prefer icon-only for compact tiles: " XX " centered-ish.
+    let icon_only = format!(" {} ", button.icon);
+    if compact && (UnicodeWidthStr::width(icon_only.as_str()) as u16) <= width {
+        return icon_only;
+    }
+    truncate_to_width(&full, width as usize)
 }
 
 fn draw_panes(
@@ -5550,7 +5849,6 @@ fn draw_single_pane(
 /// Lays out a pane's tab strip into positioned cells within `strip`. The active
 /// tab is always kept visible; when tabs overflow the width a trailing `+N`
 /// marker is appended (clicking it reveals the next hidden tab).
-
 fn pane_control_buttons_for(
     layout: Option<&LayoutNode>,
     pane_id: &str,
@@ -5600,8 +5898,7 @@ fn pane_control_rects(
 
 fn pane_control_at(
     snapshot: &Session,
-    sidebar_collapsed: bool,
-    sidebar_expanded: u16,
+    sidebar_cols: u16,
     terminal_width: u16,
     terminal_height: u16,
     column: u16,
@@ -5614,12 +5911,7 @@ fn pane_control_at(
     if active.panes.is_empty() {
         return None;
     }
-    let area = pane_area(
-        sidebar_collapsed,
-        sidebar_expanded,
-        terminal_width,
-        terminal_height,
-    );
+    let area = pane_area(sidebar_cols, terminal_width, terminal_height);
     if !point_in_rect(area, column, row) {
         return None;
     }
@@ -6569,8 +6861,6 @@ fn pane_has_tab_strip(pane: &crate::model::Pane) -> bool {
     pane.tabs.len() > 1
 }
 
-/// Rectangle of the dedicated tab strip row (first row inside the block border).
-
 /// Content rectangle inside the pane block. When a tab strip is present the top
 /// is pushed down one extra row so the PTY content never overlaps the strip.
 fn pane_content_area(area: Rect, has_strip: bool) -> Rect {
@@ -7288,6 +7578,7 @@ enum SettingsEntryId {
     WorkspaceLine,
     Sidebar,
     SidebarResponsive,
+    SidebarFit,
     SidebarWidth,
     PrefixKey,
     ScrollStep,
@@ -7333,6 +7624,10 @@ fn settings_entries() -> Vec<SettingsEntry> {
         SettingsEntry {
             id: SettingsEntryId::SidebarResponsive,
             name: "responsive layout",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::SidebarFit,
+            name: "sidebar fit text",
         },
         SettingsEntry {
             id: SettingsEntryId::SidebarWidth,
@@ -7426,6 +7721,7 @@ struct SettingsView<'a> {
     workspace_second_line: UiWorkspaceSecondLine,
     sidebar_collapsed: bool,
     sidebar_responsive: bool,
+    sidebar_fit: bool,
     sidebar_width: u16,
     prefix_label: &'a str,
     scroll_step: usize,
@@ -7470,8 +7766,19 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         "off · always show sidebar".to_string()
                     }
                 }
+                SettingsEntryId::SidebarFit => {
+                    if view.sidebar_fit {
+                        "on · width follows workspace names".to_string()
+                    } else {
+                        "off · fixed width".to_string()
+                    }
+                }
                 SettingsEntryId::SidebarWidth => {
-                    format!("{} cols (drag edge)", view.sidebar_width)
+                    if view.sidebar_fit {
+                        format!("max {} cols (drag edge)", view.sidebar_width)
+                    } else {
+                        format!("{} cols (drag edge)", view.sidebar_width)
+                    }
                 }
                 SettingsEntryId::PrefixKey => view.prefix_label.to_string(),
                 SettingsEntryId::ScrollStep => format!("{} lines", view.scroll_step),
@@ -7727,6 +8034,31 @@ fn surface_prefix(kind: &crate::model::SurfaceKind) -> &'static str {
     }
 }
 
+fn compact_path(path: &str) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!("({name})")
+    }
+}
+
+fn short_path(path: &str) -> String {
+    let home = std::env::var("HOME").ok().filter(|value| !value.is_empty());
+    if let Some(home) = home {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+            return format!("~/{rest}");
+        }
+    }
+    path.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7821,9 +8153,10 @@ mod tests {
                     4399,
                     false,
                     true,
-                    false, // keep sidebar visible in unit tests (not compact-hidden)
-                    0,
-                    0, // control_bar_scroll
+                    false, // sidebar_responsive off so tests keep the rail
+                    false, // sidebar_fit
+                    0,     // workspace_picker_selected
+                    0,     // control_bar_scroll
                 )
             })
             .unwrap();
@@ -7896,9 +8229,10 @@ mod tests {
                     4399,
                     false,
                     true,
-                    false, // keep sidebar visible in unit tests (not compact-hidden)
-                    0,
-                    0, // control_bar_scroll
+                    false, // sidebar_responsive off so tests keep the rail
+                    false, // sidebar_fit
+                    0,     // workspace_picker_selected
+                    0,     // control_bar_scroll
                 )
             })
             .unwrap();
@@ -8255,9 +8589,9 @@ mod tests {
         assert!(chips[0].close_start.is_some());
         assert!(chips[0].label.contains('×'));
 
-        let area = workspace_tab_bar_area(false, 24, 120);
+        let area = workspace_tab_bar_area(24, 120);
         // Click the × on the first tab.
-        let close_x = area.x + chips[0].close_start.unwrap() as u16 + 0; // first cell of ×
+        let close_x = area.x + chips[0].close_start.unwrap() as u16; // first cell of ×
         assert_eq!(
             workspace_tab_bar_hit(&session, ws, area, close_x, area.y, "emoji", true),
             Some(PrimaryMouseAction::CloseWorkspaceTab {
@@ -8286,16 +8620,16 @@ mod tests {
             PrimaryMouseAction::None
         );
         assert_eq!(
-            pane_area(false, 24, 100, 30),
-            Rect::new(sidebar_width(false, 24), TAB_BAR_HEIGHT, 76, 27)
+            pane_area(24, 100, 30),
+            Rect::new(24, TAB_BAR_HEIGHT, 76, 27)
         );
     }
 
     #[test]
     fn control_bar_maps_clicks_to_actions() {
-        // Buttons lay out left-to-right from the main content x (after sidebar).
+        // Desktop: no menu button; buttons lay out after the sidebar.
         let x0 = sidebar_width(false, 24);
-        let buttons = control_buttons();
+        let buttons = control_buttons(false);
         let mut x = x0;
         for button in &buttons[..3] {
             assert_eq!(
@@ -8308,14 +8642,18 @@ mod tests {
             x = x.saturating_add(button.width());
         }
         assert_eq!(
-            control_buttons()[0].label,
-            "menu",
-            "workspace menu (burger) is first on the control bar"
+            control_buttons(false)[0].label,
+            "workspace",
+            "desktop control bar starts with new-workspace (no mobile menu)"
         );
         assert_eq!(
-            control_buttons()[1].label,
-            "workspace",
-            "new-workspace button uses a clear label"
+            control_buttons(true)[0].label,
+            "menu",
+            "compact/mobile control bar starts with workspace menu"
+        );
+        assert_eq!(
+            control_buttons(false)[0].action,
+            ControlAction::NewWorkspace,
         );
         // Detach is pinned to the far right of the control bar.
         let detach = detach_control_button();
@@ -8325,7 +8663,11 @@ mod tests {
             Some(ControlAction::Detach)
         );
         // Every icon should occupy 2 display columns (no mixed 1-cell gaps).
-        for button in control_buttons().into_iter().chain(std::iter::once(detach)) {
+        for button in control_buttons(false)
+            .into_iter()
+            .chain(control_buttons(true))
+            .chain(std::iter::once(detach))
+        {
             let icon_w = UnicodeWidthStr::width(button.icon);
             assert_eq!(
                 icon_w, 2,
@@ -8335,6 +8677,27 @@ mod tests {
         }
         assert_eq!(control_action_at(false, 24, 100, 30, 1, 28), None);
         assert_eq!(control_action_at(false, 24, 100, 30, 0, 29), None);
+    }
+
+    #[test]
+    fn compact_control_bar_menu_and_equal_tiles() {
+        // Mobile: full-width bar (sidebar_cols=0), first button is menu.
+        let area = Rect::new(0, 28, 80, 1);
+        let layout = control_bar_layout(area, 0, true);
+        assert!(
+            !layout.buttons.is_empty(),
+            "compact bar should show at least one button"
+        );
+        assert_eq!(layout.buttons[0].0, ControlAction::Workspaces);
+        // Hit-test at the first tile should map to menu.
+        assert_eq!(
+            control_bar_hit_at(0, 80, 30, 1, 28, 0, true),
+            Some(ControlBarHit::Action(ControlAction::Workspaces))
+        );
+        // Tiles should cover the bar without leaving large dead zones at the start.
+        let first = layout.buttons[0].1;
+        assert_eq!(first.x, 0);
+        assert!(first.width >= 4);
     }
 
     #[test]
@@ -8416,7 +8779,7 @@ mod tests {
         let mut found_split_right = false;
         let mut found_split_down = false;
         for x in 80..99 {
-            if let Some(hit) = pane_control_at(&session, false, 24, 100, 30, x, y) {
+            if let Some(hit) = pane_control_at(&session, 24, 100, 30, x, y) {
                 if hit.action == PaneControlAction::Close {
                     found_close = true;
                 }
@@ -8437,7 +8800,7 @@ mod tests {
             found_split_down,
             "expected a split-down control on pane chrome"
         );
-        assert_eq!(pane_control_at(&session, false, 24, 100, 30, 10, y), None);
+        assert_eq!(pane_control_at(&session, 24, 100, 30, 10, y), None);
     }
 
     #[test]
@@ -8641,7 +9004,7 @@ mod tests {
         // The create-pane button has a real, non-empty click region inside the
         // pane area, and clicks elsewhere in the empty area do not misroute.
         let session = Session::new("test");
-        let area = pane_area(false, 24, 120, 40);
+        let area = pane_area(24, 120, 40);
         let rect = empty_create_pane_rect(area).expect("create-pane rect");
         assert!(rect.width > 0 && rect.height == 1);
         assert!(point_in_rect(area, rect.x, rect.y));
@@ -8655,7 +9018,7 @@ mod tests {
             PrimaryMouseAction::None
         );
         // A cramped pane area yields no button rather than an out-of-bounds rect.
-        assert!(empty_create_pane_rect(pane_area(false, 24, 30, 4)).is_none());
+        assert!(empty_create_pane_rect(pane_area(24, 30, 4)).is_none());
     }
 
     #[test]
@@ -9032,6 +9395,7 @@ mod tests {
             workspace_second_line: UiWorkspaceSecondLine::Path,
             sidebar_collapsed: false,
             sidebar_responsive: true,
+            sidebar_fit: false,
             sidebar_width: 24,
             prefix_label: "Ctrl-b",
             scroll_step: 5,
@@ -9063,8 +9427,12 @@ mod tests {
             .content
             .as_ref()
             .contains("responsive layout"));
-        assert!(lines[4].spans[0].content.as_ref().contains("sidebar width"));
-        assert!(lines[4].spans[0].content.as_ref().contains("24"));
+        assert!(lines[4].spans[0]
+            .content
+            .as_ref()
+            .contains("sidebar fit text"));
+        assert!(lines[5].spans[0].content.as_ref().contains("sidebar width"));
+        assert!(lines[5].spans[0].content.as_ref().contains("24"));
         assert!(lines.iter().any(|line| {
             line.spans
                 .first()
@@ -9293,29 +9661,4 @@ mod tests {
             " session:test workspaces:1 panes:3 running:2 busy:1 attention:1 done:1 error:0 notes:1  zoom:pane-1 "
         );
     }
-}
-
-fn compact_path(path: &str) -> String {
-    let name = std::path::Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path);
-    if name.is_empty() {
-        String::new()
-    } else {
-        format!("({name})")
-    }
-}
-
-fn short_path(path: &str) -> String {
-    let home = std::env::var("HOME").ok().filter(|value| !value.is_empty());
-    if let Some(home) = home {
-        if path == home {
-            return "~".to_string();
-        }
-        if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
-            return format!("~/{rest}");
-        }
-    }
-    path.to_string()
 }

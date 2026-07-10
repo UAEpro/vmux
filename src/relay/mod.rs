@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,8 +58,9 @@ pub struct RelayConfig {
     pub idle_fps: u32,
     /// vmux session the relay attaches to.
     pub session: String,
-    /// Optional shared secret; when set, register requires
-    /// `X-Vmux-Bootstrap: <secret>` (or `Authorization: Bootstrap <secret>`).
+    /// When set (non-empty), **every** device registration must present this
+    /// secret via `X-Vmux-Bootstrap` or `Authorization: Bootstrap <secret>`.
+    /// Whois/localhost/CGNAT identity still applies after the secret check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_secret: Option<String>,
     #[serde(default)]
@@ -156,7 +157,13 @@ impl DeviceStore {
     fn load(path: PathBuf) -> Result<Self> {
         let devices = if path.exists() {
             let raw = fs::read_to_string(&path)?;
-            let file: DeviceFile = serde_json::from_str(&raw).unwrap_or_default();
+            // Fail closed on corrupt storage (bugs.md P2#13) — never treat as empty.
+            let file: DeviceFile = serde_json::from_str(&raw).with_context(|| {
+                format!(
+                    "parse device store {} failed; refusing to wipe (repair or delete the file)",
+                    path.display()
+                )
+            })?;
             file.devices
                 .into_iter()
                 .map(|d| (d.device_id.clone(), d))
@@ -177,7 +184,16 @@ impl DeviceStore {
         let file = DeviceFile {
             devices: map.values().cloned().collect(),
         };
-        fs::write(path, serde_json::to_string_pretty(&file)? + "\n")?;
+        let payload = serde_json::to_string_pretty(&file)? + "\n";
+        // Atomic write: temp in same dir + rename.
+        let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), now_secs()));
+        fs::write(&tmp, &payload)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -255,7 +271,12 @@ struct RelayState {
     boot_id: String,
     started_at: u64,
     running: AtomicBool,
+    /// Active TCP handlers (capped to limit thread/memory DoS).
+    active_connections: AtomicUsize,
 }
+
+/// Max simultaneous TCP connections accepted by the relay (bugs.md P1#7).
+const MAX_RELAY_CONNECTIONS: usize = 64;
 
 // ─── Public CLI entry points ────────────────────────────────────────────────
 
@@ -299,6 +320,7 @@ pub fn serve(
         boot_id: random_hex(16),
         started_at: now_secs(),
         running: AtomicBool::new(true),
+        active_connections: AtomicUsize::new(0),
     });
 
     let listener = TcpListener::bind(&config.listen)
@@ -315,11 +337,20 @@ pub fn serve(
     );
     eprintln!("  config:  {}", path.display());
     eprintln!("  devices: {}", devices_path()?.display());
+    eprintln!("  max conns: {MAX_RELAY_CONNECTIONS}");
     if config.allow_localhost {
         eprintln!("  auth:    localhost registration allowed");
     }
     if config.allow_tailnet_cgnat {
         eprintln!("  auth:    Tailscale CGNAT sources accepted without whois");
+    }
+    if config
+        .bootstrap_secret
+        .as_ref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        eprintln!("  auth:    bootstrap secret REQUIRED for all registration");
     }
 
     for stream in listener.incoming() {
@@ -327,14 +358,31 @@ pub fn serve(
             break;
         }
         let Ok(stream) = stream else { continue };
+        // Cap concurrent handlers before spawning a thread (bugs.md P1#7).
+        let active = state.active_connections.load(Ordering::Relaxed);
+        if active >= MAX_RELAY_CONNECTIONS {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            eprintln!("relay: rejecting connection (at capacity {MAX_RELAY_CONNECTIONS})");
+            continue;
+        }
+        state.active_connections.fetch_add(1, Ordering::Relaxed);
         let state = Arc::clone(&state);
         thread::spawn(move || {
+            let conns = Arc::clone(&state);
+            let _guard = ConnectionGuard(conns);
             if let Err(err) = handle_connection(stream, state) {
                 eprintln!("relay connection error: {err:#}");
             }
         });
     }
     Ok(())
+}
+
+struct ConnectionGuard(Arc<RelayState>);
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub fn status(config_path: Option<PathBuf>) -> Result<()> {
@@ -603,7 +651,7 @@ pub fn ensure_started(session: &str, settings: &RelaySettings) -> Result<Option<
 
     let child = cmd.spawn().context("spawn vmux relay serve")?;
     let pid = child.id();
-    fs::write(&pid_path, format!("{pid}\n"))
+    crate::paths::write_pid_record(&pid_path, pid)
         .with_context(|| format!("write {}", pid_path.display()))?;
 
     // Wait briefly for health
@@ -627,18 +675,29 @@ pub fn stop_managed() -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    let raw = fs::read_to_string(&path).unwrap_or_default();
-    let pid: i32 = raw.trim().parse().unwrap_or(0);
+    let record = crate::paths::read_pid_record(&path);
     let _ = fs::remove_file(&path);
-    if pid <= 1 {
+    let Some(record) = record else {
+        return Ok(false);
+    };
+    if record.pid <= 1 {
+        return Ok(false);
+    }
+    // Never signal a recycled PID or a process that is not our relay.
+    if !crate::paths::process_matches_record(record)
+        || !crate::paths::process_cmdline_contains(record.pid, "vmux")
+    {
         return Ok(false);
     }
     #[cfg(unix)]
     {
-        // Only kill if still looks like our relay (best-effort).
+        let pid = record.pid as i32;
         let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
-        thread::sleep(Duration::from_millis(150));
-        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        thread::sleep(Duration::from_millis(200));
+        // SIGKILL only if the same process (starttime) is still alive.
+        if crate::paths::process_matches_record(record) {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
     Ok(true)
 }
@@ -684,6 +743,12 @@ fn ureq_get_health(url: &str) -> Result<String> {
 
 // ─── HTTP connection handling ───────────────────────────────────────────────
 
+/// Request-line / header limits for unauthenticated peers (bugs.md P1#7).
+const MAX_REQUEST_LINE: usize = 8 * 1024;
+const MAX_HEADER_LINE: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HEADER_COUNT: usize = 64;
+
 fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -699,6 +764,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
     if request_line.is_empty() {
         return Ok(());
     }
+    if request_line.len() > MAX_REQUEST_LINE {
+        write_http(&mut stream, 414, "text/plain", b"request line too long")?;
+        return Ok(());
+    }
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         write_http(&mut stream, 400, "text/plain", b"bad request")?;
@@ -709,9 +778,23 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
     let path = target.split('?').next().unwrap_or(&target).to_string();
 
     let mut headers: HashMap<String, String> = HashMap::new();
+    let mut header_bytes = 0usize;
     loop {
+        if headers.len() >= MAX_HEADER_COUNT {
+            write_http(&mut stream, 431, "text/plain", b"too many headers")?;
+            return Ok(());
+        }
         let mut line = String::new();
         reader.read_line(&mut line)?;
+        if line.len() > MAX_HEADER_LINE {
+            write_http(&mut stream, 431, "text/plain", b"header line too long")?;
+            return Ok(());
+        }
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_HEADER_BYTES {
+            write_http(&mut stream, 431, "text/plain", b"headers too large")?;
+            return Ok(());
+        }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             break;
@@ -725,7 +808,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let mut body = vec![0u8; content_len.min(MAX_WS_MSG)];
+    if content_len > MAX_WS_MSG {
+        write_http(&mut stream, 413, "text/plain", b"payload too large")?;
+        return Ok(());
+    }
+    let mut body = vec![0u8; content_len];
     if !body.is_empty() {
         reader.read_exact(&mut body)?;
     }
@@ -881,234 +968,8 @@ fn auth_device_from_headers(
     None
 }
 
-// ─── Registration / Tailscale auth ──────────────────────────────────────────
-
-enum RegisterError {
-    Forbidden(String),
-    Other(anyhow::Error),
-}
-
-fn register_device(
-    state: &RelayState,
-    peer: &str,
-    headers: &HashMap<String, String>,
-) -> std::result::Result<(String, String), RegisterError> {
-    let bootstrap_ok = bootstrap_header_matches(state, headers);
-    // When a bootstrap secret is configured, it is required unless the peer is
-    // already identified via Tailscale whois / localhost (handled below).
-    // A wrong secret never grants access; a missing secret is only fatal when
-    // no other trusted identity path succeeds.
-
-    let peer_ip: IpAddr = peer.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let identity =
-        resolve_peer_identity(state, peer, peer_ip, bootstrap_ok).map_err(|e| match e {
-            RegisterError::Forbidden(m) => RegisterError::Forbidden(m),
-            RegisterError::Other(e) => RegisterError::Other(e),
-        })?;
-
-    // only enforce allow_login for whois-sourced identities (see PeerIdentity::from_whois)
-    if identity.require_allow_login
-        && !state.config.allow_login.is_empty()
-        && !state
-            .config
-            .allow_login
-            .iter()
-            .any(|l| l.eq_ignore_ascii_case(&identity.login_name))
-    {
-        return Err(RegisterError::Forbidden(format!(
-            "login {} not in allow_login",
-            identity.login_name
-        )));
-    }
-
-    let device_id = sha256_hex(&identity.node_key);
-    let token = random_hex(32);
-    state
-        .devices
-        .register(&device_id, &identity.login_name, &identity.hostname, &token)
-        .map_err(RegisterError::Other)?;
-    Ok((device_id, token))
-}
-
-fn bootstrap_header_matches(state: &RelayState, headers: &HashMap<String, String>) -> bool {
-    let Some(secret) = state.config.bootstrap_secret.as_deref() else {
-        return false;
-    };
-    if secret.is_empty() {
-        return false;
-    }
-    let provided = headers
-        .get("x-vmux-bootstrap")
-        .cloned()
-        .or_else(|| {
-            headers.get("authorization").and_then(|a| {
-                a.strip_prefix("Bootstrap ")
-                    .map(|s| s.to_string())
-                    .or_else(|| a.strip_prefix("bootstrap ").map(|s| s.to_string()))
-            })
-        })
-        .unwrap_or_default();
-    // Constant-time-ish compare for equal length; length leak is acceptable here.
-    if provided.len() != secret.len() {
-        return false;
-    }
-    provided
-        .as_bytes()
-        .iter()
-        .zip(secret.as_bytes().iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
-}
-
-struct PeerIdentity {
-    login_name: String,
-    hostname: String,
-    node_key: String,
-    /// When true, `allow_login` must contain `login_name` (whois path).
-    require_allow_login: bool,
-}
-
-fn resolve_peer_identity(
-    state: &RelayState,
-    peer: &str,
-    peer_ip: IpAddr,
-    bootstrap_ok: bool,
-) -> std::result::Result<PeerIdentity, RegisterError> {
-    // 1) Localhost — only when explicitly allowed. Not subject to allow_login
-    // (that list is Tailscale logins). Refuse localhost when allow_login is
-    // set AND allow_localhost is false; if allow_localhost is true, admit.
-    if is_loopback(peer_ip) {
-        if !state.config.allow_localhost {
-            return Err(RegisterError::Forbidden(
-                "localhost registration disabled (set allow_localhost)".into(),
-            ));
-        }
-        return Ok(PeerIdentity {
-            login_name: "localhost".into(),
-            hostname: "localhost".into(),
-            node_key: format!("vmux-dev-localhost:{peer}"),
-            require_allow_login: false,
-        });
-    }
-
-    // 2) Tailscale whois — real identity; enforce allow_login if non-empty.
-    if let Some(id) = try_tailscale_whois(peer) {
-        if state.config.allow_login.is_empty()
-            || state
-                .config
-                .allow_login
-                .iter()
-                .any(|l| l.eq_ignore_ascii_case(&id.login_name))
-        {
-            return Ok(PeerIdentity {
-                login_name: id.login_name,
-                hostname: id.hostname,
-                node_key: id.node_key,
-                require_allow_login: false, // already checked
-            });
-        }
-        return Err(RegisterError::Forbidden(format!(
-            "login {} not in allow_login",
-            id.login_name
-        )));
-    }
-
-    // 3) CGNAT without whois — only when allow_tailnet_cgnat, and only when
-    // allow_login is empty (otherwise whois is required to prove login).
-    if state.config.allow_tailnet_cgnat && is_tailscale_cgnat(peer_ip) {
-        if !state.config.allow_login.is_empty() {
-            return Err(RegisterError::Forbidden(
-                "allow_login is set; Tailscale whois required (CGNAT fallback denied)".into(),
-            ));
-        }
-        return Ok(PeerIdentity {
-            login_name: "tailnet".into(),
-            hostname: peer.to_string(),
-            node_key: format!("vmux-cgnat:{peer}"),
-            require_allow_login: false,
-        });
-    }
-
-    // 4) Bootstrap secret — only when header actually matched.
-    if bootstrap_ok {
-        return Ok(PeerIdentity {
-            login_name: "bootstrap".into(),
-            hostname: peer.to_string(),
-            node_key: format!("vmux-bootstrap:{peer}"),
-            require_allow_login: false,
-        });
-    }
-
-    if state
-        .config
-        .bootstrap_secret
-        .as_ref()
-        .is_some_and(|s| !s.is_empty())
-    {
-        return Err(RegisterError::Forbidden(
-            "bootstrap secret required or peer not on Tailscale".into(),
-        ));
-    }
-
-    Err(RegisterError::Forbidden(
-        "peer not recognized (enable Tailscale, allow_localhost, or allow_tailnet_cgnat)".into(),
-    ))
-}
-
-fn try_tailscale_whois(peer: &str) -> Option<PeerIdentity> {
-    let output = std::process::Command::new("tailscale")
-        .args(["whois", "--json", peer])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let v: Value = serde_json::from_slice(&output.stdout).ok()?;
-    // tailscale whois --json shape varies; try common fields.
-    let user = v
-        .pointer("/UserProfile/LoginName")
-        .or_else(|| v.pointer("/User/LoginName"))
-        .or_else(|| v.get("LoginName"))
-        .and_then(|x| x.as_str())
-        .or_else(|| {
-            v.get("UserProfile")
-                .and_then(|u| u.get("LoginName"))
-                .and_then(|x| x.as_str())
-        })?;
-    let hostname = v
-        .pointer("/Node/Hostinfo/Hostname")
-        .or_else(|| v.pointer("/Node/Name"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("tailscale-node");
-    let node_key = v
-        .pointer("/Node/Key")
-        .and_then(|x| x.as_str())
-        .unwrap_or(peer);
-    Some(PeerIdentity {
-        login_name: user.to_string(),
-        hostname: hostname.to_string(),
-        node_key: node_key.to_string(),
-        require_allow_login: true,
-    })
-}
-
-fn is_loopback(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback(),
-    }
-}
-
-fn is_tailscale_cgnat(ip: IpAddr) -> bool {
-    // 100.64.0.0/10
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 100 && (o[1] & 0xC0) == 64
-        }
-        _ => false,
-    }
-}
+mod auth;
+use auth::*;
 
 // ─── WebSocket ──────────────────────────────────────────────────────────────
 
@@ -1188,14 +1049,19 @@ fn handle_ws_upgrade(
                             .or_else(|| data.as_array())
                         {
                             for ev in arr {
+                                // Prefer monotonic numeric id (daemon EventRecord.id).
                                 let id = ev
                                     .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
+                                    .and_then(|v| {
+                                        v.as_u64()
+                                            .map(|n| n.to_string())
+                                            .or_else(|| v.as_str().map(|s| s.to_string()))
+                                    })
                                     .unwrap_or_else(|| {
                                         format!(
-                                            "{}:{}",
-                                            ev.get("ts").and_then(|t| t.as_u64()).unwrap_or(0),
+                                            "{}:{}:{}",
+                                            ev.get("time").and_then(|t| t.as_u64()).unwrap_or(0),
+                                            ev.get("kind").and_then(|k| k.as_str()).unwrap_or(""),
                                             ev.get("message")
                                                 .and_then(|m| m.as_str())
                                                 .unwrap_or("")
@@ -1443,6 +1309,7 @@ mod sha1_compat {
                 w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
             }
             let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+            #[allow(clippy::needless_range_loop)]
             for i in 0..80 {
                 let (f, k) = match i {
                     0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
@@ -1524,6 +1391,7 @@ struct ScreenSnap {
     cursor_y: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_surface_poller(
     socket: PathBuf,
     _workspace_id: String,
@@ -1536,14 +1404,16 @@ fn run_surface_poller(
 ) {
     let mut rev: u64 = 0;
     let mut prev: Option<ScreenSnap> = None;
-    let last_input = Instant::now();
+    let mut last_activity = Instant::now();
     let mut last_checksum = Instant::now() - Duration::from_secs(10);
-    let mut current_fps = active_fps.max(1);
 
     while !stop.load(Ordering::Relaxed) {
-        if last_input.elapsed() > Duration::from_millis(1500) {
-            current_fps = idle_fps.max(1);
-        }
+        // Non-empty screen diffs bump last_activity so FPS returns to active (bugs.md P2#15).
+        let current_fps = if last_activity.elapsed() > Duration::from_millis(1500) {
+            idle_fps.max(1)
+        } else {
+            active_fps.max(1)
+        };
         let interval = Duration::from_millis((1000 / current_fps as u64).max(20));
 
         match read_surface_screen(&socket, &surface_id, lines) {
@@ -1563,6 +1433,7 @@ fn run_surface_poller(
                     ops
                 };
                 if !ops.is_empty() {
+                    last_activity = Instant::now();
                     rev = rev.wrapping_add(1);
                     // First frame after subscribe: also send screen.full for clients
                     // that prefer a full snapshot.
@@ -1611,13 +1482,6 @@ fn run_surface_poller(
             }
         }
 
-        // boost fps if someone notes input via atomic — we approximate by
-        // checking high-frequency for a short time after any successful read
-        // of changing content; last_input is bumped when ops non-empty.
-        if prev.is_some() {
-            // keep
-        }
-        let _ = last_input; // silence if unused in some paths
         thread::sleep(interval);
     }
 }
@@ -2133,8 +1997,29 @@ fn file_upload(params: &Value) -> Result<Value> {
             }
         })
         .collect();
-    let path = dir.join(format!("{}-{}", now_secs(), safe));
-    fs::write(&path, bytes)?;
+    // Unique name + create_new so same-second uploads never clobber (bugs.md P3#18).
+    let mut path = PathBuf::new();
+    let mut written = false;
+    for _ in 0..8 {
+        path = dir.join(format!("{}-{}-{}", now_secs(), random_hex(8), safe));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(&bytes)?;
+                written = true;
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    if !written {
+        anyhow::bail!("could not create unique upload path");
+    }
     Ok(json!({
         "path": path.display().to_string(),
         "filename": safe,
@@ -2155,7 +2040,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
         }
     }
     let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if cleaned.len() % 4 != 0 {
+    if !cleaned.len().is_multiple_of(4) {
         bail!("invalid base64 length");
     }
     let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
@@ -2277,6 +2162,7 @@ mod tests {
 
     #[test]
     fn tailscale_cgnat() {
+        use std::net::{IpAddr, Ipv4Addr};
         assert!(is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
         assert!(is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(
             100, 127, 1, 1
