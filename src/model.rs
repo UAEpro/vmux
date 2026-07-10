@@ -224,17 +224,22 @@ impl Session {
             return Err(format!("unknown pane {second}"));
         }
         // Prefer active tab that has both; else any tab that holds both.
-        let Some(index) = self.workspaces.iter().position(|workspace| {
-            workspace.panes.iter().any(|pane| pane == first)
-                && workspace.panes.iter().any(|pane| pane == second)
-        })
-        .or_else(|| {
-            self.workspaces.iter().position(|workspace| {
-                workspace.tabs.iter().any(|tab| {
-                    tab.panes.iter().any(|p| p == first) && tab.panes.iter().any(|p| p == second)
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| {
+                workspace.panes.iter().any(|pane| pane == first)
+                    && workspace.panes.iter().any(|pane| pane == second)
+            })
+            .or_else(|| {
+                self.workspaces.iter().position(|workspace| {
+                    workspace.tabs.iter().any(|tab| {
+                        tab.panes.iter().any(|p| p == first)
+                            && tab.panes.iter().any(|p| p == second)
+                    })
                 })
             })
-        }) else {
+        else {
             return Err(format!(
                 "panes {first} and {second} are not in the same workspace tab"
             ));

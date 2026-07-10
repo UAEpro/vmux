@@ -815,9 +815,7 @@ pub enum RelayCommand {
 #[derive(Debug, Clone, Subcommand)]
 pub enum RelayDevicesCommand {
     List,
-    Revoke {
-        device_id: String,
-    },
+    Revoke { device_id: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]

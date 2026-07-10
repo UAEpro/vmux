@@ -23,8 +23,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use cli::SurfaceKindArg;
 use cli::{
     ActionCommand, AgentCommand, BrowserCommand, Cli, Command, ConfigCommand, HookShell,
-    HooksCommand, MarkdownCommand, MetadataCommand, PaneTabCommand, ProgressCommand,
-    RelayCommand, RelayDevicesCommand, RemoteCommand, SkillsCommand, SurfaceCommand, TabCommand,
+    HooksCommand, MarkdownCommand, MetadataCommand, PaneTabCommand, ProgressCommand, RelayCommand,
+    RelayDevicesCommand, RemoteCommand, SkillsCommand, SurfaceCommand, TabCommand,
     WorkspaceCommand,
 };
 use model::SurfaceKind;
@@ -586,9 +586,7 @@ fn relay_command(session: &str, command: RelayCommand) -> Result<()> {
             listen,
             allow_localhost,
         ),
-        RelayCommand::Status { config } => {
-            relay::status(config.map(std::path::PathBuf::from))
-        }
+        RelayCommand::Status { config } => relay::status(config.map(std::path::PathBuf::from)),
         RelayCommand::Devices { command } => match command {
             RelayDevicesCommand::List => relay::devices_list(),
             RelayDevicesCommand::Revoke { device_id } => relay::devices_revoke(&device_id),
@@ -865,8 +863,9 @@ fn append_hook_source_once(path: &std::path::Path, source_line: &str) -> Result<
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => {
-            return Err(anyhow::Error::new(err)
-                .context(format!("read shell rc {}", path.display())));
+            return Err(
+                anyhow::Error::new(err).context(format!("read shell rc {}", path.display()))
+            );
         }
     };
     if existing.lines().any(|line| line.trim() == source_line) {
@@ -1930,11 +1929,7 @@ fn ssh_command(host: &str, remote_command: Option<&str>) -> String {
     // `--` stops option injection via host (improve.md: ProxyCommand footgun).
     match remote_command {
         Some(command) if !command.trim().is_empty() => {
-            format!(
-                "ssh -- {} {}",
-                shell_quote(host),
-                shell_quote(command)
-            )
+            format!("ssh -- {} {}", shell_quote(host), shell_quote(command))
         }
         _ => format!("ssh -- {}", shell_quote(host)),
     }

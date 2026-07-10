@@ -480,7 +480,10 @@ mod tests {
     fn session_data_from_snapshot_unwraps_envelope() {
         let nested = serde_json::json!({"generation": 3, "session": {"name": "default"}});
         let session = session_data_from_snapshot(nested);
-        assert_eq!(session.get("name").and_then(|v| v.as_str()), Some("default"));
+        assert_eq!(
+            session.get("name").and_then(|v| v.as_str()),
+            Some("default")
+        );
         let flat = serde_json::json!({"name": "legacy"});
         assert_eq!(
             session_data_from_snapshot(flat)

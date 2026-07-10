@@ -25,8 +25,8 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
             .create(dir)
             .with_context(|| format!("create private dir {}", dir.display()))?;
     }
-    let meta = fs::symlink_metadata(dir)
-        .with_context(|| format!("stat runtime dir {}", dir.display()))?;
+    let meta =
+        fs::symlink_metadata(dir).with_context(|| format!("stat runtime dir {}", dir.display()))?;
     if meta.file_type().is_symlink() {
         bail!(
             "refusing to use runtime dir {}: path is a symlink",
@@ -53,8 +53,7 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
         // Tighten in place when safe (we own it).
         let mut perms = meta.permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
-        fs::set_permissions(dir, perms)
-            .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+        fs::set_permissions(dir, perms).with_context(|| format!("chmod 0700 {}", dir.display()))?;
     }
     Ok(())
 }

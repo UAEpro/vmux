@@ -1090,8 +1090,12 @@ impl Ui {
                 if self.mode == UiMode::WorkspacePicker {
                     match key.code {
                         KeyCode::Esc => self.mode = UiMode::Panes,
-                        KeyCode::Up | KeyCode::Char('k') => self.move_workspace_picker_selection(-1),
-                        KeyCode::Down | KeyCode::Char('j') => self.move_workspace_picker_selection(1),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.move_workspace_picker_selection(-1)
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.move_workspace_picker_selection(1)
+                        }
                         KeyCode::Home => self.workspace_picker_selected = 0,
                         KeyCode::End => {
                             let n = self
@@ -1829,8 +1833,7 @@ impl Ui {
                 match crate::relay::apply_enabled(&session, &settings) {
                     Ok(msg) => *self.action_error.get_mut() = Some(msg),
                     Err(err) => {
-                        *self.action_error.get_mut() =
-                            Some(format!("mobile relay error: {err:#}"));
+                        *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
                     }
                 }
             }
@@ -1867,8 +1870,7 @@ impl Ui {
                     let session = self.session.clone();
                     let _ = crate::relay::stop_managed();
                     if let Err(err) = crate::relay::ensure_started(&session, &settings) {
-                        *self.action_error.get_mut() =
-                            Some(format!("mobile relay error: {err:#}"));
+                        *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
                     }
                 }
             }
@@ -3117,63 +3119,59 @@ fn draw(
     };
 
     if sidebar_width > 0 {
-    let sidebar_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(chunks[0]);
-    // Collapsed rail: show burger glyph so click-to-open is discoverable.
-    let sidebar_title = if sidebar_collapsed {
-        " ☰ "
-    } else {
-        " vmux "
-    };
-    frame.render_widget(
-        Paragraph::new(sidebar_title).style(
-            Style::default()
-                .fg(palette.active)
-                .bg(palette.background)
-                .add_modifier(Modifier::BOLD),
-        ),
-        sidebar_chunks[0],
-    );
-    // Inner width available for labels (Borders::RIGHT steals one column).
-    let sidebar_label_width = usize::from(sidebar_chunks[1].width.saturating_sub(1)).max(1);
-    let workspace_items: Vec<ListItem> = sidebar_entries(
-        snapshot.workspaces.len(),
-        sidebar_scroll,
-        sidebar_chunks[1].height,
-        sidebar_collapsed,
-    )
-    .into_iter()
-    .map(|entry| match entry {
-        SidebarEntry::Above(hidden) => ListItem::new(Line::from(Span::styled(
-            format!("  ▲ +{hidden}"),
-            Style::default().fg(palette.muted).bg(palette.background),
-        ))),
-        SidebarEntry::Below(hidden) => ListItem::new(Line::from(Span::styled(
-            format!("  ▼ +{hidden}"),
-            Style::default().fg(palette.muted).bg(palette.background),
-        ))),
-        SidebarEntry::Workspace(index) => workspace_list_item(
-            snapshot,
-            index,
+        let sidebar_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(chunks[0]);
+        // Collapsed rail: show burger glyph so click-to-open is discoverable.
+        let sidebar_title = if sidebar_collapsed { " ☰ " } else { " vmux " };
+        frame.render_widget(
+            Paragraph::new(sidebar_title).style(
+                Style::default()
+                    .fg(palette.active)
+                    .bg(palette.background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            sidebar_chunks[0],
+        );
+        // Inner width available for labels (Borders::RIGHT steals one column).
+        let sidebar_label_width = usize::from(sidebar_chunks[1].width.saturating_sub(1)).max(1);
+        let workspace_items: Vec<ListItem> = sidebar_entries(
+            snapshot.workspaces.len(),
+            sidebar_scroll,
+            sidebar_chunks[1].height,
             sidebar_collapsed,
-            workspace_second_line,
-            hover_workspace,
-            sidebar_label_width,
-            palette,
-            status_markers,
-        ),
-    })
-    .collect();
-    let sidebar = List::new(workspace_items)
-        .block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(Style::default().fg(palette.border)),
         )
-        .style(Style::default().fg(palette.text).bg(palette.background));
-    frame.render_widget(sidebar, sidebar_chunks[1]);
+        .into_iter()
+        .map(|entry| match entry {
+            SidebarEntry::Above(hidden) => ListItem::new(Line::from(Span::styled(
+                format!("  ▲ +{hidden}"),
+                Style::default().fg(palette.muted).bg(palette.background),
+            ))),
+            SidebarEntry::Below(hidden) => ListItem::new(Line::from(Span::styled(
+                format!("  ▼ +{hidden}"),
+                Style::default().fg(palette.muted).bg(palette.background),
+            ))),
+            SidebarEntry::Workspace(index) => workspace_list_item(
+                snapshot,
+                index,
+                sidebar_collapsed,
+                workspace_second_line,
+                hover_workspace,
+                sidebar_label_width,
+                palette,
+                status_markers,
+            ),
+        })
+        .collect();
+        let sidebar = List::new(workspace_items)
+            .block(
+                Block::default()
+                    .borders(Borders::RIGHT)
+                    .border_style(Style::default().fg(palette.border)),
+            )
+            .style(Style::default().fg(palette.text).bg(palette.background));
+        frame.render_widget(sidebar, sidebar_chunks[1]);
     } // end sidebar_width > 0
 
     let main_chunks = Layout::default()
@@ -5260,8 +5258,7 @@ fn draw_control_bar(
 
     // Paint full bar background first.
     frame.render_widget(
-        Paragraph::new(" ".repeat(area.width as usize))
-            .style(Style::default().bg(palette.surface)),
+        Paragraph::new(" ".repeat(area.width as usize)).style(Style::default().bg(palette.surface)),
         area,
     );
 

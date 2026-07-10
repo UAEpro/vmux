@@ -779,32 +779,35 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
                 body.to_string().as_bytes(),
             )?;
         }
-        ("POST", "/v1/devices/me/register") => {
-            match register_device(&state, &peer, &headers) {
-                Ok((device_id, token)) => {
-                    let body = json!({ "device_id": device_id, "token": token });
-                    write_http(
-                        &mut stream,
-                        200,
-                        "application/json",
-                        body.to_string().as_bytes(),
-                    )?;
-                }
-                Err(RegisterError::Forbidden(msg)) => {
-                    eprintln!("register forbidden from {peer}: {msg}");
-                    write_http(&mut stream, 403, "application/json", br#"{"error":"forbidden"}"#)?;
-                }
-                Err(RegisterError::Other(err)) => {
-                    eprintln!("register error from {peer}: {err:#}");
-                    write_http(
-                        &mut stream,
-                        500,
-                        "application/json",
-                        br#"{"error":"internal"}"#,
-                    )?;
-                }
+        ("POST", "/v1/devices/me/register") => match register_device(&state, &peer, &headers) {
+            Ok((device_id, token)) => {
+                let body = json!({ "device_id": device_id, "token": token });
+                write_http(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    body.to_string().as_bytes(),
+                )?;
             }
-        }
+            Err(RegisterError::Forbidden(msg)) => {
+                eprintln!("register forbidden from {peer}: {msg}");
+                write_http(
+                    &mut stream,
+                    403,
+                    "application/json",
+                    br#"{"error":"forbidden"}"#,
+                )?;
+            }
+            Err(RegisterError::Other(err)) => {
+                eprintln!("register error from {peer}: {err:#}");
+                write_http(
+                    &mut stream,
+                    500,
+                    "application/json",
+                    br#"{"error":"internal"}"#,
+                )?;
+            }
+        },
         ("POST", "/v1/devices/me/apns") => {
             let Some(did) = device_id else {
                 write_http(&mut stream, 401, "text/plain", b"unauthorized")?;
@@ -897,10 +900,11 @@ fn register_device(
     // no other trusted identity path succeeds.
 
     let peer_ip: IpAddr = peer.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let identity = resolve_peer_identity(state, peer, peer_ip, bootstrap_ok).map_err(|e| match e {
-        RegisterError::Forbidden(m) => RegisterError::Forbidden(m),
-        RegisterError::Other(e) => RegisterError::Other(e),
-    })?;
+    let identity =
+        resolve_peer_identity(state, peer, peer_ip, bootstrap_ok).map_err(|e| match e {
+            RegisterError::Forbidden(m) => RegisterError::Forbidden(m),
+            RegisterError::Other(e) => RegisterError::Other(e),
+        })?;
 
     // only enforce allow_login for whois-sourced identities (see PeerIdentity::from_whois)
     if identity.require_allow_login
@@ -921,12 +925,7 @@ fn register_device(
     let token = random_hex(32);
     state
         .devices
-        .register(
-            &device_id,
-            &identity.login_name,
-            &identity.hostname,
-            &token,
-        )
+        .register(&device_id, &identity.login_name, &identity.hostname, &token)
         .map_err(RegisterError::Other)?;
     Ok((device_id, token))
 }
@@ -1040,7 +1039,12 @@ fn resolve_peer_identity(
         });
     }
 
-    if state.config.bootstrap_secret.as_ref().is_some_and(|s| !s.is_empty()) {
+    if state
+        .config
+        .bootstrap_secret
+        .as_ref()
+        .is_some_and(|s| !s.is_empty())
+    {
         return Err(RegisterError::Forbidden(
             "bootstrap secret required or peer not on Tailscale".into(),
         ));
@@ -1283,11 +1287,7 @@ fn handle_ws_upgrade(
                         .max(1) as usize;
 
                     // stop existing sub for this surface
-                    if let Some(flag) = stop_flags
-                        .lock()
-                        .expect("flags")
-                        .remove(&surface_id)
-                    {
+                    if let Some(flag) = stop_flags.lock().expect("flags").remove(&surface_id) {
                         flag.store(true, Ordering::Relaxed);
                     }
                     if let Some(handle) = active_subs.remove(&surface_id) {
@@ -1306,13 +1306,18 @@ fn handle_ws_upgrade(
                     let sid = surface_id.clone();
                     let handle = thread::spawn(move || {
                         run_surface_poller(
-                            socket, workspace_id, sid, lines, fps, idle_fps, stop, push,
+                            socket,
+                            workspace_id,
+                            sid,
+                            lines,
+                            fps,
+                            idle_fps,
+                            stop,
+                            push,
                         );
                     });
                     active_subs.insert(surface_id, handle);
-                    let _ = ws.send(Message::Text(
-                        rpc_ok(&id, json!({})).to_string(),
-                    ));
+                    let _ = ws.send(Message::Text(rpc_ok(&id, json!({})).to_string()));
                     continue;
                 }
 
@@ -1473,8 +1478,7 @@ mod sha1_compat {
     }
 
     fn base64_encode(data: &[u8]) -> String {
-        const T: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in data.chunks(3) {
             let b0 = chunk[0] as u32;
@@ -1652,10 +1656,7 @@ fn screen_hash(screen: &ScreenSnap) -> String {
     hasher.update(screen.cursor_x.to_le_bytes());
     hasher.update(screen.cursor_y.to_le_bytes());
     let dig = hasher.finalize();
-    dig.iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    dig.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 fn read_surface_screen(socket: &Path, surface_id: &str, lines: usize) -> Result<ScreenSnap> {
@@ -1682,10 +1683,7 @@ fn read_surface_screen(socket: &Path, surface_id: &str, lines: usize) -> Result<
     // Cursor comes from ReadScreen itself (no second full List snapshot).
     let (cx, cy) = pane_cursor_from_read(&data).unwrap_or((0, 0));
 
-    let mut rows: Vec<String> = text
-        .split('\n')
-        .map(|s| s.to_string())
-        .collect();
+    let mut rows: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
     if rows.len() > lines {
         rows = rows.split_off(rows.len() - lines);
     }
@@ -1782,7 +1780,12 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let _ = call(socket, &Request::FocusPane { pane: surface.clone() });
+            let _ = call(
+                socket,
+                &Request::FocusPane {
+                    pane: surface.clone(),
+                },
+            );
             call(
                 socket,
                 &Request::Input {
@@ -1800,7 +1803,12 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                 .unwrap_or("")
                 .to_string();
             let mapped = map_cmux_key(&key);
-            let _ = call(socket, &Request::FocusPane { pane: surface.clone() });
+            let _ = call(
+                socket,
+                &Request::FocusPane {
+                    pane: surface.clone(),
+                },
+            );
             call(
                 socket,
                 &Request::SendKey {
@@ -1812,10 +1820,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
         }
         "surface.read_text" => {
             let surface = req_str(params, "surface_id")?;
-            let lines = params
-                .get("lines")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(200) as usize;
+            let lines = params.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
             let snap = read_surface_screen(socket, &surface, lines)?;
             Ok(json!({
                 "text": snap.rows.join("\n"),
@@ -1842,10 +1847,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                 .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or("notification");
-            let body = params
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let body = params.get("body").and_then(|v| v.as_str()).unwrap_or("");
             let message = if body.is_empty() {
                 title.to_string()
             } else {
@@ -1976,7 +1978,9 @@ fn workspace_create(socket: &Path, title: &str) -> Result<Value> {
     // Re-list to get index
     let list = workspace_list(socket)?;
     if let Some(arr) = list.get("workspaces").and_then(|v| v.as_array()) {
-        if let Some(ws) = arr.iter().find(|w| w.get("id").and_then(|i| i.as_str()) == Some(&id))
+        if let Some(ws) = arr
+            .iter()
+            .find(|w| w.get("id").and_then(|i| i.as_str()) == Some(&id))
         {
             return Ok(ws.clone());
         }
@@ -2121,7 +2125,13 @@ fn file_upload(params: &Value) -> Result<Value> {
         .and_then(|s| s.to_str())
         .unwrap_or("upload.bin")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = dir.join(format!("{}-{}", now_secs(), safe));
     fs::write(&path, bytes)?;
@@ -2144,10 +2154,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
             _ => None,
         }
     }
-    let cleaned: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if cleaned.len() % 4 != 0 {
         bail!("invalid base64 length");
     }
@@ -2271,8 +2278,12 @@ mod tests {
     #[test]
     fn tailscale_cgnat() {
         assert!(is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
-        assert!(is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(100, 127, 1, 1))));
-        assert!(!is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(100, 63, 0, 1))));
+        assert!(is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(
+            100, 127, 1, 1
+        ))));
+        assert!(!is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(
+            100, 63, 0, 1
+        ))));
         assert!(!is_tailscale_cgnat(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
     }
 
