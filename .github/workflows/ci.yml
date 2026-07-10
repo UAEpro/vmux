@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+        env:
+          # Isolated XDG so tests never touch the runner's real state.
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
+          XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
+          XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
+          HOME: ${{ runner.temp }}/vmux-home
+
+      - name: Restart persistence e2e
+        run: cargo test --all-targets e2e_restart_preserves_scrollback -- --exact --nocapture
+        env:
+          XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
+          XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
+          XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
+          HOME: ${{ runner.temp }}/vmux-home
+
+      - name: Release build
+        run: cargo build --release
