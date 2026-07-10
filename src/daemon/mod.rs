@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use crate::cli::{BroadcastScope, SplitDirection};
 use crate::model::{
     acknowledge_done_status, direction_axis, infer_agent_status, insert_pane_in_layout,
-    merge_agent_status, next_pane_in_layout, remove_pane_from_layout, resize_layout,
-    touch_agent_status, unix_time, AgentStatus, ClipboardItem, DaemonInfo, EventRecord,
-    ListeningPort, Notification, Pane, PaneStatus, PaneTab, PullRequestInfo, Session, SurfaceKind,
+    merge_agent_status, next_pane_in_layout, resize_layout, touch_agent_status, unix_time,
+    AgentStatus, ClipboardItem, DaemonInfo, EventRecord, ListeningPort, Notification, Pane,
+    PaneStatus, PaneTab, PullRequestInfo, Session, SurfaceKind,
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
@@ -1134,7 +1134,14 @@ impl Server {
             pane.scrollback_formatted = old_scrollback_formatted;
             {
                 let mut session = self.session.lock_or_recover();
-                session.panes.insert(pane_id.clone(), pane);
+                // start_pane_runtime already published a Running record; refresh
+                // it with the restored history only if the child has not already
+                // exited, otherwise mark_exited holds the final output.
+                if let Some(existing) = session.panes.get(&pane_id) {
+                    if existing.status == PaneStatus::Running {
+                        session.panes.insert(pane_id.clone(), pane);
+                    }
+                }
             }
             restored.push(pane_id);
         }
@@ -1171,7 +1178,9 @@ impl Server {
 
         {
             let mut session = self.session.lock_or_recover();
-            session.panes.insert(id.clone(), pane.clone());
+            // start_pane_runtime already published the session record (before
+            // spawning the reader thread); only link it into the workspace here
+            // so we never clobber an exit that raced ahead of us.
             let workspace = session
                 .workspaces
                 .iter_mut()
@@ -1207,7 +1216,7 @@ impl Server {
             let workspace = session
                 .workspaces
                 .iter()
-                .find(|workspace| workspace.panes.iter().any(|item| item == &pane_id))
+                .find(|workspace| workspace.contains_pane(&pane_id))
                 .ok_or_else(|| anyhow!("pane {pane_id} is not attached to a workspace"))?;
             (
                 pane.command.clone(),
@@ -1419,6 +1428,12 @@ impl Server {
         builder.env("VMUX_PID_PATH", self.pid_path.display().to_string());
         builder.env("VMUX_LOG_PATH", self.log_path.display().to_string());
         builder.env("VMUX_STATE_PATH", self.state_path.display().to_string());
+        // Legacy lmux hook scripts still expand these names.
+        builder.env("LMUX_SESSION", &self.session_name);
+        builder.env("LMUX_WORKSPACE_ID", workspace);
+        builder.env("LMUX_PANE_ID", &pane.id);
+        builder.env("LMUX_SURFACE_ID", &pane.id);
+        builder.env("LMUX_SOCKET_PATH", self.socket_path.display().to_string());
         let mut child = pair.slave.spawn_command(builder)?;
         let child_pid = child.process_id();
         drop(pair.slave);
@@ -1467,6 +1482,26 @@ impl Server {
                 scrollback_formatted_generation: u64::MAX,
             },
         );
+
+        // Publish the session record BEFORE spawning the reader thread. A
+        // fast-exiting child's mark_exited runs on that thread and looks the
+        // pane up in session.panes; if the record is not there yet the exit is
+        // dropped and the pane is stuck Running forever (vmux wait hangs).
+        // Preserve tab/metadata ownership when a prior record exists (restart).
+        {
+            let mut session = self.session.lock_or_recover();
+            if let Some(existing) = session.panes.get_mut(&pane_id) {
+                let tabs = existing.tabs.clone();
+                let active_tab = existing.active_tab.clone();
+                let metadata = existing.metadata.clone();
+                *existing = pane.clone();
+                existing.tabs = tabs;
+                existing.active_tab = active_tab;
+                existing.metadata = metadata;
+            } else {
+                session.panes.insert(pane_id.clone(), pane.clone());
+            }
+        }
 
         let output_server = Arc::clone(self);
         thread::spawn(move || {
@@ -1695,7 +1730,7 @@ impl Server {
             let workspace = session
                 .workspaces
                 .iter()
-                .find(|workspace| workspace.panes.iter().any(|item| item == pane_id))
+                .find(|workspace| workspace.contains_pane(pane_id))
                 .ok_or_else(|| anyhow!("pane {pane_id} is not attached to a workspace"))?;
             (
                 pane,
@@ -1705,10 +1740,8 @@ impl Server {
         };
 
         self.start_pane_runtime(&mut pane, cwd, &workspace_id)?;
-        {
-            let mut session = self.session.lock_or_recover();
-            session.panes.insert(pane_id.to_string(), pane.clone());
-        }
+        // start_pane_runtime republished the session record before spawning the
+        // reader thread; re-inserting here would clobber an instant exit.
         self.save()?;
         Ok(pane)
     }
@@ -1907,21 +1940,18 @@ impl Server {
         self.remove_pane_runtimes(&pane_id);
 
         let mut session = self.session.lock_or_recover();
+        // Kill removes the pane from every tab and the live view (not just the
+        // active-tab view), then drops the session record. Keeping an Exited
+        // orphan that is in no layout would leak: all_pane_ids() can't reach it
+        // so prune_exited_panes can never collect it (finding: kill_pane leak).
         for workspace in &mut session.workspaces {
-            workspace.panes.retain(|item| item != &pane_id);
-            workspace.layout = remove_pane_from_layout(workspace.layout.take(), &pane_id);
-            if workspace.active_pane.as_deref() == Some(&pane_id) {
-                workspace.active_pane = workspace.first_pane();
-            }
-            if workspace.zoomed_pane.as_deref() == Some(&pane_id) {
-                workspace.zoomed_pane = None;
-            }
+            workspace.remove_pane_anywhere(&pane_id);
         }
-        let Some(pane) = session.panes.get_mut(&pane_id) else {
+        let Some(mut pane) = session.panes.remove(&pane_id) else {
             return Err(anyhow!("unknown pane {pane_id}"));
         };
         pane.status = PaneStatus::Exited;
-        touch_agent_status(pane, AgentStatus::Done, true);
+        touch_agent_status(&mut pane, AgentStatus::Done, true);
         pane.notification_message = None;
         pane.notification_color = None;
         if let Some(output) = output {
@@ -1933,8 +1963,6 @@ impl Server {
             pane.scrollback_formatted.clear();
         }
         pane.updated_at = unix_time();
-        sync_active_pane_tab(pane);
-        let pane = pane.clone();
         drop(session);
         self.save()?;
         Ok(pane)
@@ -2359,8 +2387,12 @@ impl Server {
         status: Option<String>,
         color: Option<String>,
         clear: bool,
-        message: String,
+        mut message: String,
     ) -> Result<Notification> {
+        // Bound the stored message like events are (see push_event); the raw
+        // request body can be up to the 16 MB request cap otherwise.
+        const MAX_NOTIFY_MSG: usize = 4_096;
+        truncate_on_char_boundary(&mut message, MAX_NOTIFY_MSG);
         let target_workspace = self.resolve_workspace(workspace)?;
         let target_pane = if target_workspace.is_some() {
             pane
@@ -2556,7 +2588,7 @@ impl Server {
             let workspace_id = session
                 .workspaces
                 .iter()
-                .find(|workspace| workspace.panes.iter().any(|item| item == &pane_id))
+                .find(|workspace| workspace.contains_pane(&pane_id))
                 .map(|workspace| workspace.id.clone())
                 .ok_or_else(|| anyhow!("notification pane {pane_id} is no longer attached"))?;
             (workspace_id, Some(pane_id))
@@ -2646,7 +2678,6 @@ impl Server {
                 .get(&runtime_key)
                 .or_else(|| panes.get(&pane_id))
                 .map(|runtime| {
-                    let raw = runtime.joined_output();
                     let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
                     let mut value = serde_json::json!({
                         "pane": pane_id,
@@ -2657,6 +2688,9 @@ impl Server {
                         "cursor_col": cursor_col,
                     });
                     if include_scrollback {
+                        // joined_output() concatenates the whole ring (~16KB); only
+                        // pay for it when the caller actually wants scrollback.
+                        let raw = runtime.joined_output();
                         value["scrollback"] = serde_json::json!(trim_output(raw, limit));
                     }
                     value
@@ -2874,7 +2908,10 @@ impl Server {
 
     fn resolve_pane(&self, pane: Option<String>) -> Result<String> {
         let mut session = self.session.lock_or_recover();
-        let pane_id = match pane {
+        // Treat missing / blank / whitespace as "use active pane". Claude Stop
+        // hooks that expand an empty LMUX_PANE_ID used to send `--pane ""` and
+        // fail with `unknown pane `, leaving 🔄 stuck forever.
+        let pane_id = match pane.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
             Some(pane) => pane,
             None => session
                 .active_workspace_mut()
@@ -2935,15 +2972,6 @@ impl Server {
         }
     }
 
-    #[allow(dead_code)]
-    fn remove_runtime(&self, runtime_key: &str) {
-        if let Some(mut runtime) = self.panes.lock_or_recover().remove(runtime_key) {
-            if let Some(mut killer) = runtime.killer.take() {
-                killer.kill().ok();
-            }
-        }
-    }
-
     fn append_output(&self, runtime_key: &str, pane_id: &str, generation: u64, bytes: &[u8]) {
         // Hot path: update the vt100 parser + light metadata only. Heavy screen
         // strings are materialized lazily in snapshot() (improve.md #36).
@@ -2986,11 +3014,19 @@ impl Server {
                 runtime.pane.screen_cols = Some(screen_cols);
                 update_pane_terminal_modes(&mut runtime.pane, runtime.parser.screen());
                 // Clone light metadata for session merge (empty heavy strings).
-                let mut light = runtime.pane.clone();
-                light.output.clear();
-                light.output_formatted.clear();
-                light.scrollback.clear();
-                light.scrollback_formatted.clear();
+                // The last snapshot may have cached the heavy screen strings on
+                // runtime.pane; lift them out before cloning so we don't copy
+                // (then discard) up to ~16KB × 4 on every PTY chunk, then put
+                // them back (moves, no copy).
+                let output = std::mem::take(&mut runtime.pane.output);
+                let output_formatted = std::mem::take(&mut runtime.pane.output_formatted);
+                let scrollback = std::mem::take(&mut runtime.pane.scrollback);
+                let scrollback_formatted = std::mem::take(&mut runtime.pane.scrollback_formatted);
+                let light = runtime.pane.clone();
+                runtime.pane.output = output;
+                runtime.pane.output_formatted = output_formatted;
+                runtime.pane.scrollback = scrollback;
+                runtime.pane.scrollback_formatted = scrollback_formatted;
                 Some((light, notifications))
             })
         }) else {
@@ -3408,6 +3444,12 @@ impl Server {
 
     fn save(&self) -> Result<()> {
         self.touch();
+        // Hold save_lock across the ENTIRE save — snapshot capture through
+        // rename — so two concurrent saves can't build snapshots out of order
+        // and rename an older payload over a newer one (which after a crash
+        // would resurrect killed panes / drop new ones). The lock also gives
+        // each save a unique temp name via the per-save counter below.
+        let mut counter = self.save_lock.lock_or_recover();
         // Keep active-tab records in sync with live layout fields before
         // persisting (inactive tabs already hold their own layout).
         {
@@ -3420,10 +3462,6 @@ impl Server {
         let mut snapshot = self.snapshot(true)?;
         snapshot.daemon = None;
         let payload = serde_json::to_vec_pretty(&snapshot)?;
-        // Serialize writes so concurrent handlers can't interleave into a shared
-        // temp file or race the rename. Each save also uses a unique temp name
-        // (per-save counter + pid) so a stray writer never clobbers ours.
-        let mut counter = self.save_lock.lock_or_recover();
         *counter = counter.wrapping_add(1);
         let tmp =
             self.state_path
@@ -3482,15 +3520,27 @@ fn runtime_key_is_active_for_pane(pane: &Pane, runtime_key: &str) -> bool {
         || (pane.active_tab.is_none() && legacy_runtime_key(&pane.id) == runtime_key)
 }
 
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+/// `String::truncate` panics when the byte index is not a char boundary, and
+/// these messages come straight from arbitrary pane output / user input.
+fn truncate_on_char_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push('…');
+}
+
 fn push_event(session: &mut Session, mut event: EventRecord) {
     session.next_event_id = session.next_event_id.saturating_add(1).max(1);
     event.id = session.next_event_id;
     // Bound message length at the protocol boundary (newimp §9).
     const MAX_EVENT_MSG: usize = 4_096;
-    if event.message.len() > MAX_EVENT_MSG {
-        event.message.truncate(MAX_EVENT_MSG);
-        event.message.push('…');
-    }
+    truncate_on_char_boundary(&mut event.message, MAX_EVENT_MSG);
     session.events.push(event);
     let len = session.events.len();
     if len > 500 {
@@ -3640,23 +3690,6 @@ fn resolve_pane_tab<'a>(pane: &'a Pane, selector: &str) -> Result<&'a PaneTab> {
         [] => Err(anyhow!("unknown tab {selector}")),
         _ => Err(anyhow!("pane tab selector {selector} is ambiguous")),
     }
-}
-
-#[allow(dead_code)]
-fn resolve_pane_tab_mut<'a>(pane: &'a mut Pane, selector: &str) -> Result<&'a mut PaneTab> {
-    let matches = pane
-        .tabs
-        .iter()
-        .enumerate()
-        .filter(|(_, tab)| tab.id == selector || tab.title == selector)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let index = match matches.as_slice() {
-        [index] => *index,
-        [] => return Err(anyhow!("unknown tab {selector}")),
-        _ => return Err(anyhow!("pane tab selector {selector} is ambiguous")),
-    };
-    Ok(&mut pane.tabs[index])
 }
 
 fn screen_contents_formatted(screen: &vt100::Screen) -> String {
@@ -3830,7 +3863,7 @@ fn notification_workspace<'a>(
     session
         .workspaces
         .iter()
-        .find(|workspace| workspace.panes.iter().any(|item| item == pane_id))
+        .find(|workspace| workspace.contains_pane(pane_id))
 }
 
 fn normalize_pane_title(title: Option<String>) -> Result<Option<String>> {

@@ -1016,6 +1016,7 @@ dependencies = [
  "crossterm",
  "daemonize",
  "dirs",
+ "getrandom",
  "libc",
  "portable-pty",
  "ratatui",

@@ -84,14 +84,14 @@ pub(crate) fn bootstrap_header_matches(
             })
         })
         .unwrap_or_default();
-    // Constant-time-ish compare for equal length; length leak is acceptable here.
-    if provided.len() != secret.len() {
-        return false;
-    }
-    provided
+    // Compare fixed-length digests so neither the timing nor the (previously
+    // early-returned) length reveals anything about the secret.
+    let provided_digest = sha256_hex(&provided);
+    let secret_digest = sha256_hex(secret);
+    provided_digest
         .as_bytes()
         .iter()
-        .zip(secret.as_bytes().iter())
+        .zip(secret_digest.as_bytes().iter())
         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
         == 0
 }
@@ -119,10 +119,14 @@ pub(crate) fn resolve_peer_identity(
                 "localhost registration disabled (set allow_localhost)".into(),
             ));
         }
+        // Loopback has no stable node identity (peer is always 127.0.0.1), so a
+        // fixed node_key would hash to ONE device_id for every local client and
+        // each new pairing would overwrite the previous device's token. Mix in
+        // fresh randomness so every localhost registration is its own device.
         return Ok(PeerIdentity {
             login_name: "localhost".into(),
             hostname: "localhost".into(),
-            node_key: format!("vmux-dev-localhost:{peer}"),
+            node_key: format!("vmux-dev-localhost:{peer}:{}", random_hex(16)),
             require_allow_login: false,
         });
     }

@@ -293,11 +293,20 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
 }
 
 pub fn save_to_path(path: &Path, config: &LmuxConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    // If the config path is a symlink (e.g. dotfiles-managed), write THROUGH it
+    // to the real target. Renaming over the link itself would replace it with a
+    // regular file and silently detach it from the user's dotfiles repo.
+    let target = match fs::read_link(path) {
+        Ok(link) if link.is_absolute() => link,
+        Ok(link) => path.parent().map(|p| p.join(&link)).unwrap_or(link),
+        Err(_) => path.to_path_buf(),
+    };
+    if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    // Atomic write (tmp + rename) so a crash mid-write cannot leave empty config.
-    let tmp = path.with_extension("json.tmp");
+    // Atomic write (tmp + rename in the target's dir) so a crash mid-write cannot
+    // leave empty config.
+    let tmp = target.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(config)?;
     fs::write(&tmp, &bytes).with_context(|| format!("write {}", tmp.display()))?;
     #[cfg(unix)]
@@ -305,7 +314,7 @@ pub fn save_to_path(path: &Path, config: &LmuxConfig) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
     }
-    fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    fs::rename(&tmp, &target).with_context(|| format!("rename to {}", target.display()))?;
     Ok(())
 }
 
@@ -334,7 +343,23 @@ pub fn default_workspace_second_line() -> String {
 }
 
 pub fn supported_themes() -> Vec<&'static str> {
-    vec!["midnight", "daylight", "contrast"]
+    vec![
+        "midnight",
+        "daylight",
+        "contrast",
+        "nord",
+        "dracula",
+        "gruvbox",
+        "catppuccin",
+        "solarized-dark",
+        "solarized-light",
+        "tokyo-night",
+        "forest",
+        "rose-pine",
+        "ocean",
+        "ember",
+        "monokai",
+    ]
 }
 
 pub fn supported_workspace_second_lines() -> Vec<&'static str> {
@@ -476,8 +501,25 @@ pub fn load_from_path(path: &Path) -> Result<LmuxConfig> {
 /// on parse errors so a typo cannot be overwritten with defaults (bugs.md P1#5).
 pub fn load_for_mutation() -> Result<(std::path::PathBuf, LmuxConfig)> {
     let path = paths::config_path()?;
+    // Distinguish "genuinely absent" from "broken symlink". `exists()` follows
+    // symlinks, so a dotfiles link whose target is temporarily missing would
+    // read as absent → defaults → the save then destroys the link. Detect the
+    // link with symlink_metadata and fail closed instead.
+    match fs::symlink_metadata(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((path, LmuxConfig::default()));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("stat config {}", path.display()));
+        }
+        Ok(_) => {}
+    }
     if !path.exists() {
-        return Ok((path, LmuxConfig::default()));
+        return Err(anyhow!(
+            "config path {} is a broken symlink; refusing to overwrite with defaults \
+             (fix or remove the link target first)",
+            path.display()
+        ));
     }
     let config = load_from_path_strict(&path)?;
     Ok((path, config))

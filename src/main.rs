@@ -12,7 +12,7 @@ mod ui;
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
@@ -611,7 +611,13 @@ fn hooks_command(session: &str, command: HooksCommand) -> Result<()> {
             color,
             message,
         } => {
-            daemon::ensure_running(session)?;
+            // A hook event only updates an already-running session. When invoked
+            // outside vmux (e.g. Claude Code in a plain terminal) there is no
+            // daemon — do NOT start one, just no-op, or every hook fire would
+            // spawn a stray persistent daemon.
+            if !daemon::is_running(session) {
+                return Ok(());
+            }
             let mut payload = String::new();
             if !std::io::stdin().is_terminal() {
                 std::io::stdin().read_to_string(&mut payload)?;
@@ -719,9 +725,10 @@ fn hook_event_request(
             })
         })
         .unwrap_or_else(|| default_message.to_string());
+    // Blank `--pane ""` (legacy empty LMUX_PANE_ID) must not become "unknown pane ".
     Ok(protocol::Request::Notify {
-        pane,
-        workspace,
+        pane: non_empty(pane),
+        workspace: non_empty(workspace),
         status: non_empty(status).or_else(|| Some(default_status.to_string())),
         color: non_empty(color).or_else(|| Some(default_color.to_string())),
         clear: false,
@@ -768,10 +775,10 @@ fn hook_event_defaults(event: &str) -> (&'static str, &'static str, &'static str
     // Exact lifecycle names first (Codex + Claude). Substring matching alone
     // mis-classifies events (e.g. SubagentStop → done while still working).
     match key.as_str() {
-        // Finished turn
-        "stop" | "sessionend" | "subagentstop" | "taskcompleted" => {
-            ("done", "green", "agent hook completed")
-        }
+        // Finished turn. Note: SubagentStop is NOT here — it fires when a
+        // Task-tool subagent finishes while the parent agent is still working,
+        // so it must read as "busy" (below), not "done".
+        "stop" | "sessionend" | "taskcompleted" => ("done", "green", "agent hook completed"),
         // Hard failure
         "stopfailure" | "posttoolusefailure" => ("error", "red", "agent hook failed"),
         // Needs user (approval / notification)
@@ -785,6 +792,7 @@ fn hook_event_defaults(event: &str) -> (&'static str, &'static str, &'static str
         | "posttoolbatch"
         | "sessionstart"
         | "subagentstart"
+        | "subagentstop"
         | "precompact"
         | "postcompact"
         | "setup"
@@ -857,35 +865,10 @@ fn hook_source_line(path: &std::path::Path) -> String {
 }
 
 fn append_hook_source_once(path: &std::path::Path, source_line: &str) -> Result<()> {
-    // Only treat missing file as empty. Other I/O/decode errors must not wipe
-    // the user's rc (improve.md #5 — non-UTF-8 bashrc was truncated).
-    let existing = match fs::read(path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(
-                anyhow::Error::new(err).context(format!("read shell rc {}", path.display()))
-            );
-        }
-    };
-    if existing.lines().any(|line| line.trim() == source_line) {
-        return Ok(());
-    }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str("\n# vmux shell hooks\n");
-    updated.push_str(source_line);
-    updated.push('\n');
-    fs::write(path, updated)?;
-    Ok(())
+    // Delegate to the hardened installer: it refuses to rewrite a non-UTF-8 rc
+    // (from_utf8_lossy used to silently mangle latin-1 files) and takes a
+    // byte-for-byte backup before mutating.
+    crate::agent_hooks::append_source_once(path, source_line)
 }
 
 fn skills_command(command: SkillsCommand) -> Result<()> {
@@ -1073,22 +1056,43 @@ const BASH_HOOKS: &str = r#"# vmux shell hooks for bash/zsh-compatible shells.
 #   vmux_hook_attention "waiting for approval"
 #
 # Coding agents (Claude Code / Codex / Grok / etc.):
-#   Inside a vmux pane, VMUX_PANE_ID is set automatically.
+#   Inside a vmux pane, VMUX_PANE_ID is set automatically (LMUX_PANE_ID still works).
 #   Call these from agent stop/tool hooks, or pipe JSON:
 #     echo '{"event":"stop","message":"done"}' | vmux hooks event
 #     echo '{"event":"needs-input","message":"approve edit"}' | vmux hooks event
 #   OSC fallback (many agents emit this):
 #     printf '\033]777;notify;Agent;waiting for approval\a'
 
+# Prefer VMUX_*; fall back to legacy LMUX_* from older pane env / scripts.
+_vmux_pane_id() {
+  if [ -n "${VMUX_PANE_ID:-}" ]; then
+    printf '%s' "$VMUX_PANE_ID"
+  elif [ -n "${LMUX_PANE_ID:-}" ]; then
+    printf '%s' "$LMUX_PANE_ID"
+  fi
+}
+
+_vmux_bin() {
+  if command -v vmux >/dev/null 2>&1; then
+    printf '%s' vmux
+  elif command -v lmux >/dev/null 2>&1; then
+    printf '%s' lmux
+  else
+    printf '%s' vmux
+  fi
+}
+
 vmux_hook_status() {
   local status="${1:-busy}"
   shift || true
   local message="${*:-$status}"
   local pane_args=()
-  if [ -n "${VMUX_PANE_ID:-}" ]; then
-    pane_args=(--pane "$VMUX_PANE_ID")
+  local pane
+  pane="$(_vmux_pane_id)"
+  if [ -n "$pane" ]; then
+    pane_args=(--pane "$pane")
   fi
-  vmux set-status "$status" "${pane_args[@]}" --message "$message" >/dev/null 2>&1 || true
+  "$(_vmux_bin)" set-status "$status" "${pane_args[@]}" --message "$message" >/dev/null 2>&1 || true
 }
 
 vmux_hook_busy() {
@@ -1107,19 +1111,23 @@ vmux_hook_error() {
 vmux_hook_progress() {
   local value="${1:-0}"
   local pane_args=()
-  if [ -n "${VMUX_PANE_ID:-}" ]; then
-    pane_args=(--pane "$VMUX_PANE_ID")
+  local pane
+  pane="$(_vmux_pane_id)"
+  if [ -n "$pane" ]; then
+    pane_args=(--pane "$pane")
   fi
-  vmux set-progress "$value" "${pane_args[@]}" >/dev/null 2>&1 || true
+  "$(_vmux_bin)" set-progress "$value" "${pane_args[@]}" >/dev/null 2>&1 || true
 }
 
 vmux_hook_notify() {
   local message="${*:-needs attention}"
   local pane_args=()
-  if [ -n "${VMUX_PANE_ID:-}" ]; then
-    pane_args=(--pane "$VMUX_PANE_ID")
+  local pane
+  pane="$(_vmux_pane_id)"
+  if [ -n "$pane" ]; then
+    pane_args=(--pane "$pane")
   fi
-  vmux notify "${pane_args[@]}" --status attention --message "$message" >/dev/null 2>&1 || true
+  "$(_vmux_bin)" notify "${pane_args[@]}" --status attention --message "$message" >/dev/null 2>&1 || true
 }
 
 vmux_hook_attention() {
@@ -1143,10 +1151,29 @@ vmux_hook_run() {
 
 # Pipe agent hook JSON (Claude Code Stop, Codex hooks, etc.) into vmux.
 # Example Stop hook command:
-#   cat | vmux hooks event --pane "${VMUX_PANE_ID:-}"
+#   cat | vmux hooks event --pane "${VMUX_PANE_ID:-${LMUX_PANE_ID:-}}"
 vmux_hook_event_stdin() {
-  vmux hooks event "$@" >/dev/null 2>&1 || true
+  local pane session_args=()
+  pane="$(_vmux_pane_id)"
+  if [ -n "$pane" ]; then
+    session_args+=(--pane "$pane")
+  fi
+  if [ -n "${VMUX_SESSION:-${LMUX_SESSION:-}}" ]; then
+    session_args+=(--session "${VMUX_SESSION:-$LMUX_SESSION}")
+  fi
+  "$(_vmux_bin)" hooks event "${session_args[@]}" "$@" >/dev/null 2>&1 || true
 }
+
+# Legacy lmux_* aliases so older scripts keep working after the rename.
+lmux_hook_status() { vmux_hook_status "$@"; }
+lmux_hook_busy() { vmux_hook_busy "$@"; }
+lmux_hook_done() { vmux_hook_done "$@"; }
+lmux_hook_error() { vmux_hook_error "$@"; }
+lmux_hook_progress() { vmux_hook_progress "$@"; }
+lmux_hook_notify() { vmux_hook_notify "$@"; }
+lmux_hook_attention() { vmux_hook_attention "$@"; }
+lmux_hook_run() { vmux_hook_run "$@"; }
+lmux_hook_event_stdin() { vmux_hook_event_stdin "$@"; }
 "#;
 
 fn surface_command(session: &str, command: SurfaceCommand) -> Result<()> {
@@ -2775,19 +2802,28 @@ fn wait_for_socket_ping(socket: &std::path::Path, attempts: usize) -> Result<boo
 
 fn follow_events(session: &str, limit: usize, interval_ms: u64) -> Result<()> {
     let socket = paths::socket_path(session)?;
-    let mut seen = events_from_socket(&socket, limit)?
-        .into_iter()
-        .filter_map(|event| serde_json::to_string(&event).ok())
-        .collect::<BTreeSet<_>>();
+    let event_id = |event: &serde_json::Value| event.get("id").and_then(|v| v.as_u64());
+    // Cursor: the highest event id already emitted. Dedup on the monotonic id,
+    // NOT the serialized JSON — the daemon embeds mutable pane_title /
+    // workspace_name resolved at query time, so a title change would otherwise
+    // re-serialize a seen event and re-print it as new. (A burst larger than
+    // `limit` between polls can still scroll out of the window; fully fixing
+    // that needs a `since`-cursor on the Events request.)
+    let mut last_id = events_from_socket(&socket, limit)?
+        .iter()
+        .filter_map(&event_id)
+        .max()
+        .unwrap_or(0);
     let interval = std::time::Duration::from_millis(interval_ms.clamp(100, 10_000));
     loop {
         let mut events = events_from_socket(&socket, limit)?;
         events.reverse();
         for event in events {
-            let key = serde_json::to_string(&event)?;
-            if !seen.insert(key) {
+            let Some(id) = event_id(&event) else { continue };
+            if id <= last_id {
                 continue;
             }
+            last_id = id;
             println!("{}", serde_json::to_string(&event)?);
             std::io::stdout().flush()?;
         }
@@ -2976,11 +3012,14 @@ mod tests {
     fn shell_hooks_include_status_progress_and_notification_helpers() {
         let hooks = shell_hooks(HookShell::Bash);
         assert!(hooks.contains("vmux_hook_status()"));
-        assert!(hooks.contains("vmux set-status"));
-        assert!(hooks.contains("vmux set-progress"));
-        assert!(hooks.contains("vmux notify"));
+        assert!(hooks.contains("set-status"));
+        assert!(hooks.contains("set-progress"));
+        assert!(hooks.contains("notify"));
         assert!(hooks.contains("VMUX_PANE_ID"));
+        assert!(hooks.contains("LMUX_PANE_ID")); // legacy fallback
+        assert!(hooks.contains("_vmux_pane_id"));
         assert!(hooks.contains("vmux_hook_run()"));
+        assert!(hooks.contains("lmux_hook_done()")); // legacy aliases
     }
 
     #[test]
@@ -3389,6 +3428,7 @@ mod tests {
     fn relative_workspace_id_wraps_workspace_order() {
         let mut session = model::Session::new("test");
         session.workspaces.push(model::Workspace {
+            next_tab_seq: 0,
             id: "ws-2".to_string(),
             name: "agents".to_string(),
             cwd: model::default_cwd(),
@@ -3404,6 +3444,7 @@ mod tests {
             layout: None,
         });
         session.workspaces.push(model::Workspace {
+            next_tab_seq: 0,
             id: "ws-3".to_string(),
             name: "tests".to_string(),
             cwd: model::default_cwd(),

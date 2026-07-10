@@ -20,9 +20,32 @@ pub fn agent_hook_command() -> String {
     let vmux = resolve_vmux_bin();
     // Quote for shell; fall back to bare `vmux` if resolution fails.
     let bin = shell_words::quote(&vmux);
+    // Prefer VMUX_*; fall back to legacy LMUX_* so old Claude settings still
+    // route Stop → ✅. Empty pane is handled by the daemon as "active pane".
     format!(
-        "cat | {bin} hooks event --pane \"${{VMUX_PANE_ID:-}}\" >/dev/null 2>&1 || cat >/dev/null; printf '%s\\n' '{{}}'"
+        "cat | {bin} hooks event --pane \"${{VMUX_PANE_ID:-${{LMUX_PANE_ID:-}}}}\" --session \"${{VMUX_SESSION:-${{LMUX_SESSION:-default}}}}\" >/dev/null 2>&1 || cat >/dev/null; printf '%s\\n' '{{}}'"
     )
+}
+
+/// True when installed hook commands still use pre-rename env/binary names and
+/// will fail to mark Claude/Codex as done (🔄 stuck after Stop).
+pub fn hooks_look_stale(content: &str) -> bool {
+    if !content.contains(VMUX_HOOK_MARKER) {
+        return false;
+    }
+    // Fresh hooks may still mention LMUX_* as a fallback after VMUX_*.
+    // Stale = legacy only (no VMUX_PANE_ID) or still invoking the old `lmux` binary.
+    let uses_legacy_pane_only =
+        content.contains("LMUX_PANE_ID") && !content.contains("VMUX_PANE_ID");
+    let uses_legacy_bin = (content.contains("/lmux ")
+        || content.contains("/lmux\"")
+        || content.contains("| lmux ")
+        || content.contains("|lmux "))
+        && !content.contains("/vmux ")
+        && !content.contains("/vmux\"")
+        && !content.contains("| vmux ")
+        && !content.contains("|vmux ");
+    uses_legacy_pane_only || uses_legacy_bin
 }
 
 fn resolve_vmux_bin() -> String {
@@ -173,9 +196,22 @@ pub fn status_for(kind: IntegrationKind, home: &Path) -> IntegrationStatus {
 
 fn shell_status(home: &Path) -> IntegrationStatus {
     let path = shell_hooks_path(home);
+    let legacy_path = config_home(home).join("lmux").join("hooks.sh");
     let (state, detail) = if path.is_file() {
         let content = fs::read_to_string(&path).unwrap_or_default();
-        if content.contains("vmux_hook_status") && content.contains("vmux set-status") {
+        if content.contains("lmux_hook_status")
+            && !content.contains("vmux_hook_status")
+            && !content.contains("_vmux_pane_id")
+        {
+            (
+                InstallState::Missing,
+                "stale lmux shell hooks — run: vmux hooks install --agent shell".to_string(),
+            )
+        } else if content.contains("vmux_hook_status")
+            && (content.contains("vmux set-status")
+                || content.contains("_vmux_bin")
+                || content.contains("set-status"))
+        {
             (
                 InstallState::Installed,
                 "eval \"$(vmux hooks shell)\" helpers present".to_string(),
@@ -186,6 +222,14 @@ fn shell_status(home: &Path) -> IntegrationStatus {
                 "hooks.sh exists but is incomplete".to_string(),
             )
         }
+    } else if legacy_path.is_file() {
+        (
+            InstallState::Missing,
+            format!(
+                "legacy {} found — run: vmux hooks install --agent shell",
+                legacy_path.display()
+            ),
+        )
     } else {
         (
             InstallState::Missing,
@@ -224,7 +268,13 @@ fn claude_status(home: &Path) -> IntegrationStatus {
     let has_stop = content.contains("\"Stop\"") && has_marker;
     let has_notification = content.contains("\"Notification\"") && has_marker;
     let has_prompt = content.contains("\"UserPromptSubmit\"") && has_marker;
-    let (state, detail) = if has_stop && has_notification && has_prompt {
+    let (state, detail) = if hooks_look_stale(&content) {
+        (
+            InstallState::Missing,
+            "stale lmux hooks (LMUX_PANE_ID / old binary) — run: vmux hooks install --agent claude"
+                .to_string(),
+        )
+    } else if has_stop && has_notification && has_prompt {
         (
             InstallState::Installed,
             "UserPromptSubmit→🔄 Stop→✅ Notification→🙋".to_string(),
@@ -272,7 +322,12 @@ fn codex_status(home: &Path) -> IntegrationStatus {
     let has_stop = content.contains("\"Stop\"") && has_marker;
     let has_permission = content.contains("\"PermissionRequest\"") && has_marker;
     let has_busy = content.contains("\"PreToolUse\"") && has_marker;
-    let (state, detail) = if has_stop && has_permission && has_busy {
+    let (state, detail) = if hooks_look_stale(&content) {
+        (
+            InstallState::Missing,
+            "stale lmux hooks — run: vmux hooks install --agent codex".to_string(),
+        )
+    } else if has_stop && has_permission && has_busy {
         (
             InstallState::Installed,
             "UserPromptSubmit/PreToolUse→🔄 PermissionRequest→🙋 Stop→✅".to_string(),
@@ -309,7 +364,14 @@ fn grok_status(home: &Path) -> IntegrationStatus {
     }
     if path.is_file() {
         let content = fs::read_to_string(&path).unwrap_or_default();
-        if content.contains("set-status") && content.contains("vmux") {
+        if content.contains("lmux ") && !content.contains("vmux ") {
+            IntegrationStatus {
+                kind: IntegrationKind::Grok,
+                state: InstallState::Missing,
+                path,
+                detail: "stale lmux skill — run: vmux hooks install --agent grok".to_string(),
+            }
+        } else if content.contains("set-status") && content.contains("vmux") {
             IntegrationStatus {
                 kind: IntegrationKind::Grok,
                 state: InstallState::Installed,
@@ -321,7 +383,7 @@ fn grok_status(home: &Path) -> IntegrationStatus {
                 kind: IntegrationKind::Grok,
                 state: InstallState::Missing,
                 path,
-                detail: "skill file incomplete".to_string(),
+                detail: "skill file incomplete — run: vmux hooks install --agent grok".to_string(),
             }
         }
     } else {
@@ -361,14 +423,26 @@ fn install_shell(home: &Path) -> Result<InstallResult> {
     let previous = fs::read_to_string(&path).unwrap_or_default();
     let changed = previous != content;
     if changed {
-        fs::write(&path, content)?;
+        write_atomic(&path, content)?;
     }
 
     // Best-effort: append source line to bashrc/zshrc when they exist.
     let source_line = format!(". {}", shell_words::quote(&path.display().to_string()));
+    let legacy_source = format!(
+        ". {}",
+        shell_words::quote(
+            &config_home(home)
+                .join("lmux")
+                .join("hooks.sh")
+                .display()
+                .to_string()
+        )
+    );
     for rc_name in [".bashrc", ".zshrc"] {
         let rc = home.join(rc_name);
         if rc.is_file() || rc_name == ".bashrc" {
+            // Prefer the new vmux path; comment out a legacy lmux source line if present.
+            rewrite_legacy_shell_source(&rc, &legacy_source, &source_line)?;
             append_source_once(&rc, &source_line)?;
         }
     }
@@ -381,7 +455,36 @@ fn install_shell(home: &Path) -> Result<InstallResult> {
     })
 }
 
-fn append_source_once(path: &Path, source_line: &str) -> Result<()> {
+/// Comment out a legacy `lmux` hooks source line so it does not fight with vmux.
+fn rewrite_legacy_shell_source(path: &Path, legacy_line: &str, new_line: &str) -> Result<()> {
+    let Ok(existing) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    if !existing.lines().any(|line| line.trim() == legacy_line) {
+        return Ok(());
+    }
+    if existing.lines().any(|line| line.trim() == new_line) {
+        // New line already present: just comment the old one.
+    }
+    let mut updated = String::new();
+    for line in existing.lines() {
+        if line.trim() == legacy_line {
+            updated.push_str("# migrated to vmux — was: ");
+            updated.push_str(line);
+            updated.push('\n');
+        } else {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+    }
+    if !existing.ends_with('\n') && updated.ends_with('\n') {
+        // keep trailing newline style
+    }
+    write_atomic(path, &updated)?;
+    Ok(())
+}
+
+pub(crate) fn append_source_once(path: &Path, source_line: &str) -> Result<()> {
     // Only treat missing file as empty; fail closed on other I/O (bugs.md P1#4).
     let existing = match fs::read(path) {
         Ok(bytes) => String::from_utf8(bytes).with_context(|| {
@@ -425,7 +528,7 @@ fn append_source_once(path: &Path, source_line: &str) -> Result<()> {
     updated.push_str("\n# vmux shell hooks\n");
     updated.push_str(source_line);
     updated.push('\n');
-    fs::write(path, updated)?;
+    write_atomic(path, &updated)?;
     Ok(())
 }
 
@@ -452,6 +555,25 @@ fn read_json_object_file(path: &Path) -> Result<(String, Value)> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(("{}".to_string(), json!({}))),
         Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
     }
+}
+
+/// Write `contents` to `path` atomically: write a sibling temp file, then
+/// rename it over the target. A crash / full disk / power loss can then only
+/// ever leave the old file or the new file intact, never a truncated one
+/// (fs::write truncates in place and could otherwise destroy ~/.claude settings).
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!("{e}."))
+        .unwrap_or_default();
+    let tmp = path.with_extension(format!("{ext}vmux-tmp.{}", std::process::id()));
+    fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("rename {} → {}", tmp.display(), path.display()));
+    }
+    Ok(())
 }
 
 fn backup_file_bytes(path: &Path, previous: &str) -> Result<()> {
@@ -497,7 +619,7 @@ fn install_claude(home: &Path) -> Result<InstallResult> {
     let changed = previous.trim() != next.trim();
     if changed {
         backup_file_bytes(&path, &previous)?;
-        fs::write(&path, next)?;
+        write_atomic(&path, &next)?;
     }
     Ok(InstallResult {
         kind: IntegrationKind::Claude,
@@ -540,7 +662,7 @@ fn install_codex(home: &Path) -> Result<InstallResult> {
     let changed = previous.trim() != next.trim();
     if changed {
         backup_file_bytes(&path, &previous)?;
-        fs::write(&path, next)?;
+        write_atomic(&path, &next)?;
     }
     Ok(InstallResult {
         kind: IntegrationKind::Codex,
@@ -572,6 +694,15 @@ fn ensure_event_hook(hooks_obj: &mut serde_json::Map<String, Value>, event: &str
                     let current = hook.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     if current != command {
                         hook["command"] = json!(command);
+                    }
+                    // Refresh legacy statusMessage branding.
+                    if hook
+                        .get("statusMessage")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.contains("lmux"))
+                        .unwrap_or(false)
+                    {
+                        hook["statusMessage"] = json!("vmux status");
                     }
                     return;
                 }
@@ -614,7 +745,7 @@ fn install_grok(home: &Path) -> Result<InstallResult> {
     let previous = fs::read_to_string(&path).unwrap_or_default();
     let changed = previous != content;
     if changed {
-        fs::write(&path, content)?;
+        write_atomic(&path, content)?;
     }
     Ok(InstallResult {
         kind: IntegrationKind::Grok,
@@ -638,6 +769,18 @@ mod tests {
             std::env::temp_dir().join(format!("vmux-agent-hooks-{}-{}", std::process::id(), stamp));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn hooks_look_stale_detects_legacy_lmux_env() {
+        let stale = r#"{"hooks":{"Stop":[{"hooks":[{"command":"cat | /tmp/lmux hooks event --pane \"${LMUX_PANE_ID:-}\""}]}]}}"#;
+        assert!(hooks_look_stale(stale));
+        let fresh = agent_hook_command();
+        assert!(fresh.contains("VMUX_PANE_ID"));
+        assert!(!hooks_look_stale(&format!(
+            r#"{{"cmd":"{}"}}"#,
+            fresh.replace('\\', "\\\\").replace('"', "\\\"")
+        )));
     }
 
     #[test]

@@ -174,7 +174,8 @@ pub(crate) fn url_network(url: &str) -> Result<serde_json::Value> {
 pub(crate) const FETCH_BODY_CAP: usize = 2 * 1024 * 1024;
 
 pub(crate) fn fetch_url_body(url: &str, label: &str) -> Result<String> {
-    let output = Command::new("curl")
+    use std::io::Read;
+    let mut child = Command::new("curl")
         .arg("-L")
         .arg("--max-time")
         .arg("30")
@@ -184,26 +185,52 @@ pub(crate) fn fetch_url_body(url: &str, label: &str) -> Result<String> {
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .with_context(|| format!("run curl for {label}"))?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    // Stream stdout with a hard byte cap. curl's --max-filesize only applies
+    // when the size is known up front (Content-Length); a chunked / streaming
+    // response would otherwise be buffered in full by Command::output() and can
+    // OOM the daemon. Reading CAP+1 bytes lets us detect overflow and kill curl.
+    let mut body = Vec::new();
+    let read_result = {
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        (&mut stdout)
+            .take(FETCH_BODY_CAP as u64 + 1)
+            .read_to_end(&mut body)
+    };
+    if let Err(err) = read_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow!("{label} read failed: {err}"));
+    }
+    if body.len() > FETCH_BODY_CAP {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow!(
+            "{label} response too large (exceeds {FETCH_BODY_CAP} bytes)"
+        ));
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait curl for {label}"))?;
+    if !status.success() {
+        let mut error = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut error);
+        }
+        let error = error.trim();
         return Err(anyhow!(
             "{label} failed: {}",
             if error.is_empty() {
                 "curl failed"
             } else {
-                &error
+                error
             }
         ));
     }
-    if output.stdout.len() > FETCH_BODY_CAP {
-        return Err(anyhow!(
-            "{label} response too large ({} bytes; max {FETCH_BODY_CAP})",
-            output.stdout.len()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 #[derive(Debug, Default, PartialEq)]

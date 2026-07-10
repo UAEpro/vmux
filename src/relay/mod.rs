@@ -37,7 +37,6 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:4399";
 const DEFAULT_FPS: u32 = 15;
 const DEFAULT_IDLE_FPS: u32 = 5;
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
-const MAX_WS_MSG: usize = 24 * 1024 * 1024;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -747,6 +746,29 @@ fn ureq_get_health(url: &str) -> Result<String> {
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// HTTP request bodies are only small JSON payloads (register/apns); file
+/// uploads go over the WebSocket channel, not here. Cap well below MAX_WS_MSG so
+/// an unauthenticated peer can't force a 24 MiB allocation per connection.
+const MAX_HTTP_BODY: usize = 256 * 1024;
+/// Bound on the per-connection outbound push queue. A stalled client blocks
+/// `ws.send` up to the 30s write timeout; with an unbounded channel the surface
+/// pollers would buffer ~30s of full-snapshot frames in memory. When the queue
+/// is full we drop frames (the next diff/full frame re-syncs the client).
+const PUSH_CHANNEL_CAP: usize = 128;
+
+/// Read a line into `buf` without ever buffering more than `max` bytes. Returns
+/// `Ok(false)` if the line exceeded `max` (or the peer hit EOF without a
+/// newline). `BufRead::read_line` is otherwise unbounded, so the size caps that
+/// run *after* it can't prevent a pre-auth OOM from a peer that never sends
+/// `\n`.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max: usize,
+) -> std::io::Result<bool> {
+    let read = (&mut *reader).take(max as u64).read_line(buf)?;
+    Ok(read > 0 && buf.ends_with('\n'))
+}
 const MAX_HEADER_COUNT: usize = 64;
 
 fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()> {
@@ -760,11 +782,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    let full = read_line_capped(&mut reader, &mut request_line, MAX_REQUEST_LINE)?;
     if request_line.is_empty() {
         return Ok(());
     }
-    if request_line.len() > MAX_REQUEST_LINE {
+    if !full {
         write_http(&mut stream, 414, "text/plain", b"request line too long")?;
         return Ok(());
     }
@@ -785,8 +807,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
             return Ok(());
         }
         let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.len() > MAX_HEADER_LINE {
+        if !read_line_capped(&mut reader, &mut line, MAX_HEADER_LINE)? {
             write_http(&mut stream, 431, "text/plain", b"header line too long")?;
             return Ok(());
         }
@@ -808,7 +829,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    if content_len > MAX_WS_MSG {
+    if content_len > MAX_HTTP_BODY {
         write_http(&mut stream, 413, "text/plain", b"payload too large")?;
         return Ok(());
     }
@@ -850,6 +871,12 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
             )?;
         }
         ("GET", "/v1/state") => {
+            // Requires auth: snippets may embed command text / paths the user
+            // would not want an unauthenticated (e.g. tailnet) peer to read.
+            if device_id.is_none() {
+                write_http(&mut stream, 401, "text/plain", b"unauthorized")?;
+                return Ok(());
+            }
             let body = json!({
                 "snippets": state.config.snippets,
                 "default_fps": state.config.default_fps,
@@ -878,6 +905,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
             }
             Err(RegisterError::Forbidden(msg)) => {
                 eprintln!("register forbidden from {peer}: {msg}");
+                // Throttle failed registrations: this holds the connection (and
+                // one of the MAX_RELAY_CONNECTIONS slots) so a network peer can't
+                // rapidly brute-force a weak bootstrap_secret.
+                thread::sleep(Duration::from_millis(750));
                 write_http(
                     &mut stream,
                     403,
@@ -973,6 +1004,44 @@ use auth::*;
 
 // ─── WebSocket ──────────────────────────────────────────────────────────────
 
+/// A stream that replays a prefix of already-buffered bytes before delegating to
+/// the socket. During the HTTP read the BufReader can consume bytes past the
+/// header terminator (a WS frame the client pipelined with the upgrade request);
+/// those bytes are stuck in the BufReader and lost if we hand tungstenite the
+/// raw socket. Replaying them here preserves the client's first frame.
+struct PrefixedStream {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: TcpStream,
+}
+
+impl PrefixedStream {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.inner.set_read_timeout(dur)
+    }
+}
+
+impl Read for PrefixedStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let n = std::cmp::min(buf.len(), self.prefix.len() - self.pos);
+            buf[..n].copy_from_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl Write for PrefixedStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn handle_ws_upgrade(
     stream: TcpStream,
     reader: BufReader<TcpStream>,
@@ -982,6 +1051,18 @@ fn handle_ws_upgrade(
 ) -> Result<()> {
     let device_id = device_id_from_ws_headers(&headers, &state.devices)
         .ok_or_else(|| anyhow!("ws upgrade unauthorized"))?;
+
+    // CSWSH guard: browsers always attach an Origin header to a WebSocket
+    // handshake; the native phone client does not. A present Origin therefore
+    // means a web page is trying to open the terminal-control channel — refuse
+    // it even though a valid token is separately required.
+    if headers
+        .get("origin")
+        .map(|o| !o.trim().is_empty())
+        .unwrap_or(false)
+    {
+        bail!("ws upgrade rejected: unexpected Origin header (cross-site)");
+    }
 
     // Reconstruct: tungstenite needs the raw stream before body was read.
     // We already consumed the request via a cloned stream — use the original
@@ -1004,7 +1085,10 @@ fn handle_ws_upgrade(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // reader holds a clone; drop it so we write on the original stream fully.
+    // Capture any bytes the BufReader read past the header terminator (a WS
+    // frame the client pipelined with the upgrade) BEFORE dropping it, then
+    // replay them to tungstenite so the client's first frame is not lost.
+    let buffered = reader.buffer().to_vec();
     drop(reader);
     let mut stream = stream;
     write!(
@@ -1017,7 +1101,12 @@ fn handle_ws_upgrade(
     write!(stream, "\r\n")?;
     stream.flush()?;
 
-    let mut ws = tungstenite::WebSocket::from_raw_socket(stream, Role::Server, None);
+    let socket = PrefixedStream {
+        prefix: buffered,
+        pos: 0,
+        inner: stream,
+    };
+    let mut ws = tungstenite::WebSocket::from_raw_socket(socket, Role::Server, None);
     ws.get_mut()
         .set_read_timeout(Some(Duration::from_millis(200)))
         .ok();
@@ -1028,8 +1117,8 @@ fn handle_ws_upgrade(
     let mut active_subs: HashMap<String, thread::JoinHandle<()>> = HashMap::new();
     let stop_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let push_tx = Arc::new(Mutex::new(None::<std::sync::mpsc::Sender<String>>));
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let push_tx = Arc::new(Mutex::new(None::<std::sync::mpsc::SyncSender<String>>));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(PUSH_CHANNEL_CAP);
     *push_tx.lock().expect("push lock") = Some(tx);
 
     // Event poller for notifications
@@ -1077,7 +1166,7 @@ fn handle_ws_upgrade(
                                     "payload": ev,
                                 });
                                 if let Some(tx) = push.lock().ok().and_then(|g| g.clone()) {
-                                    let _ = tx.send(frame.to_string());
+                                    let _ = tx.try_send(frame.to_string());
                                 }
                             }
                             if last_ids.len() > 500 {
@@ -1400,7 +1489,7 @@ fn run_surface_poller(
     active_fps: u32,
     idle_fps: u32,
     stop: Arc<AtomicBool>,
-    push: Arc<Mutex<Option<std::sync::mpsc::Sender<String>>>>,
+    push: Arc<Mutex<Option<std::sync::mpsc::SyncSender<String>>>>,
 ) {
     let mut rev: u64 = 0;
     let mut prev: Option<ScreenSnap> = None;
@@ -1448,7 +1537,7 @@ fn run_surface_poller(
                             "cursor": { "x": snap.cursor_x, "y": snap.cursor_y },
                         });
                         if let Some(tx) = push.lock().ok().and_then(|g| g.clone()) {
-                            let _ = tx.send(full.to_string());
+                            let _ = tx.try_send(full.to_string());
                         }
                     }
                     let frame = json!({
@@ -1458,7 +1547,7 @@ fn run_surface_poller(
                         "ops": ops,
                     });
                     if let Some(tx) = push.lock().ok().and_then(|g| g.clone()) {
-                        let _ = tx.send(frame.to_string());
+                        let _ = tx.try_send(frame.to_string());
                     }
                     prev = Some(snap.clone());
                 }
@@ -1473,7 +1562,7 @@ fn run_surface_poller(
                         "hash": hash,
                     });
                     if let Some(tx) = push.lock().ok().and_then(|g| g.clone()) {
-                        let _ = tx.send(frame.to_string());
+                        let _ = tx.try_send(frame.to_string());
                     }
                 }
             }
@@ -2087,16 +2176,13 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
 }
 
 fn random_hex(bytes: usize) -> String {
+    // These bytes back device tokens and boot_id, so they MUST be
+    // cryptographically random. getrandom draws from the OS CSPRNG
+    // (getrandom(2) / /dev/urandom) and fails only in a broken environment; a
+    // predictable fallback (the old time-seeded LCG) would make tokens
+    // guessable, so fail closed instead of issuing weak secrets.
     let mut buf = vec![0u8; bytes];
-    // Prefer getrandom via /dev/urandom
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    } else {
-        let t = now_secs();
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = ((t.wrapping_mul(1103515245).wrapping_add(i as u64 * 12345)) % 256) as u8;
-        }
-    }
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable; refusing to issue weak tokens");
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

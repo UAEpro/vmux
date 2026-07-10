@@ -281,42 +281,48 @@ impl Session {
         };
 
         let workspace = &mut self.workspaces[index];
-        // If both panes are only on a background tab, switch live view there first.
-        if !(workspace.panes.iter().any(|p| p == first)
-            && workspace.panes.iter().any(|p| p == second))
-        {
-            if let Some(tab_id) = workspace
-                .tabs
-                .iter()
-                .find(|tab| {
-                    tab.panes.iter().any(|p| p == first) && tab.panes.iter().any(|p| p == second)
-                })
-                .map(|t| t.id.clone())
-            {
-                let _ = workspace.switch_tab(&tab_id);
-            }
-        }
-        for pane in &mut workspace.panes {
-            if pane == first {
-                *pane = second.to_string();
-            } else if pane == second {
-                *pane = first.to_string();
-            }
-        }
-        if let Some(layout) = workspace.layout.as_mut() {
-            swap_panes_in_layout(layout, first, second);
-        }
-        if workspace.active_pane.as_deref() == Some(first) {
-            workspace.active_pane = Some(second.to_string());
-        } else if workspace.active_pane.as_deref() == Some(second) {
-            workspace.active_pane = Some(first.to_string());
-        }
-        if workspace.zoomed_pane.as_deref() == Some(first) {
-            workspace.zoomed_pane = Some(second.to_string());
-        } else if workspace.zoomed_pane.as_deref() == Some(second) {
-            workspace.zoomed_pane = Some(first.to_string());
-        }
+        // Sync the active tab record with the live view first, then swap purely
+        // at the tab level. Swapping panes on a background tab must NOT change
+        // which tab is active or what an attached user is viewing.
         workspace.flush_active_tab();
+        let Some(tab_index) = workspace.tabs.iter().position(|tab| {
+            tab.panes.iter().any(|p| p == first) && tab.panes.iter().any(|p| p == second)
+        }) else {
+            return Err(format!(
+                "panes {first} and {second} are not in the same workspace tab"
+            ));
+        };
+        {
+            let tab = &mut workspace.tabs[tab_index];
+            for pane in &mut tab.panes {
+                if pane == first {
+                    *pane = second.to_string();
+                } else if pane == second {
+                    *pane = first.to_string();
+                }
+            }
+            if let Some(layout) = tab.layout.as_mut() {
+                swap_panes_in_layout(layout, first, second);
+            }
+            if tab.active_pane.as_deref() == Some(first) {
+                tab.active_pane = Some(second.to_string());
+            } else if tab.active_pane.as_deref() == Some(second) {
+                tab.active_pane = Some(first.to_string());
+            }
+            if tab.zoomed_pane.as_deref() == Some(first) {
+                tab.zoomed_pane = Some(second.to_string());
+            } else if tab.zoomed_pane.as_deref() == Some(second) {
+                tab.zoomed_pane = Some(first.to_string());
+            }
+        }
+        // If we swapped within the active tab, re-hydrate the live view from it.
+        if workspace.active_tab.as_deref() == Some(workspace.tabs[tab_index].id.as_str()) {
+            let tab = workspace.tabs[tab_index].clone();
+            workspace.panes = tab.panes;
+            workspace.active_pane = tab.active_pane;
+            workspace.zoomed_pane = tab.zoomed_pane;
+            workspace.layout = tab.layout;
+        }
         Ok(workspace.clone())
     }
 
@@ -475,6 +481,10 @@ pub struct Workspace {
     pub zoomed_pane: Option<String>,
     #[serde(default)]
     pub layout: Option<LayoutNode>,
+    /// Monotonic tab-id counter. Persisted so a closed tab's id is never reused
+    /// (which would silently retarget stale `tab-N` references).
+    #[serde(default)]
+    pub next_tab_seq: u64,
 }
 
 impl Workspace {
@@ -496,6 +506,7 @@ impl Workspace {
             active_pane: None,
             zoomed_pane: None,
             layout: None,
+            next_tab_seq: 2,
         }
     }
 
@@ -532,13 +543,23 @@ impl Workspace {
         // Hydrate live view from the active tab (tabs are authoritative when
         // both sides were present in JSON).
         if let Some(tab_id) = self.active_tab.clone() {
+            // Would keeping the live fields flush a pane that another tab already
+            // owns? That happens only with inconsistent on-disk state; treating
+            // the live view as authoritative there duplicates the pane into two
+            // tabs. In that case hydrate from the (authoritative) active tab.
+            let live_dupes_other_tab = self.panes.iter().any(|pane| {
+                self.tabs
+                    .iter()
+                    .any(|t| t.id != tab_id && t.panes.iter().any(|p| p == pane))
+            });
             if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
                 // If live fields are empty but the tab has content, load tab.
                 // If live fields have content and tab is empty (legacy dual-write
-                // mid-migrate), prefer live fields and flush later.
+                // mid-migrate), prefer live fields and flush later — unless those
+                // live panes already belong to another tab (stale duplicate).
                 let tab_empty = tab.panes.is_empty() && tab.layout.is_none();
                 let live_empty = self.panes.is_empty() && self.layout.is_none();
-                if live_empty || !tab_empty {
+                if live_empty || !tab_empty || live_dupes_other_tab {
                     self.panes = tab.panes.clone();
                     self.active_pane = tab.active_pane.clone();
                     self.zoomed_pane = tab.zoomed_pane.clone();
@@ -657,15 +678,20 @@ impl Workspace {
         self.flush_active_tab();
     }
 
-    pub fn next_tab_id(&self) -> String {
-        let max = self
+    pub fn next_tab_id(&mut self) -> String {
+        // Monotonic and never reused: seed the counter from the highest existing
+        // id so old state files (no persisted counter) stay consistent, then
+        // advance it. A closed tab's id is never handed out again.
+        let max_existing = self
             .tabs
             .iter()
             .filter_map(|tab| tab.id.strip_prefix("tab-"))
             .filter_map(|rest| rest.parse::<u64>().ok())
             .max()
             .unwrap_or(0);
-        format!("tab-{}", max + 1)
+        let n = self.next_tab_seq.max(max_existing + 1);
+        self.next_tab_seq = n + 1;
+        format!("tab-{n}")
     }
 
     /// Add a new empty tab and make it active. Returns the new tab id.
@@ -692,12 +718,23 @@ impl Workspace {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             return Err(format!("unknown tab {tab_id}"));
         };
+        let closing_active = self.active_tab.as_deref() == Some(tab_id);
         let removed = self.tabs.remove(index);
         let pane_ids = removed.panes.clone();
-        let next_index = index.saturating_sub(1).min(self.tabs.len() - 1);
-        let next = self.tabs[next_index].clone();
-        self.switch_tab(&next.id)?;
-        Ok((pane_ids, next))
+        // Only move the live view when the user closed the tab they are on.
+        // Closing a background tab must leave the active tab untouched.
+        if closing_active {
+            let next_index = index.saturating_sub(1).min(self.tabs.len() - 1);
+            let next_id = self.tabs[next_index].id.clone();
+            self.switch_tab(&next_id)?;
+        }
+        let active = self
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id.as_str()) == self.active_tab.as_deref())
+            .cloned()
+            .unwrap_or_else(|| self.tabs[0].clone());
+        Ok((pane_ids, active))
     }
 
     pub fn rename_tab(&mut self, tab_id: &str, title: String) -> Result<WorkspaceTab, String> {
@@ -1107,23 +1144,6 @@ pub struct EventRecord {
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
-}
-
-impl EventRecord {
-    #[allow(dead_code)]
-    pub fn new(kind: impl Into<String>) -> Self {
-        Self {
-            id: 0,
-            time: unix_time(),
-            kind: kind.into(),
-            pane: None,
-            workspace: None,
-            status: None,
-            key: None,
-            value: None,
-            message: String::new(),
-        }
-    }
 }
 
 pub fn unix_time() -> u64 {
@@ -2050,6 +2070,7 @@ mod tests {
         );
         session.workspaces[0].panes.push("pane-1".to_string());
         session.workspaces.push(Workspace {
+            next_tab_seq: 0,
             id: "ws-2".to_string(),
             name: "agents".to_string(),
             cwd: default_cwd(),
@@ -2098,6 +2119,7 @@ mod tests {
     fn moving_workspace_uses_one_based_position() {
         let mut session = Session::new("test");
         session.workspaces.push(Workspace {
+            next_tab_seq: 0,
             id: "ws-2".to_string(),
             name: "agents".to_string(),
             cwd: default_cwd(),
@@ -2113,6 +2135,7 @@ mod tests {
             layout: None,
         });
         session.workspaces.push(Workspace {
+            next_tab_seq: 0,
             id: "ws-3".to_string(),
             name: "tests".to_string(),
             cwd: default_cwd(),
@@ -2145,6 +2168,7 @@ mod tests {
     fn resolves_workspace_selector_by_id_or_unique_name() {
         let mut session = Session::new("test");
         session.workspaces.push(Workspace {
+            next_tab_seq: 0,
             id: "ws-2".to_string(),
             name: "agents".to_string(),
             cwd: default_cwd(),
@@ -2168,6 +2192,7 @@ mod tests {
         assert!(session.resolve_workspace_selector("missing").is_err());
 
         session.workspaces.push(Workspace {
+            next_tab_seq: 0,
             id: "ws-3".to_string(),
             name: "agents".to_string(),
             cwd: default_cwd(),
@@ -2202,6 +2227,7 @@ mod tests {
             pane: "pane-1".to_string(),
         });
         session.workspaces.push(Workspace {
+            next_tab_seq: 0,
             id: "ws-2".to_string(),
             name: "agents".to_string(),
             cwd: default_cwd(),

@@ -378,6 +378,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// wins the timeout race and returns a proper response/error.
 const LONG_POLL_SLACK: Duration = Duration::from_secs(5);
 
+/// Read timeout for URL/browser fetch commands. The daemon runs curl with
+/// `--max-time 30`, so the client must wait past that (plus slack) or it fails
+/// with a spurious "daemon unresponsive" while the daemon fetch still succeeds.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30 + 5);
+
 /// Read timeout for a given request. Long-polling commands (`WaitPane`) run
 /// arbitrarily long on the daemon, so honour their own deadline instead of the
 /// default; a `None` deadline means wait indefinitely.
@@ -390,6 +395,15 @@ fn read_timeout_for(request: &Request) -> Option<Duration> {
         Request::WaitPane {
             timeout_ms: None, ..
         } => None,
+        // Browser/url fetches shell out to curl (--max-time 30) on the daemon;
+        // the client must outwait that deadline.
+        Request::UrlSnapshot { .. }
+        | Request::UrlLinks { .. }
+        | Request::UrlForms { .. }
+        | Request::UrlEvaluate { .. }
+        | Request::UrlConsole { .. }
+        | Request::UrlNetwork { .. }
+        | Request::OpenUrlLink { .. } => Some(FETCH_TIMEOUT),
         _ => Some(DEFAULT_TIMEOUT),
     }
 }
