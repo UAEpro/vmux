@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 
 use crate::cli::{BroadcastScope, SplitDirection};
 use crate::model::{
-    acknowledge_done_status, direction_axis, infer_agent_status, insert_pane_in_layout,
-    merge_agent_status, next_pane_in_layout, resize_layout, touch_agent_status, unix_time,
-    AgentStatus, ClipboardItem, DaemonInfo, EventRecord, ListeningPort, Notification, Pane,
-    PaneStatus, PaneTab, PullRequestInfo, Session, SurfaceKind,
+    acknowledge_done_status, decay_stale_busy, direction_axis, infer_agent_status,
+    insert_pane_in_layout, merge_agent_status, next_pane_in_layout, resize_layout,
+    touch_agent_status, unix_time, AgentStatus, ClipboardItem, DaemonInfo, EventRecord,
+    ListeningPort, Notification, Pane, PaneStatus, PaneTab, PullRequestInfo, Session, SurfaceKind,
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
@@ -238,6 +238,12 @@ fn cleanup_stale_runtime(session: &str) -> Result<()> {
 
 /// Maximum bytes of decoded terminal output retained per pane for scrollback.
 const SCROLLBACK_CAP: usize = 16_000;
+/// How often the idle-decay sweep runs.
+const DECAY_TICK_SECS: u64 = 4;
+/// An unpinned (heuristic) Busy spinner with no output for this long is demoted
+/// to Idle. Pinned (hook/CLI) Busy is exempt, so this does not affect a properly
+/// hook-driven agent that is thinking silently.
+const BUSY_IDLE_DECAY_SECS: u64 = 20;
 
 struct PaneRuntime {
     generation: u64,
@@ -476,6 +482,11 @@ impl Server {
             // Background update-availability check (Stage A: notify only).
             let server = Arc::clone(&self);
             thread::spawn(move || server.update_check_loop());
+        }
+        {
+            // Self-heal stale/false 🔄 spinners (unpinned Busy → Idle when quiet).
+            let server = Arc::clone(&self);
+            thread::spawn(move || server.agent_status_decay_loop());
         }
         if self.socket_path.exists() {
             fs::remove_file(&self.socket_path).ok();
@@ -1447,13 +1458,13 @@ impl Server {
         let killer = child.clone_killer();
         let master = pair.master;
         pane.status = PaneStatus::Running;
-        // Coding agents start as Busy (pinned) so the workspace sidebar shows
-        // 🔄 until a Stop hook/CLI marks Done, or the process exits.
-        if crate::model::is_coding_agent_command(&pane.command) {
-            touch_agent_status(pane, AgentStatus::Busy, true);
-        } else {
-            touch_agent_status(pane, infer_agent_status("", &pane.command), false);
-        }
+        // Do NOT pin Busy at launch: a freshly spawned agent is waiting for your
+        // first prompt, not working, and a pinned 🔄 would stick as a false
+        // spinner until a Stop hook or process exit. Start from inference
+        // (coding agent → Idle, else Unknown), unpinned. Real work drives Busy
+        // via hooks (pinned, authoritative) or output inference (which the idle
+        // decay self-heals once the pane goes quiet).
+        touch_agent_status(pane, infer_agent_status("", &pane.command), false);
         pane.exit_code = None;
         pane.pid = child_pid;
         pane.progress = None;
@@ -3437,6 +3448,36 @@ impl Server {
         loop {
             crate::update::refresh_if_stale();
             thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
+    /// Background thread: self-heal stale 🔄. Demotes any *unpinned* (heuristic)
+    /// Busy pane that has produced no output for `BUSY_IDLE_DECAY_SECS` back to
+    /// Idle. Pinned Busy (a real hook/CLI signal) is left alone, so a silently
+    /// thinking agent keeps its spinner. Sweeps both the runtime panes (so the
+    /// next output frame merges from Idle, not sticky Busy) and the session copy
+    /// (what the UI shows) — each judged by its own last-output time.
+    fn agent_status_decay_loop(self: Arc<Self>) {
+        loop {
+            thread::sleep(Duration::from_secs(DECAY_TICK_SECS));
+            let now = unix_time();
+            let mut changed = false;
+            {
+                let mut panes = self.panes.lock_or_recover();
+                for runtime in panes.values_mut() {
+                    changed |= decay_stale_busy(&mut runtime.pane, now, BUSY_IDLE_DECAY_SECS);
+                }
+            }
+            {
+                let mut session = self.session.lock_or_recover();
+                for pane in session.panes.values_mut() {
+                    changed |= decay_stale_busy(pane, now, BUSY_IDLE_DECAY_SECS);
+                }
+            }
+            if changed {
+                self.touch();
+                self.save().ok();
+            }
         }
     }
 

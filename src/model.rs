@@ -1184,14 +1184,13 @@ pub fn infer_agent_status(output: &str, command: &str) -> AgentStatus {
         {
             return AgentStatus::Attention;
         }
+        // Agent-specific activity phrases only. Generic words like "executing",
+        // "generating", "in progress", "streaming", and "working on" appear
+        // constantly in ordinary build/log output and produced false 🔄. A
+        // genuinely stuck heuristic Busy is also self-healed by decay_stale_busy.
         if haystack.contains("thinking")
             || haystack.contains("tool call")
             || haystack.contains("calling tool")
-            || haystack.contains("executing")
-            || haystack.contains("generating")
-            || haystack.contains("streaming")
-            || haystack.contains("in progress")
-            || haystack.contains("working on")
             || haystack.contains("running tool")
         {
             return AgentStatus::Busy;
@@ -1241,6 +1240,29 @@ pub fn touch_agent_status(pane: &mut Pane, status: AgentStatus, pinned: bool) {
     pane.agent_status = status;
     pane.agent_status_pinned = pinned;
     pane.agent_status_at = unix_time();
+}
+
+/// Self-heal a stale, *unpinned* Busy spinner. A heuristic (output-keyword)
+/// Busy that has seen no activity for `timeout_secs` is demoted, so a false or
+/// finished-but-unsignalled 🔄 clears itself instead of sticking forever.
+/// Pinned Busy is an authoritative hook/CLI signal (e.g. an agent thinking
+/// silently mid-turn) and is left untouched. `now`/`updated_at` are unix
+/// seconds; `updated_at` reflects the pane's last output. Returns true if the
+/// status changed.
+pub fn decay_stale_busy(pane: &mut Pane, now: u64, timeout_secs: u64) -> bool {
+    if !matches!(pane.agent_status, AgentStatus::Busy) || pane.agent_status_pinned {
+        return false;
+    }
+    if now.saturating_sub(pane.updated_at) < timeout_secs {
+        return false;
+    }
+    let demoted = if is_coding_agent_command(&pane.command) {
+        AgentStatus::Idle
+    } else {
+        AgentStatus::Unknown
+    };
+    touch_agent_status(pane, demoted, false);
+    true
 }
 
 pub fn merge_agent_status(
@@ -1904,6 +1926,44 @@ mod tests {
         assert_eq!(pane.agent_status, AgentStatus::Idle);
         assert!(!pane.agent_status_pinned);
         assert!(!acknowledge_done_status(&mut pane));
+    }
+
+    #[test]
+    fn decay_stale_busy_demotes_only_stale_unpinned() {
+        let mk = |cmd: &str| Pane::new("p1".into(), cmd.into(), SplitDirection::Right);
+
+        // Unpinned Busy, no output past the timeout → demote (coding agent → Idle).
+        let mut agent = mk("claude");
+        agent.agent_status = AgentStatus::Busy;
+        agent.agent_status_pinned = false;
+        agent.updated_at = 100;
+        assert!(decay_stale_busy(&mut agent, 100 + 30, 20));
+        assert_eq!(agent.agent_status, AgentStatus::Idle);
+        assert!(!agent.agent_status_pinned);
+
+        // Pinned Busy (hook / silent think) is authoritative → never decays.
+        let mut pinned = mk("claude");
+        pinned.agent_status = AgentStatus::Busy;
+        pinned.agent_status_pinned = true;
+        pinned.updated_at = 100;
+        assert!(!decay_stale_busy(&mut pinned, 100 + 9999, 20));
+        assert_eq!(pinned.agent_status, AgentStatus::Busy);
+
+        // Recent output → not yet.
+        let mut recent = mk("claude");
+        recent.agent_status = AgentStatus::Busy;
+        recent.agent_status_pinned = false;
+        recent.updated_at = 100;
+        assert!(!decay_stale_busy(&mut recent, 100 + 5, 20));
+        assert_eq!(recent.agent_status, AgentStatus::Busy);
+
+        // Non-agent command demotes to Unknown (no marker).
+        let mut shell = mk("bash");
+        shell.agent_status = AgentStatus::Busy;
+        shell.agent_status_pinned = false;
+        shell.updated_at = 0;
+        assert!(decay_stale_busy(&mut shell, 100, 20));
+        assert_eq!(shell.agent_status, AgentStatus::Unknown);
     }
 
     #[test]
