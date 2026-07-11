@@ -472,6 +472,11 @@ impl Server {
             let server = Arc::clone(&self);
             thread::spawn(move || server.save_loop());
         }
+        {
+            // Background update-availability check (Stage A: notify only).
+            let server = Arc::clone(&self);
+            thread::spawn(move || server.update_check_loop());
+        }
         if self.socket_path.exists() {
             fs::remove_file(&self.socket_path).ok();
         }
@@ -3420,6 +3425,18 @@ impl Server {
             log_path: self.log_path.display().to_string(),
             state_path: self.state_path.display().to_string(),
             started_at: self.started_at,
+            // Read from the cache the background thread keeps fresh (cheap).
+            update_available: crate::update::available_update(),
+        }
+    }
+
+    /// Background thread: keep the update-check cache fresh. `refresh_if_stale`
+    /// is a no-op until the TTL elapses and fails silently, so a cheap hourly
+    /// tick is enough to notice a new release within a day.
+    fn update_check_loop(self: Arc<Self>) {
+        loop {
+            crate::update::refresh_if_stale();
+            thread::sleep(Duration::from_secs(3600));
         }
     }
 

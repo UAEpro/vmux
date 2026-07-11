@@ -377,6 +377,9 @@ pub struct DaemonInfo {
     pub log_path: String,
     pub state_path: String,
     pub started_at: u64,
+    /// A newer published `vmux` version, if the background update check found one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_available: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,0 +1,56 @@
+name: Release
+
+# Cut a release by pushing a semver tag:  git tag v0.1.0 && git push origin v0.1.0
+# Builds a static (musl) x86_64 Linux binary, checksums it, and publishes a
+# GitHub Release. `releases/latest` is what `vmux`'s update notifier reads.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build + publish (x86_64 musl static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="vmux-${version}-x86_64-unknown-linux-musl"
+          mkdir -p "dist/${name}"
+          cp "target/x86_64-unknown-linux-musl/release/vmux" "dist/${name}/"
+          strip "dist/${name}/vmux" || true
+          cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
+          tar -C dist -czf "${name}.tar.gz" "${name}"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "tarball=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.tarball }}.sha256"

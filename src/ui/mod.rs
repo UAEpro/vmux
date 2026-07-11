@@ -55,7 +55,17 @@ pub fn attach(session: &str) -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend)?;
     let mut app = Ui::new(session.to_string(), terminal, config);
-    app.run()
+    let result = app.run();
+    // Restore the shell (drop the guard) before printing, so the notice lands on
+    // the normal screen after detach rather than being cleared by the alt-screen.
+    drop(_guard);
+    if let Some(version) = crate::update::available_update() {
+        eprintln!(
+            "vmux {version} is available (you have {}). See the project releases to update.",
+            crate::update::current_version()
+        );
+    }
+    result
 }
 
 /// RAII guard that owns the terminal's raw mode + alternate screen state. Its
@@ -7509,6 +7519,13 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
         .and_then(|workspace| workspace.zoomed_pane.as_deref())
     {
         base.push_str(&format!(" zoom:{} ", trim_label(zoomed, 16)));
+    }
+    if let Some(version) = snapshot
+        .daemon
+        .as_ref()
+        .and_then(|daemon| daemon.update_available.as_ref())
+    {
+        base.push_str(&format!(" ⬆ vmux {version} "));
     }
     match mode {
         UiMode::Panes => base,

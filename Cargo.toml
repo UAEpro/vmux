@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "The Linux terminal born from the cmux revolution — agent-first TTY multiplexer"
 license = "MIT"
+authors = ["Mayed Abdulla <UAEpro@live.com>"]
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "tui", "cli", "tmux"]
+categories = ["command-line-utilities", "development-tools"]
+repository = "https://github.com/UAEpro/vmux"
+homepage = "https://github.com/UAEpro/vmux"
 
 [dependencies]
 anyhow = "1"

@@ -129,6 +129,28 @@ vmux move left|right|up|down
 
 ---
 
+## Install
+
+**Prebuilt binary (Linux x86_64)** — a static musl build, no dependencies to compile:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/UAEpro/vmux/main/install.sh | sh
+```
+
+This installs `vmux` to `~/.local/bin` (override with `VMUX_INSTALL_DIR`) and
+verifies the release checksum. Runtime tools it shells out to: `curl` and `git`
+are recommended; `gh`, `ss`, and `tailscale` unlock optional features (PR info,
+port detection, the phone relay).
+
+**From source** (any platform with a Rust toolchain):
+
+```sh
+cargo install --git https://github.com/UAEpro/vmux
+```
+
+`vmux` checks for a newer release once a day and shows a notice; disable it with
+`VMUX_NO_UPDATE_CHECK=1`.
+
 ## Quick start
 
 ### Build

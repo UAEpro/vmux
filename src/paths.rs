@@ -108,6 +108,12 @@ pub fn state_path(session: &str) -> Result<PathBuf> {
     Ok(state_dir()?.join(format!("{session}.json")))
 }
 
+/// Cache for the background update check. Not session-scoped — the running
+/// version is global, so all sessions share one cache.
+pub fn update_cache_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("update-check.json"))
+}
+
 pub fn config_dir() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))

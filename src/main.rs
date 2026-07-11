@@ -8,6 +8,7 @@ mod paths;
 mod protocol;
 mod relay;
 mod ui;
+mod update;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Parser)]
 #[command(
     name = "vmux",
+    version,
     about = "vmux — the Linux terminal born from the cmux revolution"
 )]
 pub struct Cli {
