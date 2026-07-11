@@ -32,11 +32,12 @@ jobs:
       - name: Test
         run: cargo test --all-targets
         env:
-          # Isolated XDG so tests never touch the runner's real state.
+          # Isolated XDG so tests never touch the runner's real state. (Do NOT
+          # override HOME — rustup's toolchain lives under $HOME/.rustup, and
+          # pointing HOME elsewhere hides it: "no default toolchain configured".)
           XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
           XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
           XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
-          HOME: ${{ runner.temp }}/vmux-home
 
       - name: Restart persistence e2e
         run: cargo test --all-targets e2e_restart_preserves_scrollback -- --exact --nocapture
@@ -44,7 +45,6 @@ jobs:
           XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
           XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
           XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
-          HOME: ${{ runner.temp }}/vmux-home
 
       - name: Release build
         run: cargo build --release
