@@ -22,9 +22,11 @@ esac
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
 
-# Resolve the latest published release tag.
-tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep -m1 '"tag_name"' \
+# Resolve the latest published release tag. Capture the full response first so
+# the JSON parse can't SIGPIPE curl mid-write.
+api="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")" \
+  || fail "could not reach the GitHub releases API"
+tag="$(printf '%s' "$api" | grep '"tag_name"' | head -n1 \
   | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
 [ -n "$tag" ] || fail "could not find a published release yet"
 version="${tag#v}"
