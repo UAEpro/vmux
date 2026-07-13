@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # ratatui/crossterm are already several minors behind and must move together;
+  # the longer they drift the worse that bump gets. Group them so Dependabot
+  # proposes one coherent PR rather than two that each break the other.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      tui:
+        patterns:
+          - ratatui
+          - crossterm
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

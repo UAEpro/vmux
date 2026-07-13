@@ -426,7 +426,7 @@ impl WorkspaceTab {
     pub fn ensure_layout(&mut self) {
         self.panes.retain(|pane| !pane.is_empty());
         self.layout = normalize_layout(self.layout.take(), &self.panes);
-        // Reset dangling focus the same way as zoomed_pane (bugs.md P3#17).
+        // Reset dangling focus the same way as zoomed_pane.
         if self
             .active_pane
             .as_ref()
@@ -778,7 +778,7 @@ impl Workspace {
         }
         self.panes.retain(|pane| !pane.is_empty());
         self.layout = normalize_layout(self.layout.take(), &self.panes);
-        // Reset dangling focus the same way as zoomed_pane (bugs.md P3#17).
+        // Reset dangling focus the same way as zoomed_pane.
         if self
             .active_pane
             .as_ref()
@@ -1340,7 +1340,7 @@ pub fn merge_agent_status(
 /// Codex, Grok Build, Aider, Cursor, Gemini, etc.).
 ///
 /// Matches the **basename of the first token** only — avoids false positives
-/// like `git rebase --continue` or `ssh-agent bash` (improve.md P3).
+/// like `git rebase --continue` or `ssh-agent bash`.
 pub fn is_coding_agent_command(command: &str) -> bool {
     let mut tokens = command.split_whitespace();
     let Some(first) = tokens.next() else {

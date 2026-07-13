@@ -17,6 +17,7 @@ vmux config set ui.prefix_key Ctrl-a
 | `ui.sidebar_collapsed` | `true` / `false` | Start with a compact sidebar |
 | `ui.sidebar_width` | `28` | Width when expanded |
 | `ui.scroll_step` | `8` | Lines per scroll step |
+| `ui.scrollback_bytes` | `200000` | Output retained per pane, in bytes (~2500 lines). Clamped to 16 KB–5 MB. Takes effect on the next daemon start. |
 | `ui.theme` | see below | Color theme |
 | `ui.status_markers` | `emoji`, `ascii`, `off` | How agent status renders in the sidebar |
 | `ui.cursor` | set in the Settings panel | Cursor style and blink |

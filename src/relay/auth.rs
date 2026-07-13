@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 // ─── Registration / Tailscale auth ──────────────────────────────────────────
 
+#[derive(Debug)]
 pub(crate) enum RegisterError {
     Forbidden(String),
     Other(anyhow::Error),
@@ -17,7 +18,7 @@ pub(crate) fn register_device(
     headers: &HashMap<String, String>,
 ) -> std::result::Result<(String, String), RegisterError> {
     let bootstrap_ok = bootstrap_header_matches(state, headers);
-    // Policy (bugs.md P1#3): when bootstrap_secret is configured non-empty, it
+    // Policy: when bootstrap_secret is configured non-empty, it
     // is required for *every* registration path (whois, localhost, CGNAT).
     // Identity checks still run after the secret gate.
     let secret_required = state

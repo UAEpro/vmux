@@ -21,8 +21,13 @@ Cargo.lock.bak
 test.md
 *.log
 *.tmp
+bugs.md
+newimp.md
+port-forwarding-plan.md
+review-659a0c1.md
 
 # Env / secrets
 .env
 .env.*
 !.env.example
+improve.md

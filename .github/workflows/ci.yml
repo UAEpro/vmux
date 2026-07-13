@@ -53,14 +53,58 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # `--locked` everywhere: without it CI silently resolves newer semver-compatible
+      # deps than the ones the release job publishes with, so an upstream break
+      # surfaces at release time instead of on the PR that introduced it.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
 
+      # `--exact` matches the *full* test path, so the truncated name silently
+      # selected 0 tests and passed green. Keep the path complete, and make the
+      # step fail loudly if the filter ever stops matching again.
       - name: Restart persistence e2e
-        run: cargo test --all-targets e2e_restart_preserves_scrollback -- --exact --nocapture
+        run: |
+          cargo test --all-targets \
+            daemon::tests::e2e_restart_preserves_scrollback_across_save_reload \
+            -- --exact --nocapture 2>&1 | tee e2e.log
+          grep -q '^test result: ok. 1 passed' e2e.log \
+            || { echo "::error::persistence e2e selected no tests"; exit 1; }
 
       - name: Release build
-        run: cargo build --release
+        run: cargo build --release --locked
+
+  msrv:
+    name: msrv (${{ env.MSRV }})
+    runs-on: ubuntu-latest
+    env:
+      # Keep in sync with `rust-version` in Cargo.toml, which the README also
+      # advertises. CI otherwise runs on `stable`, so nothing caught a newer
+      # API sneaking in and breaking the MSRV we promise.
+      MSRV: "1.87"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against the advertised MSRV
+        run: cargo check --all-targets --locked
+
+  audit:
+    name: security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Fails the build on an actual advisory. Unmaintained/unsound *warnings*
+      # (currently 4, all in transitive deps of portable-pty) are reported but
+      # do not fail: they are not actionable from here, and a job that is red by
+      # default is a job people learn to ignore. Dependabot tracks the upgrades.
+      - name: Audit dependencies
+        run: cargo audit

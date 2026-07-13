@@ -485,7 +485,7 @@ fn rewrite_legacy_shell_source(path: &Path, legacy_line: &str, new_line: &str) -
 }
 
 pub(crate) fn append_source_once(path: &Path, source_line: &str) -> Result<()> {
-    // Only treat missing file as empty; fail closed on other I/O (bugs.md P1#4).
+    // Only treat missing file as empty; fail closed on other I/O.
     let existing = match fs::read(path) {
         Ok(bytes) => String::from_utf8(bytes).with_context(|| {
             format!(

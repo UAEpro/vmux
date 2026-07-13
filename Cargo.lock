@@ -1024,7 +1024,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "shell-words",
- "thiserror",
  "tungstenite",
  "unicode-width 0.1.14",
  "vt100",

@@ -10,7 +10,7 @@ pub(crate) fn validate_url(url: &str) -> Result<()> {
     // This is a local dev tool: opening localhost/private previews is a core use
     // case, so we deliberately do NOT block private or loopback hosts. We only
     // harden parsing: reject empty input, whitespace/control characters, an
-    // unsupported scheme, and a missing host (finding 15).
+    // unsupported scheme, and a missing host.
     if url.is_empty() {
         return Err(anyhow!("open-url requires a URL"));
     }
@@ -170,7 +170,7 @@ pub(crate) fn url_network(url: &str) -> Result<serde_json::Value> {
     }))
 }
 
-/// Hard cap on browser/fetch response bodies (bugs.md P1#8).
+/// Hard cap on browser/fetch response bodies.
 pub(crate) const FETCH_BODY_CAP: usize = 2 * 1024 * 1024;
 
 pub(crate) fn fetch_url_body(url: &str, label: &str) -> Result<String> {
