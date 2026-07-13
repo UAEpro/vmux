@@ -50,9 +50,14 @@ jobs:
     needs: guard
     runs-on: ubuntu-latest
     env:
-      XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
-      XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
-      XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
+      # Literal paths, NOT ${{ runner.temp }}: the `runner` context is not
+      # available in job-level `env:`, and using it there makes GitHub reject the
+      # whole workflow at load time — which is why every CI run before this
+      # commit was a startup failure that ran zero jobs. Runners are ephemeral,
+      # so a fixed /tmp path isolates the tests just as well.
+      XDG_RUNTIME_DIR: /tmp/vmux-xdg-runtime
+      XDG_CONFIG_HOME: /tmp/vmux-xdg-config
+      XDG_STATE_HOME: /tmp/vmux-xdg-state
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
