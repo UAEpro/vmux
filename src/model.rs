@@ -397,6 +397,9 @@ pub struct ClipboardItem {
 pub struct WorkspaceTab {
     pub id: String,
     pub title: String,
+    /// Set once the user renames this tab by hand; auto-titling then leaves it alone.
+    #[serde(default)]
+    pub title_locked: bool,
     #[serde(default)]
     pub panes: Vec<String>,
     #[serde(default)]
@@ -412,6 +415,7 @@ impl WorkspaceTab {
         Self {
             id: id.into(),
             title: title.into(),
+            title_locked: false,
             panes: Vec::new(),
             active_pane: None,
             zoomed_pane: None,
@@ -524,6 +528,7 @@ impl Workspace {
                 } else {
                     self.name.clone()
                 },
+                title_locked: false,
                 panes: std::mem::take(&mut self.panes),
                 active_pane: self.active_pane.take(),
                 zoomed_pane: self.zoomed_pane.take(),
@@ -740,17 +745,28 @@ impl Workspace {
         Ok((pane_ids, active))
     }
 
+    /// Rename a tab on the user's behalf. Pins the title so agent auto-titling
+    /// cannot overwrite a name the user chose.
     pub fn rename_tab(&mut self, tab_id: &str, title: String) -> Result<WorkspaceTab, String> {
         self.flush_active_tab();
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return Err(format!("unknown tab {tab_id}"));
         };
         tab.title = title;
-        let tab = tab.clone();
-        if self.active_tab.as_deref() == Some(tab_id) {
-            // nothing else on live view for title
+        tab.title_locked = true;
+        Ok(tab.clone())
+    }
+
+    /// Rename a tab from an agent-derived title. Returns the updated tab, or
+    /// `None` when the tab is missing, user-pinned, or already carries `title`.
+    pub fn auto_rename_tab(&mut self, tab_id: &str, title: &str) -> Option<WorkspaceTab> {
+        self.flush_active_tab();
+        let tab = self.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
+        if tab.title_locked || tab.title == title {
+            return None;
         }
-        Ok(tab)
+        tab.title = title.to_string();
+        Some(tab.clone())
     }
 
     pub fn ensure_layout(&mut self) {
@@ -1326,18 +1342,54 @@ pub fn merge_agent_status(
 /// Matches the **basename of the first token** only — avoids false positives
 /// like `git rebase --continue` or `ssh-agent bash` (improve.md P3).
 pub fn is_coding_agent_command(command: &str) -> bool {
-    let first = command
-        .split_whitespace()
-        .next()
+    let mut tokens = command.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if is_agent_binary(&token_basename(first)) {
+        return true;
+    }
+    // Agents installed through npm/pip run under an interpreter: the process is
+    // `node /usr/lib/node_modules/.../bin/claude`, where the first token names
+    // the interpreter and the script names the agent. Only the script argument
+    // is considered, so `node build.js --agent claude` cannot match.
+    if !is_agent_interpreter(&token_basename(first)) {
+        return false;
+    }
+    let Some(script) = tokens.find(|token| !token.starts_with('-')) else {
+        return false;
+    };
+    // The script itself may be the agent (`node .../bin/claude`), or an entry
+    // point inside the agent's package (`node .../claude-code/cli.js`), where the
+    // package directory is what carries the name.
+    is_agent_binary(&token_basename(script)) || is_agent_binary(&script_parent_name(script))
+}
+
+/// Name of the directory holding a script, unquoted and lowercased.
+fn script_parent_name(token: &str) -> String {
+    let token = token.trim_matches(|c| c == '\'' || c == '"');
+    std::path::Path::new(token)
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
         .unwrap_or("")
-        .trim_matches(|c| c == '\'' || c == '"');
-    let base = std::path::Path::new(first)
+        .to_ascii_lowercase()
+}
+
+/// Basename of one command-line token, unquoted and lowercased.
+fn token_basename(token: &str) -> String {
+    let token = token.trim_matches(|c| c == '\'' || c == '"');
+    std::path::Path::new(token)
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(first)
-        .to_ascii_lowercase();
+        .and_then(|name| name.to_str())
+        .unwrap_or(token)
+        .to_ascii_lowercase()
+}
+
+/// True when a binary name is a coding agent CLI.
+fn is_agent_binary(base: &str) -> bool {
     matches!(
-        base.as_str(),
+        base,
         "claude"
             | "codex"
             | "grok"
@@ -1355,6 +1407,105 @@ pub fn is_coding_agent_command(command: &str) -> bool {
     ) || base.starts_with("claude")
         || base.starts_with("codex")
         || base.starts_with("grok")
+}
+
+/// Interpreters an agent CLI is commonly launched through.
+fn is_agent_interpreter(base: &str) -> bool {
+    matches!(
+        base,
+        "node" | "nodejs" | "bun" | "deno" | "npx" | "python" | "python3" | "uv" | "uvx"
+    )
+}
+
+/// Longest auto-generated tab title, in characters.
+pub const AUTO_TITLE_MAX_CHARS: usize = 20;
+
+/// Words that carry no meaning in a two-word tab label.
+const TITLE_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "at", "be", "can", "could", "do", "does", "for", "from", "i", "in",
+    "into", "is", "it", "its", "let", "make", "me", "my", "of", "on", "onto", "or", "our", "out",
+    "please", "should", "some", "that", "the", "then", "this", "to", "up", "us", "we", "will",
+    "with", "would", "you", "your",
+];
+
+/// Titles an agent-run pane may emit that describe the tool, not the task.
+const TITLE_NOISE_WORDS: &[&str] = &[
+    "agent",
+    "aider",
+    "amp",
+    "assistant",
+    "bash",
+    "claude",
+    "code",
+    "codex",
+    "copilot",
+    "cursor",
+    "devin",
+    "gemini",
+    "goose",
+    "grok",
+    "opencode",
+    "session",
+    "sh",
+    "shell",
+    "terminal",
+    "zsh",
+];
+
+/// Condense a terminal title an agent set (OSC 0/2) into a one-or-two word tab
+/// name: `"✳ Fixing the parser bug"` → `"fixing parser"`.
+///
+/// Returns `None` for titles that describe the shell rather than a task
+/// (`user@host`, a bare path) or that hold nothing but the agent's own name —
+/// the caller then leaves the tab title alone (or asks an LLM instead).
+pub fn condense_agent_title(raw: &str) -> Option<String> {
+    let cleaned = raw.replace(|c: char| c.is_control(), " ");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Shell-style titles (`user@host:~/dir`, `~/code/vmux`) describe a location,
+    // not a task. A real task title can still mention a path, so only reject
+    // when the whole title looks like one.
+    if cleaned.contains('@') || cleaned.starts_with('/') || cleaned.starts_with('~') {
+        return None;
+    }
+    let words: Vec<String> = cleaned
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .map(|word| word.trim_matches(|c| c == '-' || c == '_'))
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_lowercase())
+        .collect();
+    // Percentages, step counters and spinner frames ("3/7") carry no meaning.
+    let meaningful: Vec<String> = words
+        .into_iter()
+        .filter(|word| !word.chars().all(|c| c.is_numeric()))
+        .filter(|word| !TITLE_NOISE_WORDS.contains(&word.as_str()))
+        .collect();
+    if meaningful.is_empty() {
+        return None;
+    }
+    let mut picked: Vec<&str> = meaningful
+        .iter()
+        .map(String::as_str)
+        .filter(|word| !TITLE_STOPWORDS.contains(word))
+        .take(2)
+        .collect();
+    // A title of nothing but stopwords is not worth a rename.
+    if picked.is_empty() {
+        return None;
+    }
+    // Keep the label short enough to read in a tab strip.
+    if picked.len() == 2
+        && picked[0].chars().count() + picked[1].chars().count() + 1 > AUTO_TITLE_MAX_CHARS
+    {
+        picked.truncate(1);
+    }
+    let mut title = picked.join(" ");
+    if title.chars().count() > AUTO_TITLE_MAX_CHARS {
+        title = title.chars().take(AUTO_TITLE_MAX_CHARS).collect();
+    }
+    Some(title)
 }
 
 pub fn direction_axis(direction: SplitDirection) -> SplitAxis {
@@ -1739,6 +1890,7 @@ mod tests {
             WorkspaceTab {
                 id: "tab-1".into(),
                 title: "main".into(),
+                title_locked: false,
                 panes: vec!["pane-1".into()],
                 active_pane: Some("pane-1".into()),
                 zoomed_pane: None,
@@ -1749,6 +1901,7 @@ mod tests {
             WorkspaceTab {
                 id: "tab-2".into(),
                 title: "bg".into(),
+                title_locked: false,
                 panes: vec!["pane-2".into()],
                 active_pane: Some("pane-2".into()),
                 zoomed_pane: None,
@@ -1979,6 +2132,66 @@ mod tests {
         assert!(is_coding_agent_command("aider --model gpt"));
         assert!(!is_coding_agent_command("bash"));
         assert!(!is_coding_agent_command("cargo test"));
+    }
+
+    #[test]
+    fn is_coding_agent_command_sees_through_interpreters() {
+        // How an npm-installed Claude Code actually appears in the process tree.
+        assert!(is_coding_agent_command(
+            "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        ));
+        assert!(is_coding_agent_command("node /home/me/.local/bin/claude"));
+        assert!(is_coding_agent_command("python3 /usr/bin/aider"));
+        // The interpreter alone, or an agent named only in a flag, is not enough.
+        assert!(!is_coding_agent_command("node"));
+        assert!(!is_coding_agent_command("node build.js --agent claude"));
+        assert!(!is_coding_agent_command("npm run claude"));
+    }
+
+    #[test]
+    fn condense_agent_title_keeps_one_or_two_meaningful_words() {
+        assert_eq!(
+            condense_agent_title("✳ Fixing the parser bug").as_deref(),
+            Some("fixing parser")
+        );
+        assert_eq!(
+            condense_agent_title("Claude Code — reviewing auth middleware").as_deref(),
+            Some("reviewing auth")
+        );
+        // Long pairs collapse to a single word rather than overflow the tab strip.
+        let title = condense_agent_title("investigating authentication regressions").unwrap();
+        assert_eq!(title, "investigating");
+        assert!(title.chars().count() <= AUTO_TITLE_MAX_CHARS);
+    }
+
+    #[test]
+    fn condense_agent_title_rejects_shell_and_agent_only_titles() {
+        // Shell prompt titles describe a location, not a task.
+        assert_eq!(condense_agent_title("mayed@host:~/code/vmux"), None);
+        assert_eq!(condense_agent_title("~/code/vmux"), None);
+        // Nothing but the agent's own name, spinner frames, or stopwords.
+        assert_eq!(condense_agent_title("claude"), None);
+        assert_eq!(condense_agent_title("codex 3/7"), None);
+        assert_eq!(condense_agent_title("  "), None);
+    }
+
+    #[test]
+    fn manual_rename_pins_the_title_against_auto_titling() {
+        let mut ws = Workspace::new("ws-1", "work");
+        let tab = ws.add_tab("main");
+        // Agent titles apply while the tab is unpinned.
+        assert_eq!(
+            ws.auto_rename_tab(&tab.id, "fixing parser")
+                .map(|tab| tab.title),
+            Some("fixing parser".to_string())
+        );
+        // Re-applying the same title is not a rename.
+        assert!(ws.auto_rename_tab(&tab.id, "fixing parser").is_none());
+        // Once the user renames by hand, the agent stops overriding it.
+        ws.rename_tab(&tab.id, "payments".to_string()).unwrap();
+        assert!(ws.auto_rename_tab(&tab.id, "fixing parser").is_none());
+        let renamed = ws.tabs.iter().find(|item| item.id == tab.id).unwrap();
+        assert_eq!(renamed.title, "payments");
     }
 
     #[test]

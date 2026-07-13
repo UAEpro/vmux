@@ -20,9 +20,32 @@ vmux config set ui.prefix_key Ctrl-a
 | `ui.theme` | see below | Color theme |
 | `ui.status_markers` | `emoji`, `ascii`, `off` | How agent status renders in the sidebar |
 | `ui.cursor` | set in the Settings panel | Cursor style and blink |
+| `agent_titles.enabled` | `true` / `false` | Name tabs after what the agent in them is doing |
+| `agent_titles.llm_fallback` | `true` / `false` | Ask a model to name tabs agents don't title themselves |
+| `agent_titles.llm_command` | `claude -p` | Headless command that reads a prompt and prints a title |
+| `agent_titles.llm_delay_ms` | `20000` | How long to wait for the agent's own title first |
 
 Relay keys (`relay.enabled`, `relay.bind`, `relay.allow_localhost`) are covered
 in [relay.md](relay.md).
+
+## Automatic tab names
+
+A tab holding a coding agent names itself after the work in it — `fixing parser`,
+`auth middleware` — so a row of tabs reads as a list of what is in flight.
+
+Agents that set a terminal title (Claude Code, Codex) are simply read: vmux takes
+the title, condenses it to one or two words, and keeps it current as the agent
+moves between tasks. Agents that set no title get named by `agent_titles.llm_command`,
+which is shown the pane's screen once the agent has been working for
+`agent_titles.llm_delay_ms` and asked for a label — one short call per pane, and
+only for a pane that is actually on a task. Set `agent_titles.llm_fallback` to
+`false` to keep tab naming entirely free.
+
+Renaming a tab yourself pins it: vmux will not rename it again.
+
+    vmux config set agent_titles.enabled false     # off entirely
+
+Changes take effect on the next daemon start (`vmux kill`, then attach).
 
 ## Themes
 

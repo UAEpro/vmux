@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use crate::cli::{BroadcastScope, SplitDirection};
 use crate::model::{
-    acknowledge_done_status, decay_stale_busy, direction_axis, infer_agent_status,
-    insert_pane_in_layout, merge_agent_status, next_pane_in_layout, resize_layout,
-    touch_agent_status, unix_time, AgentStatus, ClipboardItem, DaemonInfo, EventRecord,
-    ListeningPort, Notification, Pane, PaneStatus, PaneTab, PullRequestInfo, Session, SurfaceKind,
+    acknowledge_done_status, condense_agent_title, decay_stale_busy, direction_axis,
+    infer_agent_status, insert_pane_in_layout, is_coding_agent_command, merge_agent_status,
+    next_pane_in_layout, resize_layout, touch_agent_status, unix_time, AgentStatus, ClipboardItem,
+    DaemonInfo, EventRecord, ListeningPort, Notification, Pane, PaneStatus, PaneTab,
+    PullRequestInfo, Session, SurfaceKind,
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
@@ -277,6 +278,32 @@ struct PaneRuntime {
     // output_generation it was built from. `u64::MAX` forces the first build.
     scrollback_formatted_cache: String,
     scrollback_formatted_generation: u64,
+    // Auto tab titles (agent panes only). `auto_title` is the last title this
+    // pane pushed onto its tab, so an agent rewriting the same title does not
+    // re-rename. `llm_title_state` tracks the one-shot LLM fallback.
+    auto_title: Option<String>,
+    llm_title_state: LlmTitleState,
+    // When this pane's process started, used to time the LLM fallback out.
+    started_at: u64,
+    // Whether a coding agent is running *inside* this pane, and when that was
+    // last determined. A pane's command is normally the user's shell and the
+    // agent is a child of it, so this is answered from the process tree — and
+    // cached, because that walk must not run on every chunk of output.
+    agent_inside: bool,
+    agent_inside_at: u64,
+}
+
+/// How long a pane's "is an agent running in here" answer is trusted before the
+/// process tree is walked again.
+const AGENT_INSIDE_TTL_SECS: u64 = 5;
+
+/// One-shot lifecycle of the LLM tab-title fallback for a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmTitleState {
+    /// No title from the agent yet; still eligible for the fallback.
+    Pending,
+    /// A summarizer is running (or the pane got a title another way).
+    Done,
 }
 
 impl PaneRuntime {
@@ -385,6 +412,9 @@ struct Server {
     pane_size_owner: Mutex<Option<String>>,
     /// Wakes `wait` when a pane exits (instead of 50 ms polling only).
     exit_notify: (Mutex<()>, std::sync::Condvar),
+    /// Automatic agent tab naming. Read once at start: changing it takes effect
+    /// on the next daemon start (`vmux kill && vmux attach`).
+    agent_titles: crate::config::AgentTitleSettings,
     /// Session lock file fd held for the daemon lifetime (single-instance).
     #[cfg(unix)]
     _session_lock: Option<std::fs::File>,
@@ -468,6 +498,7 @@ impl Server {
             generation: std::sync::atomic::AtomicU64::new(1),
             pane_size_owner: Mutex::new(None),
             exit_notify: (Mutex::new(()), std::sync::Condvar::new()),
+            agent_titles: crate::config::load().unwrap_or_default().agent_titles,
             #[cfg(unix)]
             _session_lock: session_lock,
         })
@@ -1534,6 +1565,11 @@ impl Server {
                 output_generation: 0,
                 scrollback_formatted_cache: String::new(),
                 scrollback_formatted_generation: u64::MAX,
+                auto_title: None,
+                llm_title_state: LlmTitleState::Pending,
+                agent_inside: false,
+                agent_inside_at: 0,
+                started_at: unix_time(),
             },
         );
 
@@ -3039,10 +3075,16 @@ impl Server {
         }
     }
 
-    fn append_output(&self, runtime_key: &str, pane_id: &str, generation: u64, bytes: &[u8]) {
+    fn append_output(
+        self: &Arc<Self>,
+        runtime_key: &str,
+        pane_id: &str,
+        generation: u64,
+        bytes: &[u8],
+    ) {
         // Hot path: update the vt100 parser + light metadata only. Heavy screen
         // strings are materialized lazily in snapshot() (improve.md #36).
-        let Some((light, notifications)) = ({
+        let Some((light, notifications, auto_title, llm_screen)) = ({
             let mut panes = self.panes.lock_or_recover();
             let runtime = panes.get_mut(runtime_key);
             runtime.and_then(|runtime| {
@@ -3053,11 +3095,20 @@ impl Server {
                 runtime.output_generation = runtime.output_generation.wrapping_add(1);
                 let text = decode_utf8_stream(&mut runtime.pending, bytes);
                 runtime.osc_tail.push_str(&text);
-                let (notifications, retain_from) = scan_osc_notifications(&runtime.osc_tail);
+                let (osc, retain_from) = scan_osc_events(&runtime.osc_tail);
+                let notifications = osc.notifications;
                 if retain_from > 0 {
                     runtime.osc_tail.drain(..retain_from);
                 }
                 cap_osc_tail(&mut runtime.osc_tail);
+                // Name the tab after what the agent says it is doing. Whether a
+                // pane counts as an agent pane is decided inside, from the
+                // process tree — the pane command is just the shell.
+                let (auto_title, llm_screen) = if self.agent_titles.enabled {
+                    self.agent_title_update(runtime, osc.title)
+                } else {
+                    (None, None)
+                };
                 runtime.push_output(text.clone());
                 runtime.pane.updated_at = unix_time();
                 let inferred = infer_agent_status(&text, &runtime.pane.command);
@@ -3096,12 +3147,20 @@ impl Server {
                 runtime.pane.output_formatted = output_formatted;
                 runtime.pane.scrollback = scrollback;
                 runtime.pane.scrollback_formatted = scrollback_formatted;
-                Some((light, notifications))
+                Some((light, notifications, auto_title, llm_screen))
             })
         }) else {
             return;
         };
         self.touch();
+        // Both run outside the `panes` lock: renaming takes `session`, and the
+        // summarizer shells out to another process.
+        if let Some(title) = auto_title {
+            self.apply_auto_tab_title(pane_id, &title);
+        }
+        if let Some(screen) = llm_screen {
+            self.spawn_llm_tab_title(pane_id.to_string(), screen);
+        }
         let mut should_save = false;
         {
             let mut session = self.session.lock_or_recover();
@@ -3162,6 +3221,126 @@ impl Server {
         if should_save {
             self.schedule_save();
         }
+    }
+
+    /// Fold a fresh terminal title into a pane's auto-title state.
+    ///
+    /// Returns the title to put on the tab (when it changed) and, when the agent
+    /// has gone `llm_delay_ms` without ever setting a usable title, the screen
+    /// text to hand the summarizer. Caller must hold the `panes` lock.
+    fn agent_title_update(
+        &self,
+        runtime: &mut PaneRuntime,
+        osc_title: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        // Condense first: it is pure string work, and it rejects the titles a
+        // plain shell sets (`~/code/vmux`, `user@host`) without touching /proc.
+        if let Some(condensed) = osc_title.as_deref().and_then(condense_agent_title) {
+            if !self.pane_runs_agent(runtime) {
+                return (None, None);
+            }
+            // The agent names its own tab; the summarizer is not needed.
+            runtime.llm_title_state = LlmTitleState::Done;
+            if runtime.auto_title.as_deref() == Some(condensed.as_str()) {
+                return (None, None);
+            }
+            runtime.auto_title = Some(condensed.clone());
+            return (Some(condensed), None);
+        }
+        if runtime.llm_title_state != LlmTitleState::Pending || !self.agent_titles.llm_fallback {
+            return (None, None);
+        }
+        // Only name a pane that is actually on a task. An agent parked at its
+        // banner has nothing to name, and summarizing it would spend a model
+        // call to produce a title about nothing.
+        if !matches!(
+            runtime.pane.agent_status,
+            AgentStatus::Busy | AgentStatus::Attention
+        ) {
+            return (None, None);
+        }
+        let elapsed_ms = unix_time()
+            .saturating_sub(runtime.started_at)
+            .saturating_mul(1000);
+        if elapsed_ms < self.agent_titles.llm_delay_ms {
+            return (None, None);
+        }
+        if !self.pane_runs_agent(runtime) {
+            return (None, None);
+        }
+        // One shot per pane: mark Done before the call so a slow summarizer
+        // cannot be started twice by the next chunk of output.
+        runtime.llm_title_state = LlmTitleState::Done;
+        let screen = runtime.parser.screen().contents();
+        if screen.trim().is_empty() {
+            return (None, None);
+        }
+        (None, Some(screen))
+    }
+
+    /// Whether a coding agent is running in this pane — as the pane command
+    /// (`vmux new-pane --command claude`) or, far more commonly, as a process
+    /// the user started inside the pane's shell.
+    ///
+    /// The process-tree walk is cached for `AGENT_INSIDE_TTL_SECS`: it is only
+    /// reached when a pane emits a title worth acting on or is due for the
+    /// summarizer, but a shell that retitles on every prompt would otherwise
+    /// walk /proc on every command.
+    fn pane_runs_agent(&self, runtime: &mut PaneRuntime) -> bool {
+        if is_coding_agent_command(&runtime.pane.command) {
+            return true;
+        }
+        let Some(pid) = runtime.pane.pid else {
+            return false;
+        };
+        let now = unix_time();
+        if now.saturating_sub(runtime.agent_inside_at) < AGENT_INSIDE_TTL_SECS
+            && runtime.agent_inside_at != 0
+        {
+            return runtime.agent_inside;
+        }
+        runtime.agent_inside = agent_running_in_pane(pid);
+        runtime.agent_inside_at = now;
+        runtime.agent_inside
+    }
+
+    /// Put an agent-derived title on the tab owning `pane_id`. Tabs the user has
+    /// renamed by hand are left alone (`WorkspaceTab::title_locked`).
+    fn apply_auto_tab_title(&self, pane_id: &str, title: &str) {
+        let renamed = {
+            let mut session = self.session.lock_or_recover();
+            let Some(location) = session.find_pane_location(pane_id) else {
+                return;
+            };
+            let Some(tab_id) = location.tab_id else {
+                return;
+            };
+            let Some(workspace) = session
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == location.workspace_id)
+            else {
+                return;
+            };
+            workspace.auto_rename_tab(&tab_id, title).is_some()
+        };
+        if renamed {
+            self.schedule_save();
+        }
+    }
+
+    /// Ask the configured headless agent to name a tab from what is on screen.
+    /// Runs detached: a slow or missing summarizer must never stall a PTY reader.
+    fn spawn_llm_tab_title(self: &Arc<Self>, pane_id: String, screen: String) {
+        let server = Arc::clone(self);
+        let command = self.agent_titles.llm_command.clone();
+        thread::spawn(move || match llm_tab_title(&command, &screen) {
+            Ok(Some(title)) => server.apply_auto_tab_title(&pane_id, &title),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("vmux: agent tab title via `{command}` failed: {err}");
+            }
+        });
     }
 
     fn schedule_save(&self) {
@@ -4278,6 +4457,32 @@ fn descendant_pids(roots: &[u32]) -> BTreeSet<u32> {
     owned
 }
 
+/// True when a coding agent is running inside the pane rooted at `pid`.
+///
+/// The pane's own command is almost always the user's shell — you open a pane
+/// and *then* type `claude` — so the agent shows up as a descendant process, not
+/// as the pane command. Walks the pane's process tree and matches each command
+/// line, which also catches agents launched through an interpreter
+/// (`node .../bin/claude`).
+fn agent_running_in_pane(pid: u32) -> bool {
+    descendant_pids(&[pid])
+        .into_iter()
+        .filter(|child| *child != pid)
+        .any(|child| {
+            // `comm` is the kernel's name for the process, which names the agent
+            // even when it is a wrapper script (`~/bin/claude` → comm `claude`).
+            let comm = fs::read_to_string(format!("/proc/{child}/comm")).unwrap_or_default();
+            if is_coding_agent_command(comm.trim()) {
+                return true;
+            }
+            // `cmdline` catches agents run through an interpreter, where comm is
+            // just `node` (`node .../claude-code/cli.js`). It is NUL-separated.
+            let cmdline = fs::read(format!("/proc/{child}/cmdline")).unwrap_or_default();
+            let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            is_coding_agent_command(cmdline.trim())
+        })
+}
+
 fn proc_stat_ppid(stat: &str) -> Option<u32> {
     let rest = stat.rsplit_once(") ")?.1;
     let mut fields = rest.split_whitespace();
@@ -4381,16 +4586,26 @@ fn decode_utf8_stream(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
     }
 }
 
-/// Scan `buf` for OSC notification sequences. Returns the extracted messages
-/// and the byte offset from which `buf` should be retained: the start of a
-/// trailing unterminated OSC sequence (so it can be completed by a later read),
-/// or `buf.len()` when everything up to the end was consumed.
-fn scan_osc_notifications(buf: &str) -> (Vec<String>, usize) {
-    let mut messages = Vec::new();
+/// Everything the OSC scanner pulls out of one read.
+#[derive(Debug, Default)]
+struct OscEvents {
+    /// Desktop notifications (OSC 9 / 99 / 777).
+    notifications: Vec<String>,
+    /// The window title the program last set (OSC 0 / 2). Only the final one in
+    /// a read matters — agents rewrite the title as they work.
+    title: Option<String>,
+}
+
+/// Scan `buf` for the OSC sequences vmux acts on. Returns the events and the
+/// byte offset from which `buf` should be retained: the start of a trailing
+/// unterminated OSC sequence (so it can be completed by a later read), or
+/// `buf.len()` when everything up to the end was consumed.
+fn scan_osc_events(buf: &str) -> (OscEvents, usize) {
+    let mut events = OscEvents::default();
     let mut idx = 0;
     loop {
         let Some(rel) = buf[idx..].find("\x1b]") else {
-            return (messages, buf.len());
+            return (events, buf.len());
         };
         let start = idx + rel;
         let after = start + 2;
@@ -4404,10 +4619,13 @@ fn scan_osc_notifications(buf: &str) -> (Vec<String>, usize) {
         };
         let Some(end) = end else {
             // Unterminated OSC sequence; retain it for the next read.
-            return (messages, start);
+            return (events, start);
         };
-        if let Some(message) = osc_notification_message(&buf[after..after + end]) {
-            messages.push(message);
+        let payload = &buf[after..after + end];
+        if let Some(message) = osc_notification_message(payload) {
+            events.notifications.push(message);
+        } else if let Some(title) = osc_window_title(payload) {
+            events.title = Some(title);
         }
         idx = if st == Some(end) {
             after + end + 2
@@ -4415,6 +4633,100 @@ fn scan_osc_notifications(buf: &str) -> (Vec<String>, usize) {
             after + end + 1
         };
     }
+}
+
+/// How long the tab-title summarizer may run before it is killed.
+const LLM_TITLE_TIMEOUT_SECS: u64 = 30;
+/// How much of the agent's screen the summarizer is shown.
+const LLM_TITLE_CONTEXT_CHARS: usize = 2000;
+
+/// Build the summarizer prompt from the tail of an agent's screen.
+fn llm_tab_title_prompt(screen: &str) -> String {
+    let screen = screen.trim();
+    // The tail is where the current task is; the top of the screen is banner.
+    let start = screen
+        .char_indices()
+        .nth(
+            screen
+                .chars()
+                .count()
+                .saturating_sub(LLM_TITLE_CONTEXT_CHARS),
+        )
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let context = &screen[start..];
+    format!(
+        "Below is the current screen of a coding agent working in a terminal.\n\
+         Reply with a one or two word lowercase label naming the task it is working on \
+         — the kind of name you would give a tab. Reply with the words only: no \
+         punctuation, no quotes, no explanation.\n\n\
+         SCREEN:\n{context}"
+    )
+}
+
+/// Run the configured summarizer over `screen` and condense its answer into a
+/// tab title. `Ok(None)` when it declines to answer or answers with nothing
+/// usable — the tab then simply keeps its current name.
+fn llm_tab_title(command: &str, screen: &str) -> Result<Option<String>> {
+    let argv = shell_words::split(command)
+        .with_context(|| format!("invalid agent_titles.llm_command: {command}"))?;
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("agent_titles.llm_command is empty"))?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {program}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // Dropped right after, which closes the pipe so the agent sees EOF.
+        stdin
+            .write_all(llm_tab_title_prompt(screen).as_bytes())
+            .ok();
+    }
+    // A summarizer that never exits would otherwise leak this thread forever.
+    let pid = child.id() as i32;
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = Arc::clone(&finished);
+    thread::spawn(move || {
+        for _ in 0..LLM_TITLE_TIMEOUT_SECS * 10 {
+            thread::sleep(Duration::from_millis(100));
+            if watchdog.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    });
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("run {program}"))?;
+    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Agents sometimes preface the answer; the label is the last non-empty line.
+    let answer = stdout.lines().rev().find(|line| !line.trim().is_empty());
+    Ok(answer.and_then(condense_agent_title))
+}
+
+/// Window title from `OSC 0` (icon + title) or `OSC 2` (title). `OSC 1` sets the
+/// icon name only and is ignored.
+fn osc_window_title(payload: &str) -> Option<String> {
+    let rest = payload
+        .strip_prefix("0;")
+        .or_else(|| payload.strip_prefix("2;"))?;
+    let title = rest.trim();
+    if title.is_empty() {
+        return None;
+    }
+    // Bound what an untrusted PTY can hand us before it reaches the condenser.
+    Some(title.chars().take(256).collect())
 }
 
 /// Bound the retained OSC tail so a stray, never-terminated `ESC ]` cannot grow
@@ -4432,7 +4744,12 @@ fn cap_osc_tail(tail: &mut String) {
 
 #[cfg(test)]
 fn osc_notifications(text: &str) -> Vec<String> {
-    scan_osc_notifications(text).0
+    scan_osc_events(text).0.notifications
+}
+
+#[cfg(test)]
+fn osc_title(text: &str) -> Option<String> {
+    scan_osc_events(text).0.title
 }
 
 fn osc_notification_message(payload: &str) -> Option<String> {
@@ -5223,17 +5540,58 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
     }
 
     #[test]
+    fn osc_title_reads_window_title_sequences() {
+        // OSC 2 (title) and OSC 0 (icon + title), both terminators.
+        assert_eq!(
+            osc_title("\x1b]2;✳ Fixing the parser bug\x07"),
+            Some("✳ Fixing the parser bug".to_string())
+        );
+        assert_eq!(
+            osc_title("\x1b]0;reviewing auth\x1b\\"),
+            Some("reviewing auth".to_string())
+        );
+        // The last title in a read wins: agents rewrite it as they work.
+        assert_eq!(
+            osc_title("\x1b]2;first\x07output\x1b]2;second\x07"),
+            Some("second".to_string())
+        );
+        // OSC 1 sets the icon name only, and a notification is not a title.
+        assert_eq!(osc_title("\x1b]1;icon\x07"), None);
+        assert_eq!(osc_title("\x1b]9;needs input\x07"), None);
+        assert_eq!(osc_title("plain output"), None);
+    }
+
+    #[test]
+    fn osc_title_and_notification_survive_the_same_read() {
+        let (events, _) = scan_osc_events("\x1b]2;fixing parser\x07\x1b]9;needs input\x07");
+        assert_eq!(events.title.as_deref(), Some("fixing parser"));
+        assert_eq!(events.notifications, vec!["needs input".to_string()]);
+    }
+
+    #[test]
+    fn llm_tab_title_condenses_the_summarizer_answer() {
+        // `cat` stands in for the summarizer: it echoes the prompt back, whose
+        // last line is the screen tail — proving the answer is condensed, and
+        // that a summarizer printing prose cannot blow out the tab strip.
+        let title = llm_tab_title("cat", "agent is Refactoring the OSC parser").unwrap();
+        assert_eq!(title.as_deref(), Some("refactoring osc"));
+        // A summarizer that fails or is missing leaves the tab title alone.
+        assert_eq!(llm_tab_title("false", "screen").unwrap(), None);
+        assert!(llm_tab_title("vmux-no-such-summarizer-binary", "screen").is_err());
+    }
+
+    #[test]
     fn scan_osc_notifications_detects_sequences_split_across_reads() {
         let mut tail = String::new();
         tail.push_str("before\x1b]9;needs ");
-        let (messages, retain_from) = scan_osc_notifications(&tail);
-        assert!(messages.is_empty());
+        let (events, retain_from) = scan_osc_events(&tail);
+        assert!(events.notifications.is_empty());
         // Retain from the unterminated OSC start.
         assert_eq!(&tail[retain_from..], "\x1b]9;needs ");
         tail.drain(..retain_from);
         tail.push_str("input\x07done");
-        let (messages, retain_from) = scan_osc_notifications(&tail);
-        assert_eq!(messages, vec!["needs input".to_string()]);
+        let (events, retain_from) = scan_osc_events(&tail);
+        assert_eq!(events.notifications, vec!["needs input".to_string()]);
         assert_eq!(retain_from, tail.len());
     }
 
@@ -5406,6 +5764,11 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 output_generation: 1,
                 scrollback_formatted_cache: String::new(),
                 scrollback_formatted_generation: u64::MAX,
+                auto_title: None,
+                llm_title_state: LlmTitleState::Pending,
+                agent_inside: false,
+                agent_inside_at: 0,
+                started_at: unix_time(),
             };
             runtime.parser.process(b"hello-persist-marker\r\n");
             runtime.push_output("hello-persist-marker\n".into());
@@ -5487,6 +5850,11 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                     output_generation: 1,
                     scrollback_formatted_cache: String::new(),
                     scrollback_formatted_generation: u64::MAX,
+                    auto_title: None,
+                    llm_title_state: LlmTitleState::Pending,
+                    agent_inside: false,
+                    agent_inside_at: 0,
+                    started_at: unix_time(),
                 };
                 runtime.pane.status = PaneStatus::Running;
                 runtime.push_output(format!("{marker}\n"));

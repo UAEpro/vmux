@@ -12,6 +12,40 @@ pub struct LmuxConfig {
     /// Opt-in mobile / Cmux Remote relay (started on attach when enabled).
     #[serde(default)]
     pub relay: RelaySettings,
+    /// Name tabs after what the coding agent running in them is doing.
+    #[serde(default)]
+    pub agent_titles: AgentTitleSettings,
+}
+
+/// Automatic tab naming for panes running a coding agent.
+///
+/// The daemon reads the title the agent sets on the terminal (OSC 0/2) and
+/// condenses it to one or two words. Agents that never set a title fall back to
+/// `llm_command`, which is asked to name the session from what is on screen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentTitleSettings {
+    /// Master switch. Off leaves every tab title exactly as the user set it.
+    pub enabled: bool,
+    /// Ask `llm_command` to name the tab when the agent sets no terminal title.
+    /// Costs one short model call per pane; the OSC path is free.
+    pub llm_fallback: bool,
+    /// Headless command that reads a prompt on stdin and prints a short title.
+    pub llm_command: String,
+    /// How long an agent pane may run without a usable title before falling
+    /// back to `llm_command`.
+    pub llm_delay_ms: u64,
+}
+
+impl Default for AgentTitleSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            llm_fallback: true,
+            llm_command: "claude -p".to_string(),
+            llm_delay_ms: 20_000,
+        }
+    }
 }
 
 /// Mobile relay preferences (settings UI + `vmux config set relay.*`).
@@ -285,6 +319,24 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
         }
         "relay.allow_tailnet_cgnat" => {
             config.relay.allow_tailnet_cgnat = parse_bool(value)?;
+        }
+        "agent_titles.enabled" => {
+            config.agent_titles.enabled = parse_bool(value)?;
+        }
+        "agent_titles.llm_fallback" => {
+            config.agent_titles.llm_fallback = parse_bool(value)?;
+        }
+        "agent_titles.llm_command" => {
+            let command = value.trim();
+            shell_words::split(command).with_context(|| {
+                format!("agent_titles.llm_command is not a valid command: {command}")
+            })?;
+            config.agent_titles.llm_command = command.to_string();
+        }
+        "agent_titles.llm_delay_ms" => {
+            config.agent_titles.llm_delay_ms = value
+                .parse::<u64>()
+                .map_err(|_| anyhow!("agent_titles.llm_delay_ms must be an integer"))?;
         }
         other => return Err(anyhow!("unknown config key {other}")),
     }
