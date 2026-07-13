@@ -1806,7 +1806,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
         }
         "surface.focus" => {
             let surface = req_str(params, "surface_id")?;
-            call(socket, &Request::FocusPane { pane: surface })?;
+            focus_surface(socket, &surface)?;
             Ok(json!({}))
         }
         "surface.send_text" => {
@@ -1971,8 +1971,20 @@ fn workspace_list(socket: &Path) -> Result<Value> {
 
 fn workspace_attention_status(snapshot: &Value, ws: &Value) -> Option<String> {
     let panes = snapshot.get("panes")?.as_object()?;
-    let pane_ids = ws.get("panes")?.as_array()?;
-    for pid in pane_ids {
+    // workspace.panes mirrors only the ACTIVE tab; an agent on another tab
+    // must still be able to summon a human, so scan every tab's panes.
+    let mut pane_ids: Vec<Value> = Vec::new();
+    if let Some(tabs) = ws.get("tabs").and_then(|t| t.as_array()) {
+        for tab in tabs {
+            if let Some(arr) = tab.get("panes").and_then(|p| p.as_array()) {
+                pane_ids.extend(arr.iter().cloned());
+            }
+        }
+    }
+    if pane_ids.is_empty() {
+        pane_ids = ws.get("panes")?.as_array()?.clone();
+    }
+    for pid in &pane_ids {
         let id = pid.as_str()?;
         if let Some(p) = panes.get(id) {
             let status = p.get("agent_status").and_then(|v| v.as_str()).unwrap_or("");
@@ -2099,6 +2111,53 @@ fn surface_list(socket: &Path, workspace_id: &str) -> Result<Value> {
         surfaces.push(surface);
     }
     Ok(json!({ "surfaces": surfaces, "workspace_id": workspace_id }))
+}
+
+/// Focus a pane wherever it lives: FocusPane only accepts panes on the active
+/// tab (workspace.panes mirrors just that tab), so find the pane's tab and
+/// switch to it first. Tapping a pane on the phone means "show me this pane",
+/// which is a tab switch anyway.
+fn focus_surface(socket: &Path, surface: &str) -> Result<()> {
+    let resp = call(socket, &Request::List)?;
+    let data = resp.data.unwrap_or(Value::Null);
+    if let Some(workspaces) = data.get("workspaces").and_then(|v| v.as_array()) {
+        'search: for ws in workspaces {
+            let Some(tabs) = ws.get("tabs").and_then(|t| t.as_array()) else {
+                continue;
+            };
+            for tab in tabs {
+                let holds_pane = tab
+                    .get("panes")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| arr.iter().any(|p| p.as_str() == Some(surface)))
+                    .unwrap_or(false);
+                if !holds_pane {
+                    continue;
+                }
+                let ws_id = ws.get("id").and_then(|i| i.as_str()).map(String::from);
+                let active_tab = ws.get("active_tab").and_then(|v| v.as_str());
+                if let Some(tab_id) = tab.get("id").and_then(|i| i.as_str()) {
+                    if active_tab != Some(tab_id) {
+                        call(
+                            socket,
+                            &Request::SwitchTab {
+                                workspace: ws_id,
+                                tab: tab_id.to_string(),
+                            },
+                        )?;
+                    }
+                }
+                break 'search;
+            }
+        }
+    }
+    call(
+        socket,
+        &Request::FocusPane {
+            pane: surface.to_string(),
+        },
+    )?;
+    Ok(())
 }
 
 fn surface_create(socket: &Path, workspace_id: &str) -> Result<Value> {
