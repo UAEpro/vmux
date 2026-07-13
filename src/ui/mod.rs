@@ -3537,12 +3537,15 @@ impl Ui {
             return Ok(());
         }
         let result = self.rpc(&Request::SetClipboard {
-            text,
+            text: text.clone(),
             source_pane: Some(selection.pane),
             source: "selection".to_string(),
         });
         if result.is_ok() {
             self.selection = None;
+            // The session clipboard only feeds `vmux paste`; users expect a
+            // selection to land in the system clipboard too.
+            copy_to_system_clipboard(&text);
         } else if let Err(err) = result {
             self.selection = None;
             self.set_action_error(format!("selection copy failed: {err:#}"));
@@ -7201,6 +7204,84 @@ fn tail_lines(text: &str, height: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// Best-effort copy into the system clipboard. Two channels, both silent on
+/// failure (the session clipboard for `vmux paste` is already set by the
+/// caller):
+/// - OSC 52 to the host terminal — also works over SSH; some terminals gate
+///   or cap it, so it is skipped for oversized payloads.
+/// - A local clipboard tool when one exists (covers terminals without OSC 52).
+fn copy_to_system_clipboard(text: &str) {
+    // xterm rejects OSC 52 payloads over ~74 KiB encoded; stay well under.
+    const OSC52_MAX_BYTES: usize = 48 * 1024;
+    if !text.is_empty() && text.len() <= OSC52_MAX_BYTES {
+        let _ = write!(
+            io::stdout(),
+            "\x1b]52;c;{}\x07",
+            base64_encode(text.as_bytes())
+        );
+        let _ = io::stdout().flush();
+    }
+    // Prefer the tool matching the running display server; every candidate
+    // forks/exits quickly after reading stdin, so the wait cannot stall the UI.
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let candidates: &[(&str, &[&str])] = if wayland {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard", "-in"]),
+            ("xsel", &["--input", "--clipboard"]),
+            ("pbcopy", &[]),
+        ]
+    } else {
+        &[
+            ("xclip", &["-selection", "clipboard", "-in"]),
+            ("xsel", &["--input", "--clipboard"]),
+            ("wl-copy", &[]),
+            ("pbcopy", &[]),
+        ]
+    };
+    for (cmd, args) in candidates {
+        let spawned = std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            continue; // tool not installed
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return;
+    }
+}
+
+/// Standard (padded) base64, used for the OSC 52 clipboard payload. Inline to
+/// avoid a dependency for one call site.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(TABLE[(n >> 18 & 63) as usize] as char);
+        out.push(TABLE[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -9659,6 +9740,18 @@ mod tests {
         assert!(collapsed.contains("  *2"));
         assert!(!collapsed.contains("agents"));
         assert!(!collapsed.contains("@feature"));
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"hello vmux"), "aGVsbG8gdm11eA==");
     }
 
     #[test]
