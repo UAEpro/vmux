@@ -214,6 +214,9 @@ struct Ui {
     last_snapshot_data: Option<serde_json::Value>,
     /// Daemon snapshot generation — sent as Snapshot.since for unchanged short-circuit.
     snapshot_generation: Option<u64>,
+    /// Scrolled panes sent with the last lean snapshot request; when the set
+    /// changes, `since` is dropped so the daemon sends the new scrollback.
+    last_scrollback_request: Vec<String>,
     /// Set by any state-changing RPC (via `rpc()`) so the run loop refreshes
     /// immediately instead of waiting for the periodic tick. This covers
     /// keystroke echo latency as well as pane/workspace creation and layout
@@ -1069,6 +1072,7 @@ impl Ui {
             sidebar_scroll: 0,
             sidebar_active_seen: None,
             last_snapshot_data: None,
+            last_scrollback_request: Vec::new(),
             snapshot_generation: None,
             pending_refresh: std::cell::Cell::new(false),
             last_typing_at: None,
@@ -1087,6 +1091,11 @@ impl Ui {
         let started = Instant::now();
         let mut last_blink_phase = 0u8;
         let mut was_typing_solid = false;
+        // One extra refresh scheduled shortly after an Input RPC: the PTY echo
+        // lands a few ms after the write, so the refresh fired immediately
+        // after sending usually misses it and the character would otherwise
+        // wait for the next periodic tick.
+        let mut followup_refresh_at: Option<Instant> = None;
         loop {
             // Active-pane cursor: solid while typing; otherwise blink at configured rate.
             // Inactive panes never show a caret.
@@ -1118,6 +1127,27 @@ impl Ui {
             if self.should_flush_input_batch() {
                 self.flush_input_batch()?;
                 dirty = true;
+            }
+
+            // Input sent outside the event branch (idle-window flush) still
+            // needs a prompt refresh + echo follow-up rather than the tick.
+            if self.pending_refresh.get() {
+                self.pending_refresh.set(false);
+                if self.refresh()? {
+                    dirty = true;
+                }
+                last_refresh = Instant::now();
+                followup_refresh_at = Some(Instant::now() + Duration::from_millis(15));
+            }
+            if followup_refresh_at
+                .map(|at| at <= Instant::now())
+                .unwrap_or(false)
+            {
+                followup_refresh_at = None;
+                if self.refresh()? {
+                    dirty = true;
+                }
+                last_refresh = Instant::now();
             }
 
             // Adaptive poll: faster while typing/active, slower when idle (newimp §6).
@@ -1216,8 +1246,13 @@ impl Ui {
                 dirty = false;
             }
 
-            // While keystrokes are buffering, wake sooner so the 8 ms batch flushes.
-            let poll_ms = if self.input_batch.is_empty() { 50 } else { 8 };
+            // While keystrokes are buffering (or an echo follow-up is due),
+            // wake sooner so the 8 ms batch / 15 ms follow-up fires on time.
+            let poll_ms = if !self.input_batch.is_empty() || followup_refresh_at.is_some() {
+                8
+            } else {
+                50
+            };
             // Block for the first event (so the loop still ticks for the
             // periodic refresh), then drain everything already queued and draw
             // at most once. Exit promptly if any event requests quit.
@@ -1249,6 +1284,10 @@ impl Ui {
                         dirty = true;
                     }
                     last_refresh = Instant::now();
+                    // This refresh usually races the PTY echo — poll once more
+                    // in ~15 ms so the typed character shows without waiting
+                    // for the periodic tick.
+                    followup_refresh_at = Some(Instant::now() + Duration::from_millis(15));
                 }
             }
         }
@@ -1260,13 +1299,26 @@ impl Ui {
     /// Uses Snapshot.since generation short-circuit when the daemon reports
     /// unchanged (improve.md #35).
     fn refresh(&mut self) -> Result<bool> {
+        // Lean poll: skip event history and scrollback strings except for
+        // panes the user is currently scrolled back in.
+        let scrollback_panes: Vec<String> = self.scroll_offsets.keys().cloned().collect();
+        // A newly scrolled pane needs scrollback strings that the daemon's
+        // `unchanged` short-circuit would skip — force a full response.
+        let since = if scrollback_panes == self.last_scrollback_request {
+            self.snapshot_generation
+        } else {
+            None
+        };
         let response = protocol::request(
             &paths::socket_path(&self.session)?,
             &Request::Snapshot {
-                since: self.snapshot_generation,
+                since,
                 full: true,
+                lean: true,
+                scrollback_panes: scrollback_panes.clone(),
             },
         )?;
+        self.last_scrollback_request = scrollback_panes;
         if let Some(data) = response.data {
             if data
                 .get("unchanged")
@@ -1293,7 +1345,10 @@ impl Ui {
                 }
                 return Ok(false);
             }
-            self.snapshot = Some(serde_json::from_value(session_val.clone())?);
+            // Deserialize by reference — cloning the full Value tree per poll
+            // is measurable at typing-refresh rates.
+            self.snapshot = Some(Session::deserialize(&session_val)?);
+            invalidate_pane_line_cache();
             self.last_snapshot_data = Some(session_val);
             if let Some(g) = gen {
                 self.snapshot_generation = Some(g);
@@ -1573,14 +1628,18 @@ impl Ui {
                         // Don't scroll panes under overlays or confirm/rename modals.
                     } else {
                         let _ = tw;
-                        self.pane_size_control_requested = true;
                         if self.scroll_sidebar(mouse.column, -1) {
-                        } else if !self.forward_mouse_to_pane(
+                        } else if self.forward_mouse_to_pane(
                             mouse.column,
                             mouse.row,
                             MouseButtonCode::WheelUp,
                             true,
                         )? {
+                            // Wheel reached the app itself — real interaction,
+                            // so claiming size control is warranted. Plain
+                            // history scrolling must stay RPC-free per tick.
+                            self.pane_size_control_requested = true;
+                        } else {
                             self.scroll_at(mouse.column, mouse.row, self.scroll_step as isize)?
                         }
                     }
@@ -1603,14 +1662,17 @@ impl Ui {
                         self.control_bar_scroll = (self.control_bar_scroll + 1).min(max);
                     } else if !matches!(self.mode, UiMode::Panes) || self.modal_active() {
                     } else {
-                        self.pane_size_control_requested = true;
                         if self.scroll_sidebar(mouse.column, 1) {
-                        } else if !self.forward_mouse_to_pane(
+                        } else if self.forward_mouse_to_pane(
                             mouse.column,
                             mouse.row,
                             MouseButtonCode::WheelDown,
                             true,
                         )? {
+                            // See ScrollUp: only app-forwarded wheel claims
+                            // size control; history scrolling is RPC-free.
+                            self.pane_size_control_requested = true;
+                        } else {
                             self.scroll_at(mouse.column, mouse.row, -(self.scroll_step as isize))?
                         }
                     }
@@ -2891,6 +2953,7 @@ impl Ui {
         if let Some(pane) = self.active_pane() {
             let max = self.max_scroll_for_pane(&pane);
             adjust_scroll(&mut self.scroll_offsets, &pane, delta, max);
+            self.ensure_scrollback_loaded(&pane);
         }
     }
 
@@ -3410,8 +3473,27 @@ impl Ui {
         if let Some(pane) = self.pane_at_position(column, row)? {
             let max = self.max_scroll_for_pane(&pane);
             adjust_scroll(&mut self.scroll_offsets, &pane, delta, max);
+            self.ensure_scrollback_loaded(&pane);
         }
         Ok(())
+    }
+
+    /// Lean snapshots omit scrollback strings for unscrolled panes; once a
+    /// pane becomes scrolled, request a refresh so the next poll (which lists
+    /// the pane in `scrollback_panes`) delivers its history before drawing.
+    fn ensure_scrollback_loaded(&self, pane_id: &str) {
+        if !self.scroll_offsets.contains_key(pane_id) {
+            return;
+        }
+        let missing = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.panes.get(pane_id))
+            .map(|pane| pane.scrollback.is_empty() && pane.scrollback_formatted.is_empty())
+            .unwrap_or(false);
+        if missing {
+            self.pending_refresh.set(true);
+        }
     }
 
     fn start_selection(&mut self, pane: &str, column: u16, row: u16) -> Result<()> {
@@ -3455,12 +3537,15 @@ impl Ui {
             return Ok(());
         }
         let result = self.rpc(&Request::SetClipboard {
-            text,
+            text: text.clone(),
             source_pane: Some(selection.pane),
             source: "selection".to_string(),
         });
         if result.is_ok() {
             self.selection = None;
+            // The session clipboard only feeds `vmux paste`; users expect a
+            // selection to land in the system clipboard too.
+            copy_to_system_clipboard(&text);
         } else if let Err(err) = result {
             self.selection = None;
             self.set_action_error(format!("selection copy failed: {err:#}"));
@@ -6448,12 +6533,20 @@ fn draw_pane_controls(
 /// Zero when content fits entirely in the view.
 fn max_pane_scroll_offset(pane: &crate::model::Pane, view_height: usize) -> usize {
     let height = view_height.max(1);
-    let scrollback_lines = strip_ansi(&pane.scrollback).lines().count();
-    let content_lines = if scrollback_lines > 0 {
-        scrollback_lines
-    } else {
-        // Short panes may only have live output populated.
-        strip_ansi(&pane.output).lines().count()
+    let content_lines = match pane.scrollback_lines {
+        // Lean snapshots carry the count so the (omitted) scrollback text
+        // never needs scanning here.
+        Some(lines) if lines > 0 => lines,
+        Some(_) => strip_ansi(&pane.output).lines().count(),
+        None => {
+            let scrollback_lines = strip_ansi(&pane.scrollback).lines().count();
+            if scrollback_lines > 0 {
+                scrollback_lines
+            } else {
+                // Short panes may only have live output populated.
+                strip_ansi(&pane.output).lines().count()
+            }
+        }
     };
     content_lines.saturating_sub(height)
 }
@@ -6520,17 +6613,29 @@ fn scrollback_formatted_for_view(
     lines[start..end].join("\n")
 }
 
-fn pane_lines_for_view(
+thread_local! {
+    /// Parsed pane content keyed by (pane id, view height, scroll offset).
+    /// ANSI parsing is pure per snapshot, so blink-, hover-, and scroll-driven
+    /// redraws between refreshes reuse the parsed lines instead of re-scanning
+    /// the pane text every frame. Cleared by [`invalidate_pane_line_cache`]
+    /// whenever a new snapshot lands. Selection highlight and the cursor
+    /// marker are applied after lookup, so they never enter the cache.
+    static PANE_LINE_CACHE: std::cell::RefCell<BTreeMap<(String, usize, usize), Vec<Line<'static>>>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+fn invalidate_pane_line_cache() {
+    PANE_LINE_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// Pure (cacheable) part of [`pane_lines_for_view`]: parse the pane text for
+/// the given view window into styled lines.
+fn parse_pane_lines(
     pane: &crate::model::Pane,
-    height: usize,
+    view_height: usize,
     scroll_offset: usize,
-    selection: Option<&TextSelection>,
-    content_area: Rect,
-    palette: ThemePalette,
-    cursor_blink_on: bool,
 ) -> Vec<Line<'static>> {
-    let view_height = height.max(1);
-    let mut lines = if scroll_offset == 0 && !pane.output_formatted.is_empty() {
+    if scroll_offset == 0 && !pane.output_formatted.is_empty() {
         ansi_to_lines(&tail_lines(&pane.output_formatted, view_height))
     } else if scroll_offset > 0 && !pane.scrollback_formatted.is_empty() {
         // Scrolled view with styled history available: slice the same
@@ -6546,7 +6651,31 @@ fn pane_lines_for_view(
             .lines()
             .map(|line| Line::from(line.to_string()))
             .collect()
-    };
+    }
+}
+
+fn pane_lines_for_view(
+    pane: &crate::model::Pane,
+    height: usize,
+    scroll_offset: usize,
+    selection: Option<&TextSelection>,
+    content_area: Rect,
+    palette: ThemePalette,
+    cursor_blink_on: bool,
+) -> Vec<Line<'static>> {
+    let view_height = height.max(1);
+    let key = (pane.id.clone(), view_height, scroll_offset);
+    let mut lines = PANE_LINE_CACHE.with(|cache| {
+        let cached = cache.borrow().get(&key).cloned();
+        match cached {
+            Some(hit) => hit,
+            None => {
+                let parsed = parse_pane_lines(pane, view_height, scroll_offset);
+                cache.borrow_mut().insert(key, parsed.clone());
+                parsed
+            }
+        }
+    });
     if let Some(selection) = selection.filter(|_| scroll_offset == 0) {
         lines = highlight_selection_lines(lines, selection, content_area, palette);
     }
@@ -7073,6 +7202,84 @@ fn tail_lines(text: &str, height: usize) -> String {
     let lines = text.lines().collect::<Vec<_>>();
     let start = lines.len().saturating_sub(height);
     lines[start..].join("\n")
+}
+
+/// Best-effort copy into the system clipboard. Two channels, both silent on
+/// failure (the session clipboard for `vmux paste` is already set by the
+/// caller):
+/// - OSC 52 to the host terminal — also works over SSH; some terminals gate
+///   or cap it, so it is skipped for oversized payloads.
+/// - A local clipboard tool when one exists (covers terminals without OSC 52).
+fn copy_to_system_clipboard(text: &str) {
+    // xterm rejects OSC 52 payloads over ~74 KiB encoded; stay well under.
+    const OSC52_MAX_BYTES: usize = 48 * 1024;
+    if !text.is_empty() && text.len() <= OSC52_MAX_BYTES {
+        let _ = write!(
+            io::stdout(),
+            "\x1b]52;c;{}\x07",
+            base64_encode(text.as_bytes())
+        );
+        let _ = io::stdout().flush();
+    }
+    // Prefer the tool matching the running display server; every candidate
+    // forks/exits quickly after reading stdin, so the wait cannot stall the UI.
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let candidates: &[(&str, &[&str])] = if wayland {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard", "-in"]),
+            ("xsel", &["--input", "--clipboard"]),
+            ("pbcopy", &[]),
+        ]
+    } else {
+        &[
+            ("xclip", &["-selection", "clipboard", "-in"]),
+            ("xsel", &["--input", "--clipboard"]),
+            ("wl-copy", &[]),
+            ("pbcopy", &[]),
+        ]
+    };
+    for (cmd, args) in candidates {
+        let spawned = std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            continue; // tool not installed
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return;
+    }
+}
+
+/// Standard (padded) base64, used for the OSC 52 clipboard payload. Inline to
+/// avoid a dependency for one call site.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(TABLE[(n >> 18 & 63) as usize] as char);
+        out.push(TABLE[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 fn strip_ansi(text: &str) -> String {
@@ -9533,6 +9740,18 @@ mod tests {
         assert!(collapsed.contains("  *2"));
         assert!(!collapsed.contains("agents"));
         assert!(!collapsed.contains("@feature"));
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"hello vmux"), "aGVsbG8gdm11eA==");
     }
 
     #[test]

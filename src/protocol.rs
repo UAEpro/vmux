@@ -17,12 +17,21 @@ pub enum Request {
     /// Fetch session snapshot.
     /// - `since`: if equal to the daemon generation, returns `{unchanged:true,generation}` only.
     /// - `full`: when false, omits heavy per-pane scrollback strings (layout/status poll).
+    /// - `lean`: attach-UI poll — omits `events` and per-pane/tab scrollback
+    ///   strings (except panes listed in `scrollback_panes`) while still
+    ///   including live screen contents and `scrollback_lines` counts.
     Snapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<u64>,
         /// Default true for backward-compatible full payloads.
         #[serde(default = "default_true")]
         full: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        lean: bool,
+        /// Panes whose scrollback strings must be included even when `lean`
+        /// (the client is scrolled back in them).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scrollback_panes: Vec<String>,
     },
     List,
     Agents,
@@ -413,6 +422,8 @@ pub fn snapshot_full() -> Request {
     Request::Snapshot {
         since: None,
         full: true,
+        lean: false,
+        scrollback_panes: Vec::new(),
     }
 }
 
@@ -475,16 +486,28 @@ mod tests {
         let with_since = serde_json::to_string(&Request::Snapshot {
             since: Some(7),
             full: false,
+            lean: false,
+            scrollback_panes: Vec::new(),
         })
         .unwrap();
         assert!(with_since.contains(r#""since":7"#));
         assert!(with_since.contains(r#""full":false"#));
+        // Lean fields stay off the wire unless set (old daemons keep working).
+        assert!(!with_since.contains("lean"));
+        assert!(!with_since.contains("scrollback_panes"));
         // Legacy clients sending bare {"action":"snapshot"} still decode.
         let bare: Request = serde_json::from_str(r#"{"action":"snapshot"}"#).unwrap();
         match bare {
-            Request::Snapshot { since, full } => {
+            Request::Snapshot {
+                since,
+                full,
+                lean,
+                scrollback_panes,
+            } => {
                 assert!(since.is_none());
                 assert!(full);
+                assert!(!lean);
+                assert!(scrollback_panes.is_empty());
             }
             _ => panic!("expected Snapshot"),
         }

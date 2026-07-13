@@ -308,6 +308,20 @@ fn push_bounded_output(output: &mut VecDeque<String>, output_bytes: &mut usize, 
     }
 }
 
+/// Line count (as `str::lines` reports it) of the retained output chunks,
+/// without joining them into one allocation. ANSI escapes never contain
+/// newlines, so this matches counting the stripped text.
+fn chunked_line_count(output: &VecDeque<String>) -> usize {
+    let newlines: usize = output
+        .iter()
+        .map(|chunk| chunk.bytes().filter(|b| *b == b'\n').count())
+        .sum();
+    match output.iter().rev().find(|chunk| !chunk.is_empty()) {
+        None => 0,
+        Some(last) => newlines + usize::from(!last.ends_with('\n')),
+    }
+}
+
 /// Cached per-workspace metadata populated by a background thread so the
 /// snapshot hot path never spawns git/gh/ss subprocesses.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -623,7 +637,12 @@ impl Server {
             Request::Ping => Ok(Response::ok(
                 serde_json::json!({ "session": self.session_name, "daemon": self.daemon_info() }),
             )),
-            Request::Snapshot { since, full } => {
+            Request::Snapshot {
+                since,
+                full,
+                lean,
+                scrollback_panes,
+            } => {
                 let gen = self.generation();
                 if since == Some(gen) {
                     return Ok(Response::ok(serde_json::json!({
@@ -631,7 +650,12 @@ impl Server {
                         "generation": gen,
                     })));
                 }
-                let session = self.snapshot(full)?;
+                let session = if lean {
+                    let keep: BTreeSet<String> = scrollback_panes.into_iter().collect();
+                    self.snapshot_opts(full, Some(&keep))?
+                } else {
+                    self.snapshot(full)?
+                };
                 Ok(Response::ok(serde_json::json!({
                     "generation": gen,
                     "session": session,
@@ -3240,6 +3264,19 @@ impl Server {
     }
 
     fn snapshot(&self, include_output: bool) -> Result<Session> {
+        self.snapshot_opts(include_output, None)
+    }
+
+    /// `lean_scrollback: Some(keep)` enables the attach-UI lean payload:
+    /// `events` and per-pane/tab scrollback strings are stripped (except for
+    /// panes in `keep`, which the client is scrolled back in) and every pane
+    /// carries `scrollback_lines` so the client can clamp scrolling. Lean
+    /// snapshots never feed persistence — `save()` always uses `full`.
+    fn snapshot_opts(
+        &self,
+        include_output: bool,
+        lean_scrollback: Option<&BTreeSet<String>>,
+    ) -> Result<Session> {
         let mut session = self.session.lock_or_recover().clone();
         session.daemon = Some(self.daemon_info());
 
@@ -3289,27 +3326,39 @@ impl Server {
                         pane.screen_rows = Some(screen_rows);
                         pane.screen_cols = Some(screen_cols);
                         update_pane_terminal_modes(&mut pane, runtime.parser.screen());
-                        // Rebuild styled scrollback only when output changed.
-                        if runtime.scrollback_formatted_generation != runtime.output_generation {
-                            runtime.scrollback_formatted_cache = screen_scrollback_formatted(
-                                &mut runtime.parser,
-                                SCROLLBACK_FORMATTED_ROW_CAP,
-                            );
-                            runtime.scrollback_formatted_generation = runtime.output_generation;
+                        let lean_skip = lean_scrollback
+                            .map(|keep| !keep.contains(&pane.id))
+                            .unwrap_or(false);
+                        if lean_skip {
+                            // Lean poll: the client only needs the live screen
+                            // plus a line count for scroll clamping — skip the
+                            // joined-output copy and styled-scrollback rebuild.
+                            pane.scrollback_lines = Some(chunked_line_count(&runtime.output));
+                            Some((contents, formatted, String::new(), String::new()))
+                        } else {
+                            // Rebuild styled scrollback only when output changed.
+                            if runtime.scrollback_formatted_generation != runtime.output_generation
+                            {
+                                runtime.scrollback_formatted_cache = screen_scrollback_formatted(
+                                    &mut runtime.parser,
+                                    SCROLLBACK_FORMATTED_ROW_CAP,
+                                );
+                                runtime.scrollback_formatted_generation = runtime.output_generation;
+                            }
+                            // Also keep plain scrollback string in runtime for persist/save.
+                            let raw = runtime.joined_output();
+                            runtime.pane.scrollback = trim_output(raw.clone(), SCROLLBACK_CAP);
+                            runtime.pane.output = contents.clone();
+                            runtime.pane.output_formatted = formatted.clone();
+                            runtime.pane.scrollback_formatted =
+                                runtime.scrollback_formatted_cache.clone();
+                            Some((
+                                contents,
+                                formatted,
+                                raw,
+                                runtime.scrollback_formatted_cache.clone(),
+                            ))
                         }
-                        // Also keep plain scrollback string in runtime for persist/save.
-                        let raw = runtime.joined_output();
-                        runtime.pane.scrollback = trim_output(raw.clone(), SCROLLBACK_CAP);
-                        runtime.pane.output = contents.clone();
-                        runtime.pane.output_formatted = formatted.clone();
-                        runtime.pane.scrollback_formatted =
-                            runtime.scrollback_formatted_cache.clone();
-                        Some((
-                            contents,
-                            formatted,
-                            raw,
-                            runtime.scrollback_formatted_cache.clone(),
-                        ))
                     } else {
                         // Light snapshot: cursor/status only, no heavy strings.
                         let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
@@ -3362,6 +3411,30 @@ impl Server {
                 }
             } else {
                 session.panes.insert(pane.id.clone(), pane);
+            }
+        }
+        if let Some(keep) = lean_scrollback {
+            // Event history has its own RPC (Request::Events); the attach UI
+            // never reads it from snapshots, and it dominates payload size.
+            session.events.clear();
+            for pane in session.panes.values_mut() {
+                // Panes that skipped the runtime fast path (scrolled, dead, or
+                // tab-synced) still need a line count for scroll clamping.
+                if pane.scrollback_lines.is_none() {
+                    pane.scrollback_lines = Some(pane.scrollback.lines().count());
+                }
+                if !keep.contains(&pane.id) {
+                    pane.scrollback.clear();
+                    pane.scrollback_formatted.clear();
+                }
+                // Tab content strings are never rendered by the attach UI (the
+                // active tab's content is mirrored into the pane fields).
+                for tab in &mut pane.tabs {
+                    tab.output.clear();
+                    tab.output_formatted.clear();
+                    tab.scrollback.clear();
+                    tab.scrollback_formatted.clear();
+                }
             }
         }
         Ok(session)
@@ -5438,7 +5511,18 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
 
         // Phase 2: cold start from disk (lock re-acquired after drop).
         {
-            let server = Server::load(&session_name).unwrap();
+            // Concurrent tests that spawn PTY children can briefly inherit
+            // this session's flock fd (flock lives until every duplicated fd
+            // closes), so the re-acquire may need a few retries under a
+            // parallel test run.
+            let server = (0..50)
+                .find_map(|attempt| {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Server::load(&session_name).ok()
+                })
+                .expect("re-acquire session lock after drop");
             let loaded = server.session.lock_or_recover();
             let pane = loaded.panes.get("pane-1").expect("pane after reload");
             assert!(

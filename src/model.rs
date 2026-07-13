@@ -979,6 +979,10 @@ pub struct Pane {
     pub scrollback: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub scrollback_formatted: String,
+    /// Line count of `scrollback`, present in lean snapshots so the client can
+    /// clamp scrolling without receiving (or scanning) the scrollback text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback_lines: Option<usize>,
 }
 
 impl Pane {
@@ -1022,6 +1026,7 @@ impl Pane {
             screen_cols: None,
             scrollback: String::new(),
             scrollback_formatted: String::new(),
+            scrollback_lines: None,
         }
     }
 }
