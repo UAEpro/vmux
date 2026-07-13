@@ -129,6 +129,33 @@ vmux notify --pane pane-1 --status done --message "tests passed"
 printf '\033]9;needs input\a'          # or just an OSC escape
 ```
 
+## Pasting screenshots over SSH
+
+Claude Code's Ctrl+V image paste reads the clipboard of the machine it runs
+on. When you SSH into a box running vmux, your screenshot is on your laptop,
+so Claude says "No image found on clipboard". `vmux send-image` bridges that:
+it saves image bytes on the host and types the file path into a pane, which
+Claude Code picks up as an attachment.
+
+From your laptop, one command sends the clipboard image straight into the
+active pane on the server:
+
+```sh
+# macOS (brew install pngpaste)
+pngpaste - | ssh yourbox vmux send-image -
+
+# Linux, Wayland
+wl-paste --type image/png | ssh yourbox vmux send-image -
+
+# Linux, X11
+xclip -selection clipboard -t image/png -o | ssh yourbox vmux send-image -
+```
+
+Add a shell alias (`alias shot='pngpaste - | ssh yourbox vmux send-image -'`)
+and pasting a screenshot becomes: take screenshot, type `shot`, press Enter in
+Claude. `--pane pane-2` targets a specific pane, `--enter` submits
+immediately, and a plain file works too: `vmux send-image shot.png`.
+
 ## Docs
 
 - [CLI reference](docs/cli.md), or `vmux --help`
