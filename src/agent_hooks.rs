@@ -167,9 +167,17 @@ pub fn grok_skill_path(home: &Path) -> PathBuf {
 }
 
 fn config_home(home: &Path) -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
+    // Honor $XDG_CONFIG_HOME only for the *real* home. An explicit `home`
+    // (the `_in(home)` test seams) must stay self-contained: consulting the
+    // global env there let one ambient XDG_CONFIG_HOME — like the one CI sets
+    // for every job — alias the shell-hook path across otherwise isolated
+    // homes, so parallel tests raced each other through one shared hooks.sh.
+    if home == home_dir() {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg);
+        }
+    }
+    home.join(".config")
 }
 
 /// Status for every supported coding-agent integration.
@@ -850,6 +858,18 @@ mod tests {
         assert!(!root["hooks"]["Stop"].as_array().unwrap().is_empty());
         assert!(group_has_vmux_hook(&root["hooks"]["Stop"][0]));
 
+        fs::remove_dir_all(home).ok();
+    }
+
+    /// An explicit home must be fully self-contained. When this consulted the
+    /// global $XDG_CONFIG_HOME (as CI sets), every test's shell-hook path
+    /// aliased to one shared file and the install/not-detected tests flaked
+    /// against each other — Ubuntu CI red on an interleaving, macOS green.
+    #[test]
+    fn explicit_home_ignores_ambient_xdg_config_home() {
+        let home = temp_home();
+        assert_eq!(config_home(&home), home.join(".config"));
+        assert!(shell_hooks_path(&home).starts_with(&home));
         fs::remove_dir_all(home).ok();
     }
 
