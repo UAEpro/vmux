@@ -98,7 +98,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Audit dependencies for known advisories
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Fails the build on an actual advisory. Unmaintained/unsound *warnings*
+      # (currently 4, all in transitive deps of portable-pty) are reported but
+      # do not fail: they are not actionable from here, and a job that is red by
+      # default is a job people learn to ignore. Dependabot tracks the upgrades.
+      - name: Audit dependencies
+        run: cargo audit
