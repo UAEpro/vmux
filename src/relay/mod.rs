@@ -1818,6 +1818,79 @@ fn read_surface_screen(
     })
 }
 
+/// Replay a pane's raw output ring through a fresh vt100 parser and return
+/// the history rows that have scrolled off the top of the live screen,
+/// oldest first. The raw ring contains the pane's original escape stream, so
+/// with `ansi` the rows come back coloured — even when the daemon serving the
+/// ring predates colour support (the replay happens here, in the relay).
+///
+/// The ring is byte-capped, so its start may land mid-escape; vt100 discards
+/// partial sequences, costing at most one garbled leading row.
+fn replay_scrollback(raw: &str, rows: u16, cols: u16, lines: usize, ansi: bool) -> Vec<String> {
+    let mut parser = vt100::Parser::new(rows.max(1), cols.max(1), lines);
+    parser.process(raw.as_bytes());
+
+    // set_scrollback clamps to what is actually retained, which is how we
+    // learn how much history exists.
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let available = parser.screen().scrollback();
+
+    let mut out = Vec::with_capacity(available);
+    // Offset N puts the N-th line above the live screen at visible row 0.
+    for offset in (1..=available).rev() {
+        parser.screen_mut().set_scrollback(offset);
+        let row = if ansi {
+            crate::daemon::row_contents_ansi(parser.screen(), 0)
+        } else {
+            let mut plain = String::new();
+            let (_, c) = parser.screen().size();
+            for col in 0..c {
+                let Some(cell) = parser.screen().cell(0, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    plain.push(' ');
+                } else {
+                    plain.push_str(contents);
+                }
+            }
+            plain
+        };
+        out.push(row.trim_end().to_string());
+    }
+    out
+}
+
+/// `surface.scrollback` — the pane history above the live screen.
+fn surface_scrollback(socket: &Path, surface: &str, lines: usize, ansi: bool) -> Result<Value> {
+    let resp = call(
+        socket,
+        &Request::ReadScreen {
+            pane: Some(surface.to_string()),
+            scrollback: true,
+            limit_bytes: Some(512_000),
+            ansi: false,
+        },
+    )?;
+    let data = resp.data.unwrap_or(Value::Null);
+    let raw = data
+        .get("scrollback")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cols = data.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+    let rows_n = data.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+    let history = replay_scrollback(raw, rows_n, cols, lines, ansi);
+    Ok(json!({
+        "surface_id": surface,
+        "count": history.len(),
+        "rows": history,
+    }))
+}
+
 fn pane_cursor_from_read(data: &Value) -> Option<(i64, i64)> {
     let col = data.get("cursor_col")?.as_u64()? as i64;
     let row = data.get("cursor_row")?.as_u64()? as i64;
@@ -1936,6 +2009,19 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                 },
             )?;
             Ok(json!({}))
+        }
+        "surface.scrollback" => {
+            let surface = req_str(params, "surface_id")?;
+            let lines = params
+                .get("lines")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(500)
+                .clamp(1, 2000) as usize;
+            let ansi = params
+                .get("ansi")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            surface_scrollback(socket, &surface, lines, ansi)
         }
         "surface.read_text" => {
             let surface = req_str(params, "surface_id")?;
@@ -2483,6 +2569,62 @@ fn port_of(listen: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_scrollback_returns_history_above_the_screen_oldest_first() {
+        // 30 numbered lines into a 5-row screen: 25 scroll off the top.
+        let mut raw = String::new();
+        for i in 1..=30 {
+            raw.push_str(&format!("line-{i}\r\n"));
+        }
+        let history = replay_scrollback(&raw, 5, 20, 100, false);
+        assert!(!history.is_empty(), "no history came back");
+        assert_eq!(history.first().map(String::as_str), Some("line-1"));
+        // The live screen's contents must NOT be in the history.
+        assert!(
+            !history.iter().any(|r| r == "line-30"),
+            "history leaked the live screen"
+        );
+        // Contiguous, ordered.
+        // The trailing newline parks the cursor on a fresh row, so the screen
+        // holds lines 27-30 plus the cursor row — 26 lines are history.
+        assert_eq!(history.last().map(String::as_str), Some("line-26"));
+        assert_eq!(history.len(), 26);
+    }
+
+    #[test]
+    fn replay_scrollback_preserves_colour_when_asked() {
+        let raw = format!(
+            "{}coloured-history\r\n{}",
+            "\x1b[31m",
+            "filler\r\n".repeat(10)
+        );
+        let history = replay_scrollback(&raw, 3, 30, 100, true);
+        let hit = history
+            .iter()
+            .find(|r| r.contains("coloured-history"))
+            .expect("history line missing");
+        assert!(hit.contains("\x1b[0;31m"), "colour lost: {hit:?}");
+        // And plain mode strips it.
+        let plain = replay_scrollback(&raw, 3, 30, 100, false);
+        let hit = plain
+            .iter()
+            .find(|r| r.contains("coloured-history"))
+            .expect("history line missing");
+        assert!(!hit.contains('\x1b'), "plain mode leaked escapes: {hit:?}");
+    }
+
+    #[test]
+    fn replay_scrollback_caps_at_requested_lines() {
+        let mut raw = String::new();
+        for i in 1..=200 {
+            raw.push_str(&format!("l{i}\r\n"));
+        }
+        let history = replay_scrollback(&raw, 5, 10, 50, false);
+        assert!(history.len() <= 50, "cap ignored: {}", history.len());
+        // The retained window is the NEWEST history, ending just above screen.
+        assert_eq!(history.last().map(String::as_str), Some("l196"));
+    }
 
     // ─── Device registration policy ─────────────────────────────────────────
     //

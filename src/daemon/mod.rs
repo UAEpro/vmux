@@ -5066,109 +5066,117 @@ pub(crate) fn trim_output(output: String, max_len: usize) -> String {
     }
 }
 
+/// Attribute set of one cell, compared cell-to-cell to emit minimal SGR runs.
+#[derive(PartialEq, Clone, Copy, Default)]
+struct SgrStyle {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+fn push_sgr(out: &mut String, style: &SgrStyle) {
+    use std::fmt::Write;
+    out.push_str("\x1b[0");
+    if style.bold {
+        out.push_str(";1");
+    }
+    if style.italic {
+        out.push_str(";3");
+    }
+    if style.underline {
+        out.push_str(";4");
+    }
+    if style.inverse {
+        out.push_str(";7");
+    }
+    match style.fg {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(i) if i < 8 => {
+            let _ = write!(out, ";{}", 30 + u16::from(i));
+        }
+        vt100::Color::Idx(i) if i < 16 => {
+            let _ = write!(out, ";{}", 82 + u16::from(i));
+        }
+        vt100::Color::Idx(i) => {
+            let _ = write!(out, ";38;5;{i}");
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            let _ = write!(out, ";38;2;{r};{g};{b}");
+        }
+    }
+    match style.bg {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(i) if i < 8 => {
+            let _ = write!(out, ";{}", 40 + u16::from(i));
+        }
+        vt100::Color::Idx(i) if i < 16 => {
+            let _ = write!(out, ";{}", 92 + u16::from(i));
+        }
+        vt100::Color::Idx(i) => {
+            let _ = write!(out, ";48;5;{i}");
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            let _ = write!(out, ";48;2;{r};{g};{b}");
+        }
+    }
+    out.push('m');
+}
+
+/// One visible row of `screen` as text with self-contained SGR colour codes
+/// (reset re-established mid-row on attribute changes, reset at row end).
+/// Respects the screen's scrollback offset, which is what lets the relay
+/// replay pane history row by row. Used by the whole-screen serializer below.
+pub(crate) fn row_contents_ansi(screen: &vt100::Screen, row: u16) -> String {
+    let (_, cols) = screen.size();
+    let mut out = String::new();
+    let mut current = SgrStyle::default();
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            continue;
+        };
+        // A wide glyph's continuation cell repeats nothing.
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let style = SgrStyle {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        };
+        if style != current {
+            push_sgr(&mut out, &style);
+            current = style;
+        }
+        let contents = cell.contents();
+        if contents.is_empty() {
+            out.push(' ');
+        } else {
+            out.push_str(contents);
+        }
+    }
+    if current != SgrStyle::default() {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
 /// Serialize a vt100 screen to text with SGR colour codes, one line per row.
-///
-/// Each row is self-contained: styling is (re)established from a reset
-/// whenever attributes change and reset again at end of row, so consumers may
-/// treat rows independently (the relay diffs and ships rows one at a time).
 /// Only SGR is emitted — no cursor movement, no OSC — so a client needs
 /// nothing beyond a small colour-code parser.
 fn screen_contents_ansi(screen: &vt100::Screen) -> String {
-    #[derive(PartialEq, Clone, Copy, Default)]
-    struct Style {
-        fg: vt100::Color,
-        bg: vt100::Color,
-        bold: bool,
-        italic: bool,
-        underline: bool,
-        inverse: bool,
-    }
-
-    fn push_sgr(out: &mut String, style: &Style) {
-        out.push_str("\x1b[0");
-        if style.bold {
-            out.push_str(";1");
-        }
-        if style.italic {
-            out.push_str(";3");
-        }
-        if style.underline {
-            out.push_str(";4");
-        }
-        if style.inverse {
-            out.push_str(";7");
-        }
-        match style.fg {
-            vt100::Color::Default => {}
-            vt100::Color::Idx(i) if i < 8 => {
-                let _ = write!(out, ";{}", 30 + u16::from(i));
-            }
-            vt100::Color::Idx(i) if i < 16 => {
-                let _ = write!(out, ";{}", 82 + u16::from(i));
-            }
-            vt100::Color::Idx(i) => {
-                let _ = write!(out, ";38;5;{i}");
-            }
-            vt100::Color::Rgb(r, g, b) => {
-                let _ = write!(out, ";38;2;{r};{g};{b}");
-            }
-        }
-        match style.bg {
-            vt100::Color::Default => {}
-            vt100::Color::Idx(i) if i < 8 => {
-                let _ = write!(out, ";{}", 40 + u16::from(i));
-            }
-            vt100::Color::Idx(i) if i < 16 => {
-                let _ = write!(out, ";{}", 92 + u16::from(i));
-            }
-            vt100::Color::Idx(i) => {
-                let _ = write!(out, ";48;5;{i}");
-            }
-            vt100::Color::Rgb(r, g, b) => {
-                let _ = write!(out, ";48;2;{r};{g};{b}");
-            }
-        }
-        out.push('m');
-    }
-
-    use std::fmt::Write;
-    let (rows, cols) = screen.size();
+    let (rows, _) = screen.size();
     let mut out = String::new();
     for row in 0..rows {
         if row > 0 {
             out.push('\n');
         }
-        let mut current = Style::default();
-        for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-            // A wide glyph's continuation cell repeats nothing.
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            let style = Style {
-                fg: cell.fgcolor(),
-                bg: cell.bgcolor(),
-                bold: cell.bold(),
-                italic: cell.italic(),
-                underline: cell.underline(),
-                inverse: cell.inverse(),
-            };
-            if style != current {
-                push_sgr(&mut out, &style);
-                current = style;
-            }
-            let contents = cell.contents();
-            if contents.is_empty() {
-                out.push(' ');
-            } else {
-                out.push_str(contents);
-            }
-        }
-        if current != Style::default() {
-            out.push_str("\x1b[0m");
-        }
+        out.push_str(&row_contents_ansi(screen, row));
     }
     out
 }
