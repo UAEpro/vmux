@@ -872,6 +872,18 @@ mod tests {
         fs::remove_dir_all(home).ok();
     }
 
+    /// An explicit home must be fully self-contained. When this consulted the
+    /// global $XDG_CONFIG_HOME (as CI sets), every test's shell-hook path
+    /// aliased to one shared file and the install/not-detected tests flaked
+    /// against each other — Ubuntu CI red on an interleaving, macOS green.
+    #[test]
+    fn explicit_home_ignores_ambient_xdg_config_home() {
+        let home = temp_home();
+        assert_eq!(config_home(&home), home.join(".config"));
+        assert!(shell_hooks_path(&home).starts_with(&home));
+        fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn not_detected_when_agent_dirs_missing() {
         let home = temp_home();
