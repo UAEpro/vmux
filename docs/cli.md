@@ -27,7 +27,9 @@ vmux prune --workspace ws-2
 `vmux move` shifts a pane with its layout neighbor. It does not wrap.
 
 `vmux view-size` is a *leased* override (default 10s): it expires unless re-sent,
-so a viewer that dies can never pin a pane small. The relay re-leases it
+so a viewer that dies can never pin a pane small. Phone-driven resizing is
+additionally gated behind `relay.allow_view_resize` (default off); the CLI
+command talks to the daemon directly and is not gated. The relay re-leases it
 automatically for phone subscribers; the desktop UI dims the unused margin with
 a "sized by phone" note while one is active. Zoomed panes refuse it. Overrides
 are never persisted — a daemon restart always restores desktop sizes.

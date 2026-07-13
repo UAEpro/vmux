@@ -62,6 +62,11 @@ pub struct RelayConfig {
     /// on — uploads still require a paired device token. `vmux config set
     /// relay.allow_paste false` (or the Settings panel) turns it off.
     pub allow_paste: bool,
+    /// Honor `view_cols`/`view_rows` on `surface.subscribe` (phone-fit pane
+    /// sizing). Off by default — a phone glance must not resize a pane the
+    /// desktop user is looking at unless the host opted in:
+    /// `vmux config set relay.allow_view_resize true`.
+    pub allow_view_resize: bool,
     /// When set (non-empty), **every** device registration must present this
     /// secret via `X-Vmux-Bootstrap` or `Authorization: Bootstrap <secret>`.
     /// Whois/localhost/CGNAT identity still applies after the secret check.
@@ -79,6 +84,7 @@ impl Default for RelayConfig {
             allow_localhost: false,
             allow_tailnet_cgnat: false,
             allow_paste: true,
+            allow_view_resize: false,
             default_fps: DEFAULT_FPS,
             idle_fps: DEFAULT_IDLE_FPS,
             session: "default".to_string(),
@@ -601,6 +607,7 @@ pub fn sync_relay_json_from_settings(session: &str, settings: &RelaySettings) ->
     file_cfg.allow_localhost = settings.allow_localhost;
     file_cfg.allow_tailnet_cgnat = settings.allow_tailnet_cgnat;
     file_cfg.allow_paste = settings.allow_paste;
+    file_cfg.allow_view_resize = settings.allow_view_resize;
     // Keep empty allow_login = any successful whois / CGNAT policy.
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1329,21 +1336,7 @@ fn handle_ws_upgrade(
                         .get("ansi")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    // Phone-fit (both must be present): shrink the pane's PTY
-                    // to the viewer while subscribed. The poller holds a lease
-                    // on the daemon and re-signs it every cycle, so a phone
-                    // that dies without unsubscribing restores the pane once
-                    // the lease runs out.
-                    let view_size = match (
-                        params.get("view_cols").and_then(|v| v.as_u64()),
-                        params.get("view_rows").and_then(|v| v.as_u64()),
-                    ) {
-                        (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some((
-                            cols.min(u16::MAX as u64) as u16,
-                            rows.min(u16::MAX as u64) as u16,
-                        )),
-                        _ => None,
-                    };
+                    let view_size = subscribe_view_size(&params, state.config.allow_view_resize);
 
                     // stop existing sub for this surface
                     if let Some(flag) = stop_flags.lock_or_recover().remove(&surface_id) {
@@ -1591,6 +1584,28 @@ struct ScreenSnap {
 /// poll jitter comfortably.
 const VIEW_LEASE_MS: u64 = 10_000;
 const VIEW_RELEASE_EVERY: Duration = Duration::from_secs(2);
+
+/// Phone-fit view size from `surface.subscribe` params (both `view_cols` and
+/// `view_rows` must be present and non-zero) — but only when the host gate
+/// `relay.allow_view_resize` is on. The gate defaults off: a phone opening a
+/// pane must not resize it under the desktop user unless the host opted in.
+/// With the gate off (or params absent) the client gets the previous
+/// behaviour: full-width rows, wrapped client-side.
+fn subscribe_view_size(params: &Value, allow_view_resize: bool) -> Option<(u16, u16)> {
+    if !allow_view_resize {
+        return None;
+    }
+    match (
+        params.get("view_cols").and_then(|v| v.as_u64()),
+        params.get("view_rows").and_then(|v| v.as_u64()),
+    ) {
+        (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some((
+            cols.min(u16::MAX as u64) as u16,
+            rows.min(u16::MAX as u64) as u16,
+        )),
+        _ => None,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_surface_poller(
@@ -2628,6 +2643,33 @@ mod tests {
     }
 
     #[test]
+    fn view_resize_is_gated_off_by_default() {
+        // The host gate defaults off — including for relay.json files written
+        // before the field existed.
+        assert!(!RelayConfig::default().allow_view_resize);
+        let old: RelayConfig = serde_json::from_str(r#"{"listen":"127.0.0.1:4399"}"#).unwrap();
+        assert!(!old.allow_view_resize);
+
+        // A subscribe carrying view params must NOT produce an override while
+        // the gate is off; the phone falls back to client-side wrapping. The
+        // poller only leases SetPaneViewSize when this returns Some, so None
+        // here is what guarantees the daemon never sees an override.
+        let params = json!({"surface_id": "pane-1", "view_cols": 46, "view_rows": 22});
+        assert_eq!(subscribe_view_size(&params, false), None);
+
+        // Flipping the gate (vmux config set relay.allow_view_resize true)
+        // makes the same subscribe take effect.
+        assert_eq!(subscribe_view_size(&params, true), Some((46, 22)));
+
+        // Gate on but params absent/degenerate: still no override.
+        assert_eq!(subscribe_view_size(&json!({"surface_id": "p"}), true), None);
+        assert_eq!(
+            subscribe_view_size(&json!({"view_cols": 0, "view_rows": 22}), true),
+            None
+        );
+    }
+
+    #[test]
     fn relay_config_without_allow_paste_defaults_on() {
         // Configs written before the paste page existed must keep serving it
         // (serde default), and an explicit false must stick.
@@ -2737,6 +2779,7 @@ mod tests {
             allow_localhost: false,
             allow_tailnet_cgnat: true,
             allow_paste: true,
+            allow_view_resize: false,
         };
         assert_eq!(resolve_listen(&local), "127.0.0.1:4399");
         let all_migrated = RelaySettings {
