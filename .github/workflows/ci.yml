@@ -64,8 +64,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # Surface failing test names as a job annotation. A bare `cargo test` puts
+      # them only in the log, which means opening the run to learn anything at all.
       - name: Test
-        run: cargo test --all-targets --locked
+        run: |
+          set -o pipefail
+          if ! cargo test --all-targets --locked 2>&1 | tee test.log; then
+            echo "::error::failing tests: $(sed -n '/^failures:$/,/^test result/p' test.log \
+              | grep -E '^    [a-z_]+' | tr -d ' ' | paste -sd, -)"
+            sed -n '/^---- /,/^test result/p' test.log | head -60
+            exit 1
+          fi
 
       # `--exact` matches the *full* test path, so the truncated name silently
       # selected 0 tests and passed green. Keep the path complete, and make the
