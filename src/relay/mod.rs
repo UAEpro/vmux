@@ -2010,6 +2010,91 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
             )?;
             Ok(json!({}))
         }
+        "tab.create" => {
+            let ws = req_str(params, "workspace_id")?;
+            let title = params
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            call(
+                socket,
+                &Request::NewTab {
+                    workspace: Some(ws),
+                    title,
+                    command: None,
+                },
+            )?;
+            Ok(json!({}))
+        }
+        "tab.rename" => {
+            let tab = req_str(params, "tab_id")?;
+            let title = req_str(params, "title")?;
+            call(
+                socket,
+                &Request::RenameTab {
+                    workspace: params
+                        .get("workspace_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    tab,
+                    title,
+                },
+            )?;
+            Ok(json!({}))
+        }
+        "tab.close" => {
+            let tab = req_str(params, "tab_id")?;
+            call(
+                socket,
+                &Request::CloseTab {
+                    workspace: params
+                        .get("workspace_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    tab,
+                },
+            )?;
+            Ok(json!({}))
+        }
+        "tab.select" => {
+            let tab = req_str(params, "tab_id")?;
+            call(
+                socket,
+                &Request::SwitchTab {
+                    workspace: params
+                        .get("workspace_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    tab,
+                },
+            )?;
+            Ok(json!({}))
+        }
+        "surface.rename" => {
+            let surface = req_str(params, "surface_id")?;
+            let title = req_str(params, "title")?;
+            call(
+                socket,
+                &Request::SetPaneTitle {
+                    pane: Some(surface),
+                    title,
+                },
+            )?;
+            Ok(json!({}))
+        }
+        "surface.restart" => {
+            let surface = req_str(params, "surface_id")?;
+            call(
+                socket,
+                &Request::RestartPane {
+                    pane: Some(surface),
+                    workspace: None,
+                    all: false,
+                    command: None,
+                },
+            )?;
+            Ok(json!({}))
+        }
         "surface.scrollback" => {
             let surface = req_str(params, "surface_id")?;
             let lines = params
