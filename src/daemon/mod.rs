@@ -315,6 +315,10 @@ struct WorkspaceMeta {
     git_branch: Option<String>,
     pull_request: Option<PullRequestInfo>,
     ports: Vec<ListeningPort>,
+    /// Live working directory of the workspace's active pane shell, so the
+    /// sidebar path follows `cd` instead of pinning the spawn cwd. `None` when
+    /// it can't be read (pane gone, non-Linux) — the persisted cwd then shows.
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -536,6 +540,7 @@ impl Server {
                     (
                         workspace.id.clone(),
                         workspace.cwd.clone(),
+                        workspace.active_pane.clone().or_else(|| workspace.first_pane()),
                         workspace
                             .all_pane_ids()
                             .into_iter()
@@ -553,8 +558,13 @@ impl Server {
                 .collect::<BTreeMap<_, _>>()
         };
         let mut updated = BTreeMap::new();
-        for (id, cwd, pane_ids) in workspaces {
-            let path = Path::new(&cwd);
+        for (id, cwd, active_pane, pane_ids) in workspaces {
+            let live_cwd = active_pane
+                .and_then(|pane| pane_pids.get(&pane).copied())
+                .and_then(pane_live_cwd);
+            // Git metadata follows the live cwd so branch and path (both shown
+            // on the sidebar second line) never describe different directories.
+            let path = Path::new(live_cwd.as_deref().unwrap_or(&cwd));
             let roots = pane_ids
                 .iter()
                 .filter_map(|pane| pane_pids.get(pane).copied())
@@ -565,6 +575,7 @@ impl Server {
                     git_branch: git_branch(path),
                     pull_request: pull_request_info(path),
                     ports: listening_ports_for_roots(&roots),
+                    cwd: live_cwd,
                 },
             );
         }
@@ -3223,6 +3234,11 @@ impl Server {
                     workspace.git_branch = cached.git_branch.clone();
                     workspace.pull_request = cached.pull_request.clone();
                     workspace.ports = cached.ports.clone();
+                    // Display-only overlay: the persisted workspace cwd (used
+                    // to spawn new panes) is left untouched.
+                    if let Some(cwd) = &cached.cwd {
+                        workspace.cwd = cwd.clone();
+                    }
                 }
             }
         }
@@ -4064,6 +4080,14 @@ fn git_branch(cwd: &Path) -> Option<String> {
     None
 }
 
+/// Live working directory of a pane's shell via `/proc/<pid>/cwd`, so the
+/// sidebar path follows `cd`. Best-effort: `None` when the process is gone,
+/// the cwd was deleted, or `/proc` is unavailable (non-Linux).
+fn pane_live_cwd(pid: u32) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    path.is_absolute().then(|| path.display().to_string())
+}
+
 fn pull_request_info(cwd: &Path) -> Option<PullRequestInfo> {
     let mut command = Command::new("gh");
     command
@@ -4581,6 +4605,13 @@ mod tests {
             .unwrap();
         assert_eq!(git_branch(&dir).as_deref(), Some("feature/test"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_live_cwd_reads_proc_cwd() {
+        let expected = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(pane_live_cwd(std::process::id()), Some(expected));
+        assert_eq!(pane_live_cwd(u32::MAX), None);
     }
 
     #[test]
