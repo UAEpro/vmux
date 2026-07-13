@@ -2043,19 +2043,25 @@ fn surface_list(socket: &Path, workspace_id: &str) -> Result<Value> {
         .find(|w| w.get("id").and_then(|i| i.as_str()) == Some(workspace_id))
         .ok_or_else(|| anyhow!("workspace not found"))?;
 
-    // Prefer panes from the active tab, else workspace.panes.
-    let mut pane_ids: Vec<String> = Vec::new();
+    // Every tab's panes, in tab order — a phone must be able to reach all of a
+    // workspace, not just its active tab. Each surface carries `tab`/`tab_id`
+    // (additive: clients that predate them ignore unknown fields).
+    let mut pane_ids: Vec<(String, Option<(String, String)>)> = Vec::new();
     if let Some(tabs) = ws.get("tabs").and_then(|t| t.as_array()) {
-        let active = ws.get("active_tab").and_then(|v| v.as_str());
-        let tab = tabs
-            .iter()
-            .find(|t| t.get("id").and_then(|i| i.as_str()) == active)
-            .or_else(|| tabs.first());
-        if let Some(tab) = tab {
+        for tab in tabs {
+            let tab_meta = tab.get("id").and_then(|i| i.as_str()).map(|id| {
+                (
+                    id.to_string(),
+                    tab.get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or(id)
+                        .to_string(),
+                )
+            });
             if let Some(arr) = tab.get("panes").and_then(|p| p.as_array()) {
                 for p in arr {
                     if let Some(id) = p.as_str() {
-                        pane_ids.push(id.to_string());
+                        pane_ids.push((id.to_string(), tab_meta.clone()));
                     }
                 }
             }
@@ -2065,27 +2071,32 @@ fn surface_list(socket: &Path, workspace_id: &str) -> Result<Value> {
         if let Some(arr) = ws.get("panes").and_then(|p| p.as_array()) {
             for p in arr {
                 if let Some(id) = p.as_str() {
-                    pane_ids.push(id.to_string());
+                    pane_ids.push((id.to_string(), None));
                 }
             }
         }
     }
 
     let mut surfaces = Vec::new();
-    for (index, pid) in pane_ids.iter().enumerate() {
+    for (index, (pid, tab_meta)) in pane_ids.iter().enumerate() {
         let title = panes_map
             .get(pid)
             .and_then(|p| p.get("title"))
             .and_then(|t| t.as_str())
             .unwrap_or(pid)
             .to_string();
-        surfaces.push(json!({
+        let mut surface = json!({
             "id": pid,
             "title": title,
             "index": index,
             "type": "terminal",
             "focused": ws.get("active_pane").and_then(|v| v.as_str()) == Some(pid.as_str()),
-        }));
+        });
+        if let (Some((tab_id, tab_title)), Some(map)) = (tab_meta, surface.as_object_mut()) {
+            map.insert("tab_id".into(), json!(tab_id));
+            map.insert("tab".into(), json!(tab_title));
+        }
+        surfaces.push(surface);
     }
     Ok(json!({ "surfaces": surfaces, "workspace_id": workspace_id }))
 }
