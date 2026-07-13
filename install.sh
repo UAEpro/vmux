@@ -16,11 +16,21 @@ fail() { printf 'install: %s\n' "$1" >&2; exit 1; }
 
 case "$(uname -m)" in
   x86_64 | amd64) target="x86_64-unknown-linux-musl" ;;
-  *) fail "no prebuilt binary for '$(uname -m)' yet — build from source: cargo install --git https://github.com/${REPO}" ;;
+  *) fail "no prebuilt binary for '$(uname -m)' yet — build from source: cargo install vmux-tui" ;;
 esac
 
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
+
+# Checksum verification is mandatory, so resolve the tool up front rather than
+# discovering it is missing after the download.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_check() { sha256sum -c "$1"; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256_check() { shasum -a 256 -c "$1"; }
+else
+  fail "sha256sum (or shasum) is required to verify the download"
+fi
 
 # Resolve the latest published release tag. Capture the full response first so
 # the JSON parse can't SIGPIPE curl mid-write.
@@ -40,11 +50,13 @@ trap 'rm -rf "$tmp"' EXIT
 printf 'Downloading %s %s...\n' "$BIN" "$tag"
 curl -fsSL "$url" -o "$tmp/${name}.tar.gz" || fail "download failed: $url"
 
-# Verify the checksum when the release ships one.
-if curl -fsSL "${url}.sha256" -o "$tmp/${name}.tar.gz.sha256" 2>/dev/null; then
-  (cd "$tmp" && sha256sum -c "${name}.tar.gz.sha256" >/dev/null 2>&1) \
-    || fail "checksum verification failed"
-fi
+# Every release ships a .sha256 alongside the tarball, so a missing or
+# unreadable one means something is wrong with the download — never install
+# unverified. Failing closed is the whole point of checksumming a `curl | sh`.
+curl -fsSL "${url}.sha256" -o "$tmp/${name}.tar.gz.sha256" \
+  || fail "could not fetch the checksum: ${url}.sha256"
+(cd "$tmp" && sha256_check "${name}.tar.gz.sha256" >/dev/null 2>&1) \
+  || fail "checksum verification failed — refusing to install ${name}.tar.gz"
 
 tar -C "$tmp" -xzf "$tmp/${name}.tar.gz"
 mkdir -p "$VMUX_INSTALL_DIR"
