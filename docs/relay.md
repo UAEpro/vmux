@@ -99,6 +99,20 @@ curl -s http://$(tailscale ip -4):4399/v1/health
 # {"ok":true,"version":"…","backend":"vmux",…}
 ```
 
+## Phone-fit pane sizing
+
+`surface.subscribe` accepts optional `view_cols` / `view_rows` params. When a
+client sends both, the relay holds a leased view-size override on that pane:
+the PTY runs at `min(desktop layout, phone view)` per axis — tmux's "smallest
+client wins", scoped to the one pane being viewed. The lease is re-signed on
+every poll cycle and expires ~10s after the phone vanishes (crash, signal
+loss), so the pane always returns to its desktop size by itself; unsubscribing
+restores it immediately. The desktop attach UI dims the pane's unused margin
+with a "sized by phone" note while an override is active.
+
+Clients that don't send a view size get the previous behaviour: full-width
+rows, wrapped client-side. Zoomed panes refuse the override.
+
 ## The paste page
 
 The relay also serves a browser page for getting screenshots into agents when

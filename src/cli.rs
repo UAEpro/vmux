@@ -300,6 +300,30 @@ pub enum Command {
         #[arg(long, default_value_t = 5)]
         amount: u16,
     },
+    /// Temporarily fit a pane's PTY to a small viewer (phone-fit), or restore it.
+    ///
+    /// Sets a leased override: the pane runs at min(layout, view) per axis until
+    /// the lease expires or --clear restores it. The relay drives this
+    /// automatically for subscribed surfaces that report a view size.
+    ViewSize {
+        /// Pane id (defaults to the pane this command runs in).
+        #[arg(long)]
+        pane: Option<String>,
+
+        #[arg(long, requires = "rows", conflicts_with = "clear")]
+        cols: Option<u16>,
+
+        #[arg(long, requires = "cols", conflicts_with = "clear")]
+        rows: Option<u16>,
+
+        /// Milliseconds before the override expires unless re-sent.
+        #[arg(long, default_value_t = 10_000)]
+        lease_ms: u64,
+
+        /// Drop the override and restore the layout size now.
+        #[arg(long)]
+        clear: bool,
+    },
     Focus {
         #[arg(value_enum)]
         direction: SplitDirection,

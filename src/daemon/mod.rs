@@ -268,7 +268,19 @@ struct PaneRuntime {
     // Accumulated decoded text used to detect OSC sequences that straddle reads.
     osc_tail: String,
     parser: vt100::Parser,
+    /// Effective PTY size actually applied to the master and vt100 parser:
+    /// `min(layout_size, view_override)` per axis while an override is live,
+    /// otherwise `layout_size`.
     size: PaneSize,
+    /// The size the attach UI's layout last asked for. Kept separately from
+    /// `size` so dropping a view override can restore the desktop layout
+    /// without waiting for the next client resize.
+    layout_size: PaneSize,
+    /// Phone-fit override (`SetPaneViewSize`): a small remote viewer is
+    /// watching, hold the PTY to at most this size until the lease runs out.
+    /// One slot per pane — a second viewer replaces the first (last writer
+    /// wins; with one slot a true min() across viewers isn't representable).
+    view_override: Option<ViewOverride>,
     // Bumped by append_output whenever new bytes are processed. Used to skip the
     // scrollback-formatted walk in snapshot() when a pane produced no output
     // since the last snapshot.
@@ -295,6 +307,33 @@ struct PaneRuntime {
 /// How long a pane's "is an agent running in here" answer is trusted before the
 /// process tree is walked again.
 const AGENT_INSIDE_TTL_SECS: u64 = 5;
+
+/// A leased view-size override (see `Request::SetPaneViewSize`).
+#[derive(Debug, Clone, Copy)]
+struct ViewOverride {
+    size: PaneSize,
+    /// The override silently expires at this instant unless re-leased, so a
+    /// viewer that dies without unsubscribing cannot pin the pane small.
+    expires_at: Instant,
+}
+
+/// "Smallest client wins", per axis: what the PTY should actually be when a
+/// view override is active on top of the layout size.
+fn effective_pane_size(layout: PaneSize, view: Option<PaneSize>) -> PaneSize {
+    match view {
+        Some(view) => sanitize_pane_size(PaneSize {
+            rows: layout.rows.min(view.rows),
+            cols: layout.cols.min(view.cols),
+        }),
+        None => layout,
+    }
+}
+
+/// Bounds for `SetPaneViewSize.lease_ms`. The floor keeps a buggy client from
+/// thrashing resize; the ceiling keeps a stuck client from pinning a pane for
+/// more than a minute even if it leased generously.
+const VIEW_LEASE_MS_MIN: u64 = 500;
+const VIEW_LEASE_MS_MAX: u64 = 60_000;
 
 /// One-shot lifecycle of the LLM tab-title fallback for a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +487,10 @@ impl Server {
                             pane.status = PaneStatus::Restored;
                             pane.pid = None;
                         }
+                        // View overrides are leases held by live viewers; no
+                        // viewer survives a daemon restart. (save() also strips
+                        // them — this is the belt to that brace.)
+                        pane.view_size = None;
                     }
                     session.ensure_workspace();
                     // Workspace → Tab → Pane hierarchy (and collapse legacy
@@ -1130,6 +1173,19 @@ impl Server {
                 self.resize_ptys(panes, client_id, take_control)?;
                 Ok(Response::empty())
             }
+            Request::SetPaneViewSize {
+                pane,
+                cols,
+                rows,
+                lease_ms,
+            } => {
+                self.set_pane_view_size(Some(pane), PaneSize { rows, cols }, lease_ms)?;
+                Ok(Response::empty())
+            }
+            Request::ClearPaneViewSize { pane } => {
+                self.clear_pane_view_size(Some(pane))?;
+                Ok(Response::empty())
+            }
             Request::Shutdown => {
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1587,6 +1643,8 @@ impl Server {
                 osc_tail: String::new(),
                 parser: vt100::Parser::new(24, 80, 2000),
                 size: PaneSize { rows: 24, cols: 80 },
+                layout_size: PaneSize { rows: 24, cols: 80 },
+                view_override: None,
                 output_generation: 0,
                 scrollback_formatted_cache: String::new(),
                 scrollback_formatted_generation: u64::MAX,
@@ -1900,23 +1958,137 @@ impl Server {
             let Some(runtime) = panes.get_mut(&key) else {
                 continue;
             };
-            let next = sanitize_pane_size(size);
-            if runtime.size == next {
-                continue;
-            }
-            // An exited pane has no master; skip resizing it (nothing to drive).
-            if let Some(master) = runtime.master.as_ref() {
-                master.resize(PtySize {
-                    rows: next.rows,
-                    cols: next.cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })?;
-            }
-            runtime.parser.screen_mut().set_size(next.rows, next.cols);
-            runtime.size = next;
+            // The client reports its layout box; a live view override
+            // (phone-fit) clamps what actually reaches the PTY.
+            runtime.layout_size = sanitize_pane_size(size);
+            let next =
+                effective_pane_size(runtime.layout_size, runtime.view_override.map(|v| v.size));
+            apply_pty_size(runtime, next)?;
         }
         Ok(())
+    }
+
+    /// Set or refresh a pane's phone-fit view override (see the request docs).
+    fn set_pane_view_size(
+        &self,
+        pane: Option<String>,
+        view: PaneSize,
+        lease_ms: u64,
+    ) -> Result<()> {
+        let pane_id = self.resolve_pane(pane)?;
+        let runtime_key = self.active_runtime_key(&pane_id)?;
+        let view = sanitize_pane_size(view);
+
+        // LOCK ORDER: session first, released before panes. Mirror the marker
+        // into the session pane (snapshots read it from there) and refuse
+        // zoomed panes — the user zoomed for a full-area view; a phone glance
+        // must not shrink it under them.
+        {
+            let mut session = self.session.lock_or_recover();
+            let zoomed = session.workspaces.iter().any(|ws| {
+                ws.zoomed_pane.as_deref() == Some(pane_id.as_str())
+                    || ws
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.zoomed_pane.as_deref() == Some(pane_id.as_str()))
+            });
+            if zoomed {
+                return Err(anyhow!(
+                    "pane {pane_id} is zoomed; not applying a view size"
+                ));
+            }
+            let Some(pane) = session.panes.get_mut(&pane_id) else {
+                return Err(anyhow!("unknown pane {pane_id}"));
+            };
+            pane.view_size = Some(crate::model::PaneViewSize {
+                cols: view.cols,
+                rows: view.rows,
+            });
+        }
+
+        let lease = Duration::from_millis(lease_ms.clamp(VIEW_LEASE_MS_MIN, VIEW_LEASE_MS_MAX));
+        {
+            let mut panes = self.panes.lock_or_recover();
+            let key = if panes.contains_key(&runtime_key) {
+                runtime_key
+            } else {
+                legacy_runtime_key(&pane_id)
+            };
+            if let Some(runtime) = panes.get_mut(&key) {
+                runtime.view_override = Some(ViewOverride {
+                    size: view,
+                    expires_at: Instant::now() + lease,
+                });
+                runtime.pane.view_size = Some(crate::model::PaneViewSize {
+                    cols: view.cols,
+                    rows: view.rows,
+                });
+                let next = effective_pane_size(runtime.layout_size, Some(view));
+                apply_pty_size(runtime, next)?;
+            }
+        }
+        self.touch();
+        Ok(())
+    }
+
+    /// Drop a pane's view override and return it to its layout size now.
+    fn clear_pane_view_size(&self, pane: Option<String>) -> Result<()> {
+        let pane_id = self.resolve_pane(pane)?;
+        let runtime_key = self.active_runtime_key(&pane_id)?;
+        {
+            let mut session = self.session.lock_or_recover();
+            if let Some(pane) = session.panes.get_mut(&pane_id) {
+                pane.view_size = None;
+            }
+        }
+        {
+            let mut panes = self.panes.lock_or_recover();
+            let key = if panes.contains_key(&runtime_key) {
+                runtime_key
+            } else {
+                legacy_runtime_key(&pane_id)
+            };
+            if let Some(runtime) = panes.get_mut(&key) {
+                runtime.view_override = None;
+                runtime.pane.view_size = None;
+                apply_pty_size(runtime, runtime.layout_size)?;
+            }
+        }
+        self.touch();
+        Ok(())
+    }
+
+    /// Drop view overrides whose lease ran out, restoring layout sizes.
+    /// Returns true when anything changed (callers bump the generation).
+    /// Runs from the housekeeping tick so a vanished phone restores the pane
+    /// within seconds even though it never said goodbye.
+    fn expire_view_overrides(&self, now: Instant) -> bool {
+        let mut restored: Vec<String> = Vec::new();
+        {
+            let mut panes = self.panes.lock_or_recover();
+            for runtime in panes.values_mut() {
+                let expired = runtime
+                    .view_override
+                    .map(|v| v.expires_at <= now)
+                    .unwrap_or(false);
+                if expired {
+                    runtime.view_override = None;
+                    runtime.pane.view_size = None;
+                    apply_pty_size(runtime, runtime.layout_size).ok();
+                    restored.push(runtime.pane.id.clone());
+                }
+            }
+        }
+        if restored.is_empty() {
+            return false;
+        }
+        let mut session = self.session.lock_or_recover();
+        for pane_id in &restored {
+            if let Some(pane) = session.panes.get_mut(pane_id) {
+                pane.view_size = None;
+            }
+        }
+        true
     }
 
     fn write_input(&self, pane: Option<String>, data: String) -> Result<()> {
@@ -3818,6 +3990,9 @@ impl Server {
                     changed |= decay_stale_busy(pane, now, BUSY_IDLE_DECAY_SECS);
                 }
             }
+            // Same tick also reaps expired phone-fit view leases, so a viewer
+            // that vanished restores the pane within DECAY_TICK_SECS + lease.
+            changed |= self.expire_view_overrides(Instant::now());
             if changed {
                 self.touch();
                 self.save().ok();
@@ -3882,6 +4057,12 @@ impl Server {
         // hot path and loses history across daemon restart.
         let mut snapshot = self.snapshot(true)?;
         snapshot.daemon = None;
+        // View overrides are live-viewer leases, not layout: persisting one
+        // would resurrect a phone-sized pane after restart with no phone
+        // attached. Strip them; load() clears any that slip through.
+        for pane in snapshot.panes.values_mut() {
+            pane.view_size = None;
+        }
         let payload = serde_json::to_vec_pretty(&snapshot)?;
         *counter = counter.wrapping_add(1);
         let tmp =
@@ -3928,6 +4109,26 @@ fn sanitize_pane_size(size: PaneSize) -> PaneSize {
         rows: size.rows.max(2),
         cols: size.cols.max(2),
     }
+}
+
+/// Drive a pane's PTY and vt100 parser to `next`, recording it as the
+/// effective size. No-op when already there. An exited pane has no master;
+/// its parser is still resized so restored output reflows correctly.
+fn apply_pty_size(runtime: &mut PaneRuntime, next: PaneSize) -> Result<()> {
+    if runtime.size == next {
+        return Ok(());
+    }
+    if let Some(master) = runtime.master.as_ref() {
+        master.resize(PtySize {
+            rows: next.rows,
+            cols: next.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+    }
+    runtime.parser.screen_mut().set_size(next.rows, next.cols);
+    runtime.size = next;
+    Ok(())
 }
 
 fn runtime_key_tab<'a>(pane_id: &str, runtime_key: &'a str) -> Option<&'a str> {
@@ -5299,6 +5500,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn effective_pane_size_is_min_per_axis() {
+        let layout = PaneSize { cols: 80, rows: 24 };
+        // Phone narrower but taller than the layout: each axis clamps alone.
+        let out = effective_pane_size(layout, Some(PaneSize { cols: 46, rows: 60 }));
+        assert_eq!(out, PaneSize { cols: 46, rows: 24 });
+        // No override → layout untouched.
+        assert_eq!(effective_pane_size(layout, None), layout);
+        // Degenerate override still yields a usable grid.
+        let out = effective_pane_size(layout, Some(PaneSize { cols: 0, rows: 0 }));
+        assert_eq!(out, PaneSize { cols: 2, rows: 2 });
+    }
+
+    /// The full phone-fit lifecycle against one pane: set clamps the PTY and
+    /// bumps the generation, layout resizes keep respecting the override,
+    /// persistence never records it, the lease expiring restores the layout
+    /// size, and a zoomed pane refuses the override outright.
+    #[test]
+    fn view_override_clamps_leases_and_never_persists() {
+        let guard = TestSession::new("view-size");
+        let server = Server::load(guard.as_str()).unwrap();
+        {
+            let mut session = server.session.lock_or_recover();
+            let mut pane = Pane::new("pane-1".into(), "sh".into(), SplitDirection::Right);
+            pane.status = PaneStatus::Running;
+            session.workspaces[0].panes = vec!["pane-1".into()];
+            session.panes.insert("pane-1".into(), pane.clone());
+            drop(session);
+            let mut panes = server.panes.lock_or_recover();
+            panes.insert(
+                "pane-1".into(),
+                PaneRuntime {
+                    generation: 1,
+                    pane,
+                    master: None,
+                    writer: None,
+                    killer: None,
+                    output: std::collections::VecDeque::new(),
+                    output_bytes: 0,
+                    scrollback_cap: crate::config::default_scrollback_bytes(),
+                    pending: Vec::new(),
+                    osc_tail: String::new(),
+                    parser: vt100::Parser::new(24, 80, 1000),
+                    size: PaneSize { cols: 80, rows: 24 },
+                    layout_size: PaneSize { cols: 80, rows: 24 },
+                    view_override: None,
+                    output_generation: 1,
+                    scrollback_formatted_cache: String::new(),
+                    scrollback_formatted_generation: u64::MAX,
+                    auto_title: None,
+                    llm_title_state: LlmTitleState::Pending,
+                    agent_inside: false,
+                    agent_inside_at: 0,
+                    started_at: unix_time(),
+                },
+            );
+        }
+
+        // Set: PTY clamps to min(layout, view) per axis, snapshot advertises
+        // the override, and the generation moves so the UI repaints.
+        let before = server.generation();
+        server
+            .set_pane_view_size(
+                Some("pane-1".into()),
+                PaneSize { cols: 46, rows: 60 },
+                10_000,
+            )
+            .unwrap();
+        assert!(server.generation() > before, "set must bump the generation");
+        {
+            let panes = server.panes.lock_or_recover();
+            assert_eq!(panes["pane-1"].size, PaneSize { cols: 46, rows: 24 });
+        }
+        let snap = server.snapshot(false).unwrap();
+        let view = snap.panes["pane-1"]
+            .view_size
+            .expect("snapshot carries view_size");
+        assert_eq!((view.cols, view.rows), (46, 60));
+
+        // A layout resize while the override is live keeps the clamp.
+        let mut sizes = BTreeMap::new();
+        sizes.insert(
+            "pane-1".to_string(),
+            PaneSize {
+                cols: 120,
+                rows: 30,
+            },
+        );
+        server.resize_ptys(sizes, None, false).unwrap();
+        {
+            let panes = server.panes.lock_or_recover();
+            assert_eq!(panes["pane-1"].size, PaneSize { cols: 46, rows: 30 });
+            assert_eq!(
+                panes["pane-1"].layout_size,
+                PaneSize {
+                    cols: 120,
+                    rows: 30
+                }
+            );
+        }
+
+        // Persistence must not record the override: a restart with no phone
+        // attached must come back desktop-sized.
+        server.save().unwrap();
+        let on_disk: Session =
+            serde_json::from_str(&fs::read_to_string(&server.state_path).unwrap()).unwrap();
+        assert!(
+            on_disk.panes["pane-1"].view_size.is_none(),
+            "view_size leaked into the state file"
+        );
+
+        // Not expired yet: a sweep now is a no-op.
+        assert!(!server.expire_view_overrides(Instant::now()));
+        // Lease runs out: the pane returns to its layout size on its own.
+        assert!(server.expire_view_overrides(Instant::now() + Duration::from_secs(60)));
+        {
+            let panes = server.panes.lock_or_recover();
+            assert_eq!(
+                panes["pane-1"].size,
+                PaneSize {
+                    cols: 120,
+                    rows: 30
+                }
+            );
+            assert!(panes["pane-1"].view_override.is_none());
+        }
+        let snap = server.snapshot(false).unwrap();
+        assert!(snap.panes["pane-1"].view_size.is_none());
+
+        // A zoomed pane refuses the override: the user zoomed for a full-area
+        // view; a phone glance must not shrink it under them.
+        server.session.lock_or_recover().workspaces[0].zoomed_pane = Some("pane-1".into());
+        let err = server
+            .set_pane_view_size(
+                Some("pane-1".into()),
+                PaneSize { cols: 46, rows: 22 },
+                5_000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("zoomed"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// The generation counter is what makes the UI repaint: clients poll with
     /// `Snapshot { since }` and the daemon short-circuits to `unchanged` when the
     /// counter has not moved. A mutation that forgets to bump it is invisible —
@@ -6168,6 +6514,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 osc_tail: String::new(),
                 parser: vt100::Parser::new(24, 80, 1000),
                 size: PaneSize { cols: 80, rows: 24 },
+                layout_size: PaneSize { cols: 80, rows: 24 },
+                view_override: None,
                 output_generation: 1,
                 scrollback_formatted_cache: String::new(),
                 scrollback_formatted_generation: u64::MAX,
@@ -6256,6 +6604,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                     osc_tail: String::new(),
                     parser: vt100::Parser::new(24, 80, 1000),
                     size: PaneSize { cols: 80, rows: 24 },
+                    layout_size: PaneSize { cols: 80, rows: 24 },
+                    view_override: None,
                     output_generation: 1,
                     scrollback_formatted_cache: String::new(),
                     scrollback_formatted_generation: u64::MAX,

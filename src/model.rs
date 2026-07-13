@@ -991,6 +991,13 @@ pub struct Pane {
     pub screen_rows: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_cols: Option<u16>,
+    /// Live phone-fit override: while set, the PTY is held at
+    /// `min(layout size, view_size)` per axis because a small remote viewer is
+    /// watching (see `Request::SetPaneViewSize`). Runtime-only — stripped from
+    /// persistence and cleared on daemon load, so a restart always restores
+    /// desktop sizes. The attach UI uses it to explain the shrunken grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_size: Option<PaneViewSize>,
     #[serde(default)]
     pub scrollback: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1040,11 +1047,19 @@ impl Pane {
             cursor_col: None,
             screen_rows: None,
             screen_cols: None,
+            view_size: None,
             scrollback: String::new(),
             scrollback_formatted: String::new(),
             scrollback_lines: None,
         }
     }
+}
+
+/// Cols/rows a remote viewer asked a pane to fit (`Pane::view_size`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneViewSize {
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -341,6 +341,24 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         take_control: bool,
     },
+    /// Temporarily shrink a pane's PTY to fit a small viewer (phone-fit).
+    ///
+    /// The effective PTY size becomes `min(layout size, view size)` per axis —
+    /// tmux's "smallest client wins", scoped to one pane. The override is
+    /// leased: it expires `lease_ms` after the last refresh, so a viewer that
+    /// vanishes without unsubscribing cannot pin the pane small forever.
+    /// Re-send to refresh the lease. Runtime-only; a daemon restart restores
+    /// layout sizes.
+    SetPaneViewSize {
+        pane: String,
+        cols: u16,
+        rows: u16,
+        lease_ms: u64,
+    },
+    /// Drop a pane's view-size override and restore its layout size now.
+    ClearPaneViewSize {
+        pane: String,
+    },
     Shutdown,
 }
 
@@ -555,6 +573,40 @@ mod tests {
     fn agents_request_uses_socket_protocol_shape() {
         let encoded = serde_json::to_string(&Request::Agents).unwrap();
         assert_eq!(encoded, r#"{"action":"agents"}"#);
+    }
+
+    #[test]
+    fn view_size_requests_use_socket_protocol_shape() {
+        // Round-trip both ways: the relay builds these as raw JSON.
+        let encoded = serde_json::to_string(&Request::SetPaneViewSize {
+            pane: "pane-1".to_string(),
+            cols: 46,
+            rows: 22,
+            lease_ms: 10_000,
+        })
+        .unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"action":"set-pane-view-size","pane":"pane-1","cols":46,"rows":22,"lease_ms":10000}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Request>(&encoded).unwrap(),
+            Request::SetPaneViewSize {
+                cols: 46,
+                rows: 22,
+                lease_ms: 10_000,
+                ..
+            }
+        ));
+
+        let encoded = serde_json::to_string(&Request::ClearPaneViewSize {
+            pane: "pane-1".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"action":"clear-pane-view-size","pane":"pane-1"}"#
+        );
     }
 
     #[test]

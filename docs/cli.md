@@ -14,6 +14,8 @@ vmux focus right
 vmux focus-pane --pane pane-1
 vmux move left|right|up|down
 vmux resize right --amount 10
+vmux view-size --pane pane-1 --cols 46 --rows 22   # phone-fit: hold the PTY at min(layout, view)
+vmux view-size --pane pane-1 --clear               # restore the layout size now
 vmux zoom --pane pane-1
 vmux swap-panes --first pane-1 --second pane-2
 vmux duplicate-pane --pane pane-1 --direction down
@@ -23,6 +25,12 @@ vmux prune --workspace ws-2
 ```
 
 `vmux move` shifts a pane with its layout neighbor. It does not wrap.
+
+`vmux view-size` is a *leased* override (default 10s): it expires unless re-sent,
+so a viewer that dies can never pin a pane small. The relay re-leases it
+automatically for phone subscribers; the desktop UI dims the unused margin with
+a "sized by phone" note while one is active. Zoomed panes refuse it. Overrides
+are never persisted — a daemon restart always restores desktop sizes.
 
 ## Workspaces and tabs
 
