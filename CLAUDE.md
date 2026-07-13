@@ -41,7 +41,7 @@ CONTRIBUTING.md has the daemon/client diagram and the file map. The parts that m
 
 **Snapshots come in fidelity levels**, and a new pane field has to be placed deliberately in each: `full: true` materializes heavy per-pane scrollback strings (used for persistence), `full: false` omits them (layout/status polls), and `lean` is the attach-UI poll — live screen contents but no event history and no scrollback except for panes the client is currently scrolled back in (`scrollback_panes`).
 
-**The snapshot hot path must never shell out.** `git`, `gh`, and `ss` are invoked only by the `refresh_workspace_meta_loop` background thread, which caches into `workspace_meta`; snapshots read the cache. `Server::serve` also spawns threads for the debounced save loop (400ms, gated on a `save_dirty` flag), the daily update check, and agent-status decay.
+**The snapshot hot path must never shell out.** `git` and `ss` are invoked only by the `refresh_workspace_meta_loop` background thread — local tools only; the loop once polled `gh pr view` and drained the user's GitHub API quota, so metered/network commands are banned here, which caches into `workspace_meta`; snapshots read the cache. `Server::serve` also spawns threads for the debounced save loop (400ms, gated on a `save_dirty` flag), the daily update check, and agent-status decay.
 
 **`Server` is a struct of independent `Mutex`es** (`session`, `panes`, `workspace_meta`, `next_pane`, …), not one big lock. Two of them held in inconsistent order across threads deadlocks the daemon — the field comments record the intended ordering, so read them before taking a second lock. In particular: **never hold `session` and `panes` at once.** Take one, collect what you need, release it, then take the other.
 

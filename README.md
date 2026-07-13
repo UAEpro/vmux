@@ -47,9 +47,10 @@ cargo install vmux-tui
 The crate is `vmux-tui` because `vmux` was already taken on crates.io. The
 command it installs is still `vmux`.
 
-vmux shells out to a few tools. `git` and `curl` are worth having. `gh`, `ss`,
-and `tailscale` are optional, and unlock PR info, port detection, and the phone
-relay respectively.
+vmux shells out to a few tools. `git` and `curl` are worth having. `ss` and
+`tailscale` are optional, and unlock port detection and the phone relay
+respectively. vmux makes no network calls of its own beyond the once-a-day
+update check.
 
 ## Quick start
 
