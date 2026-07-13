@@ -150,6 +150,36 @@ fn main() -> Result<()> {
             )?;
             print_response(response)
         }
+        Command::SendImage { file, pane, enter } => {
+            daemon::ensure_running(session)?;
+            let bytes = read_image_input(&file)?;
+            let ext = image_extension(&bytes).ok_or_else(|| {
+                anyhow!("input does not look like an image (expected png, jpeg, gif, webp, or bmp)")
+            })?;
+            let path = save_send_image(&bytes, ext)?;
+            let mut data = format!("{} ", path.display());
+            if enter {
+                data.push('\r');
+            }
+            let response = protocol::request(
+                &paths::socket_path(session)?,
+                &protocol::Request::Input { pane, data },
+            )?;
+            if !response.ok {
+                return Err(anyhow!(response
+                    .error
+                    .unwrap_or_else(|| "vmux command failed".to_string())));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "path": path.display().to_string(),
+                    "bytes": bytes.len(),
+                }))?
+            );
+            Ok(())
+        }
         Command::Broadcast { scope, enter, text } => {
             daemon::ensure_running(session)?;
             let mut data = text.join(" ");
@@ -2958,6 +2988,91 @@ fn command_on_path_in(name: &str, paths: Option<OsString>) -> bool {
     })
 }
 
+/// Screenshots are a few MB; anything past this is not a paste gone right.
+const MAX_SEND_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_image_input(file: &str) -> Result<Vec<u8>> {
+    let bytes = if file == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(MAX_SEND_IMAGE_BYTES + 1)
+            .read_to_end(&mut buf)?;
+        buf
+    } else {
+        let meta = fs::metadata(file).map_err(|err| anyhow!("read {file}: {err}"))?;
+        if meta.len() > MAX_SEND_IMAGE_BYTES {
+            return Err(anyhow!(
+                "{file} is {} bytes; refusing images over {} bytes",
+                meta.len(),
+                MAX_SEND_IMAGE_BYTES
+            ));
+        }
+        fs::read(file).map_err(|err| anyhow!("read {file}: {err}"))?
+    };
+    if bytes.is_empty() {
+        return Err(anyhow!(
+            "no image data on stdin (is the clipboard empty, or holding text instead of an image?)"
+        ));
+    }
+    if bytes.len() as u64 > MAX_SEND_IMAGE_BYTES {
+        return Err(anyhow!(
+            "stdin exceeded {MAX_SEND_IMAGE_BYTES} bytes; refusing"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Sniff the image type from magic bytes. Agents only attach real images, so
+/// reject unrecognized data instead of typing a junk path into the pane.
+fn image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some("png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    None
+}
+
+fn save_send_image(bytes: &[u8], ext: &str) -> Result<std::path::PathBuf> {
+    let dir = paths::state_dir()?.join("images");
+    fs::create_dir_all(&dir)?;
+    let pid = std::process::id();
+    for attempt in 0..8u32 {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("image-{stamp}-{pid}-{attempt}.{ext}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(anyhow!(
+        "could not create a unique image path under {}",
+        dir.display()
+    ))
+}
+
 fn print_response(response: protocol::Response) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&response)?);
     if response.ok {
@@ -3021,6 +3136,49 @@ mod tests {
         assert!(hooks.contains("_vmux_pane_id"));
         assert!(hooks.contains("vmux_hook_run()"));
         assert!(hooks.contains("lmux_hook_done()")); // legacy aliases
+    }
+
+    #[test]
+    fn image_extension_sniffs_common_formats() {
+        assert_eq!(
+            image_extension(&[0x89, b'P', b'N', b'G', 0x0D]),
+            Some("png")
+        );
+        assert_eq!(image_extension(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(image_extension(b"GIF89a"), Some("gif"));
+        assert_eq!(
+            image_extension(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some("webp")
+        );
+        assert_eq!(image_extension(b"BM\x00\x00"), Some("bmp"));
+        assert_eq!(image_extension(b"hello, not an image"), None);
+        assert_eq!(image_extension(b""), None);
+        // RIFF without the WEBP tag (e.g. a .wav file) is not an image.
+        assert_eq!(image_extension(b"RIFF\x00\x00\x00\x00WAVEfmt "), None);
+    }
+
+    #[test]
+    fn send_image_cli_parses() {
+        let cli = Cli::try_parse_from(["vmux", "send-image", "-", "--enter"]).unwrap();
+        match cli.command {
+            Some(Command::SendImage { file, pane, enter }) => {
+                assert_eq!(file, "-");
+                assert_eq!(pane, None);
+                assert!(enter);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_send_image_writes_unique_files() {
+        let first = save_send_image(&[0x89, b'P', b'N', b'G'], "png").unwrap();
+        let second = save_send_image(&[0x89, b'P', b'N', b'G'], "png").unwrap();
+        assert_ne!(first, second);
+        assert!(first.exists());
+        assert_eq!(fs::read(&first).unwrap(), vec![0x89, b'P', b'N', b'G']);
+        fs::remove_file(&first).ok();
+        fs::remove_file(&second).ok();
     }
 
     #[test]

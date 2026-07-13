@@ -52,6 +52,9 @@ vmux agent notify --agent pane-1 --status attention --message "needs input"
 
 vmux send --enter "npm test"
 vmux send-key enter
+# save an image on this host and type its path into the pane — pipe a
+# screenshot over SSH into Claude Code: pngpaste - | ssh box vmux send-image -
+vmux send-image screenshot.png --pane pane-1
 vmux broadcast --scope workspace --enter "npm test"
 vmux run --command "npm test" --title tests --timeout 60
 vmux wait --workspace ws-2 --timeout 30
@@ -175,7 +178,7 @@ Session state is persisted separately, in `~/.local/state/vmux/`.
 ```text
 attach  daemon  new-pane  split  run  open-url  url-snapshot  url-links
 browser  agent  remote  markdown  actions  skills  config
-send  send-key  broadcast  read-screen  search  clear-pane
+send  send-key  send-image  broadcast  read-screen  search  clear-pane
 copy-pane  paste  clipboard  kill-pane  duplicate-pane  prune  restart-pane
 move-pane  swap-panes  title  tab  move  metadata  wait  resize
 focus  focus-pane  zoom  workspace  surface  progress  hooks

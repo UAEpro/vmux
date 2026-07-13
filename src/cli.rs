@@ -134,6 +134,23 @@ pub enum Command {
 
         keys: Vec<String>,
     },
+    /// Save an image on this host and type its path into a pane.
+    ///
+    /// Built for pasting screenshots into agents like Claude Code over SSH,
+    /// where Ctrl+V can't work because the clipboard lives on your local
+    /// machine: `pngpaste - | ssh host vmux send-image -` (macOS) or
+    /// `wl-paste -t image/png | ssh host vmux send-image -` (Linux).
+    SendImage {
+        /// Image file to read, or `-` to read image bytes from stdin.
+        file: String,
+
+        #[arg(long)]
+        pane: Option<String>,
+
+        /// Press Enter after typing the path.
+        #[arg(long)]
+        enter: bool,
+    },
     Broadcast {
         #[arg(long, value_enum, default_value_t = BroadcastScope::Workspace)]
         scope: BroadcastScope,
