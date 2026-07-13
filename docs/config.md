@@ -27,7 +27,8 @@ vmux config set ui.prefix_key Ctrl-a
 | `agent_titles.llm_delay_ms` | `20000` | How long to wait for the agent's own title first |
 
 Relay keys (`relay.enabled`, `relay.bind`, `relay.allow_localhost`,
-`relay.allow_paste`) are covered in [relay.md](relay.md).
+`relay.allow_paste`, `relay.allow_view_resize`) are covered in
+[relay.md](relay.md).
 
 ## Automatic tab names
 

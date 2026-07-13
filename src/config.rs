@@ -70,6 +70,10 @@ pub struct RelaySettings {
     /// Serve the browser paste page (GET /paste, POST /v1/paste) for
     /// pasting screenshots into panes from other devices.
     pub allow_paste: bool,
+    /// Let phone viewers shrink panes to fit their screen (leased view-size
+    /// overrides). Off by default: resizing a shared pane surprises whoever
+    /// is at the desk, so wrap-on-the-phone is the safe default.
+    pub allow_view_resize: bool,
 }
 
 impl Default for RelaySettings {
@@ -85,6 +89,7 @@ impl Default for RelaySettings {
             // On by default: uploads still require a paired device token, and
             // the relay itself is opt-in.
             allow_paste: true,
+            allow_view_resize: false,
         }
     }
 }
@@ -346,6 +351,9 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
         }
         "relay.allow_paste" => {
             config.relay.allow_paste = parse_bool(value)?;
+        }
+        "relay.allow_view_resize" => {
+            config.relay.allow_view_resize = parse_bool(value)?;
         }
         "agent_titles.enabled" => {
             config.agent_titles.enabled = parse_bool(value)?;
@@ -761,6 +769,11 @@ mod tests {
         assert!(config.relay.allow_paste); // default on
         set_value(&mut config, "relay.allow_paste", "false").unwrap();
         assert!(!config.relay.allow_paste);
+        // Phone-fit resizing is opt-in: a phone must not shrink a shared pane
+        // unless the host asked for that behaviour.
+        assert!(!config.relay.allow_view_resize); // default off
+        set_value(&mut config, "relay.allow_view_resize", "true").unwrap();
+        assert!(config.relay.allow_view_resize);
         assert!(config.ui.sidebar_collapsed);
         assert_eq!(config.ui.prefix_key, "Alt-x");
         assert_eq!(config.ui.scroll_step, 50);

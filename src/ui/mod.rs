@@ -191,6 +191,9 @@ struct Ui {
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
     mobile_relay_allow_paste: bool,
+    /// No settings-panel toggle (config-set only), but carried in App state so
+    /// the panel's settings writeback can't silently reset the gate to false.
+    mobile_relay_allow_view_resize: bool,
     /// Pane ids last seen in Attention (for one-shot bell).
     prev_attention_panes: BTreeSet<String>,
     actions: Vec<UiAction>,
@@ -1063,6 +1066,7 @@ impl Ui {
             mobile_relay_allow_localhost: config.relay.allow_localhost,
             mobile_relay_allow_cgnat: config.relay.allow_tailnet_cgnat,
             mobile_relay_allow_paste: config.relay.allow_paste,
+            mobile_relay_allow_view_resize: config.relay.allow_view_resize,
             prev_attention_panes: BTreeSet::new(),
             actions: Vec::new(),
             action_error: std::cell::RefCell::new(None),
@@ -2449,6 +2453,7 @@ impl Ui {
             allow_localhost: self.mobile_relay_allow_localhost,
             allow_tailnet_cgnat: self.mobile_relay_allow_cgnat,
             allow_paste: self.mobile_relay_allow_paste,
+            allow_view_resize: self.mobile_relay_allow_view_resize,
         }
     }
 
@@ -8574,6 +8579,8 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         allow_localhost: view.mobile_relay_allow_localhost,
                         allow_tailnet_cgnat: view.mobile_relay_allow_cgnat,
                         allow_paste: view.mobile_relay_allow_paste,
+                        // Display-only: runtime_status_line reads enabled/bind/port.
+                        allow_view_resize: false,
                     };
                     crate::relay::runtime_status_line(&settings)
                 }
