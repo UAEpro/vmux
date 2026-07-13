@@ -190,6 +190,7 @@ struct Ui {
     mobile_relay_port: u16,
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
+    mobile_relay_allow_paste: bool,
     /// Pane ids last seen in Attention (for one-shot bell).
     prev_attention_panes: BTreeSet<String>,
     actions: Vec<UiAction>,
@@ -1061,6 +1062,7 @@ impl Ui {
             mobile_relay_port: config.relay.port,
             mobile_relay_allow_localhost: config.relay.allow_localhost,
             mobile_relay_allow_cgnat: config.relay.allow_tailnet_cgnat,
+            mobile_relay_allow_paste: config.relay.allow_paste,
             prev_attention_panes: BTreeSet::new(),
             actions: Vec::new(),
             action_error: std::cell::RefCell::new(None),
@@ -1235,6 +1237,7 @@ impl Ui {
                             self.mobile_relay_port,
                             self.mobile_relay_allow_localhost,
                             self.mobile_relay_allow_cgnat,
+                            self.mobile_relay_allow_paste,
                             self.sidebar_responsive,
                             sidebar_fit,
                             self.workspace_picker_selected,
@@ -2410,6 +2413,21 @@ impl Ui {
                     }
                 }
             }
+            SettingsEntryId::MobileRelayPaste => {
+                self.mobile_relay_allow_paste = !self.mobile_relay_allow_paste;
+                let _ = self.save_ui_config(
+                    "relay.allow_paste",
+                    &self.mobile_relay_allow_paste.to_string(),
+                );
+                if self.mobile_relay_enabled {
+                    let settings = self.relay_settings();
+                    let session = self.session.clone();
+                    let _ = crate::relay::stop_managed();
+                    if let Err(err) = crate::relay::ensure_started(&session, &settings) {
+                        *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
+                    }
+                }
+            }
             SettingsEntryId::HookShell
             | SettingsEntryId::HookClaude
             | SettingsEntryId::HookCodex
@@ -2430,6 +2448,7 @@ impl Ui {
             port: self.mobile_relay_port,
             allow_localhost: self.mobile_relay_allow_localhost,
             allow_tailnet_cgnat: self.mobile_relay_allow_cgnat,
+            allow_paste: self.mobile_relay_allow_paste,
         }
     }
 
@@ -3704,6 +3723,7 @@ fn draw(
     mobile_relay_port: u16,
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
+    mobile_relay_allow_paste: bool,
     sidebar_responsive: bool,
     sidebar_fit: bool,
     workspace_picker_selected: usize,
@@ -3920,6 +3940,7 @@ fn draw(
                 mobile_relay_port,
                 mobile_relay_allow_localhost,
                 mobile_relay_allow_cgnat,
+                mobile_relay_allow_paste,
                 selected: settings_selected,
             },
         ),
@@ -8226,6 +8247,7 @@ enum SettingsEntryId {
     MobileRelay,
     MobileRelayBind,
     MobileRelayLocalhost,
+    MobileRelayPaste,
     Section,
     HookShell,
     HookClaude,
@@ -8322,6 +8344,10 @@ fn settings_entries() -> Vec<SettingsEntry> {
             name: "relay localhost",
         },
         SettingsEntry {
+            id: SettingsEntryId::MobileRelayPaste,
+            name: "paste page",
+        },
+        SettingsEntry {
             id: SettingsEntryId::Section,
             name: "── agent hooks ──",
         },
@@ -8370,6 +8396,7 @@ struct SettingsView<'a> {
     mobile_relay_port: u16,
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
+    mobile_relay_allow_paste: bool,
     selected: usize,
 }
 
@@ -8467,6 +8494,7 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         port: view.mobile_relay_port,
                         allow_localhost: view.mobile_relay_allow_localhost,
                         allow_tailnet_cgnat: view.mobile_relay_allow_cgnat,
+                        allow_paste: view.mobile_relay_allow_paste,
                     };
                     crate::relay::runtime_status_line(&settings)
                 }
@@ -8480,6 +8508,13 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         "allow register from 127.0.0.1".to_string()
                     } else {
                         "deny localhost register".to_string()
+                    }
+                }
+                SettingsEntryId::MobileRelayPaste => {
+                    if view.mobile_relay_allow_paste {
+                        "on · browser screenshot paste at /paste".to_string()
+                    } else {
+                        "off · /paste returns 404".to_string()
                     }
                 }
                 SettingsEntryId::Section => "sidebar emoji for agents".to_string(),
@@ -8787,6 +8822,7 @@ mod tests {
                     4399,
                     false,
                     true,
+                    true,  // mobile_relay_allow_paste
                     false, // sidebar_responsive off so tests keep the rail
                     false, // sidebar_fit
                     0,     // workspace_picker_selected
@@ -8863,6 +8899,7 @@ mod tests {
                     4399,
                     false,
                     true,
+                    true,  // mobile_relay_allow_paste
                     false, // sidebar_responsive off so tests keep the rail
                     false, // sidebar_fit
                     0,     // workspace_picker_selected
@@ -10109,6 +10146,7 @@ mod tests {
             mobile_relay_port: 4399,
             mobile_relay_allow_localhost: false,
             mobile_relay_allow_cgnat: true,
+            mobile_relay_allow_paste: true,
             selected: 0,
         });
 

@@ -57,6 +57,10 @@ pub struct RelayConfig {
     pub idle_fps: u32,
     /// vmux session the relay attaches to.
     pub session: String,
+    /// Serve the browser paste page (GET /paste, POST /v1/paste). Defaults to
+    /// on — uploads still require a paired device token. `vmux config set
+    /// relay.allow_paste false` (or the Settings panel) turns it off.
+    pub allow_paste: bool,
     /// When set (non-empty), **every** device registration must present this
     /// secret via `X-Vmux-Bootstrap` or `Authorization: Bootstrap <secret>`.
     /// Whois/localhost/CGNAT identity still applies after the secret check.
@@ -73,6 +77,7 @@ impl Default for RelayConfig {
             allow_login: Vec::new(),
             allow_localhost: false,
             allow_tailnet_cgnat: false,
+            allow_paste: true,
             default_fps: DEFAULT_FPS,
             idle_fps: DEFAULT_IDLE_FPS,
             session: "default".to_string(),
@@ -334,10 +339,12 @@ pub fn serve(
         "  health:  curl -s http://127.0.0.1:{}/v1/health",
         port_of(&config.listen).unwrap_or(4399)
     );
-    eprintln!(
-        "  paste:   http://<this-host>:{}/paste — paste screenshots from any browser into the active pane",
-        port_of(&config.listen).unwrap_or(4399)
-    );
+    if config.allow_paste {
+        eprintln!(
+            "  paste:   http://<this-host>:{}/paste — paste screenshots from any browser into the active pane",
+            port_of(&config.listen).unwrap_or(4399)
+        );
+    }
     eprintln!("  config:  {}", path.display());
     eprintln!("  devices: {}", devices_path()?.display());
     eprintln!("  max conns: {MAX_RELAY_CONNECTIONS}");
@@ -584,6 +591,7 @@ pub fn sync_relay_json_from_settings(session: &str, settings: &RelaySettings) ->
     file_cfg.session = session.to_string();
     file_cfg.allow_localhost = settings.allow_localhost;
     file_cfg.allow_tailnet_cgnat = settings.allow_tailnet_cgnat;
+    file_cfg.allow_paste = settings.allow_paste;
     // Keep empty allow_login = any successful whois / CGNAT policy.
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -843,6 +851,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
     // /v1/paste is the one route allowed a large body, and only once the
     // Bearer token checks out — unauthenticated peers keep the small cap.
     let body_cap = if method == "POST" && path == "/v1/paste" {
+        if !state.config.allow_paste {
+            write_http(&mut stream, 404, "text/plain", b"paste disabled")?;
+            return Ok(());
+        }
         if auth_device_from_headers(&headers, &state.devices).is_none() {
             write_http(&mut stream, 401, "text/plain", b"unauthorized")?;
             return Ok(());
@@ -878,6 +890,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/paste") => {
+            if !state.config.allow_paste {
+                write_http(&mut stream, 404, "text/plain", b"paste disabled")?;
+                return Ok(());
+            }
             // Static page, no secrets: pairing/auth happens from its JS via
             // the same registration flow the phone app uses.
             let page = PASTE_PAGE.replace("{{SESSION}}", &state.config.session);
@@ -2307,6 +2323,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relay_config_without_allow_paste_defaults_on() {
+        // Configs written before the paste page existed must keep serving it
+        // (serde default), and an explicit false must stick.
+        let old: RelayConfig = serde_json::from_str(r#"{"listen":"127.0.0.1:4399"}"#).unwrap();
+        assert!(old.allow_paste);
+        let off: RelayConfig =
+            serde_json::from_str(r#"{"listen":"127.0.0.1:4399","allow_paste":false}"#).unwrap();
+        assert!(!off.allow_paste);
+    }
+
+    #[test]
     fn parse_query_extracts_pane_and_enter() {
         let q = parse_query("/v1/paste?pane=pane-2&enter=1");
         assert_eq!(q.get("pane").map(String::as_str), Some("pane-2"));
@@ -2404,6 +2431,7 @@ mod tests {
             port: 4399,
             allow_localhost: false,
             allow_tailnet_cgnat: true,
+            allow_paste: true,
         };
         assert_eq!(resolve_listen(&local), "127.0.0.1:4399");
         let all_migrated = RelaySettings {

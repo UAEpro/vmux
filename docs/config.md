@@ -25,8 +25,8 @@ vmux config set ui.prefix_key Ctrl-a
 | `agent_titles.llm_command` | `claude -p` | Headless command that reads a prompt and prints a title |
 | `agent_titles.llm_delay_ms` | `20000` | How long to wait for the agent's own title first |
 
-Relay keys (`relay.enabled`, `relay.bind`, `relay.allow_localhost`) are covered
-in [relay.md](relay.md).
+Relay keys (`relay.enabled`, `relay.bind`, `relay.allow_localhost`,
+`relay.allow_paste`) are covered in [relay.md](relay.md).
 
 ## Automatic tab names
 

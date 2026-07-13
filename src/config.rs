@@ -67,6 +67,9 @@ pub struct RelaySettings {
     pub allow_localhost: bool,
     /// Accept Tailscale CGNAT peers without whois (practical on Linux).
     pub allow_tailnet_cgnat: bool,
+    /// Serve the browser paste page (GET /paste, POST /v1/paste) for
+    /// pasting screenshots into panes from other devices.
+    pub allow_paste: bool,
 }
 
 impl Default for RelaySettings {
@@ -79,6 +82,9 @@ impl Default for RelaySettings {
             // Safer default: require Tailscale whois (or bootstrap) rather than
             // trusting any CGNAT peer (newimp §8).
             allow_tailnet_cgnat: false,
+            // On by default: uploads still require a paired device token, and
+            // the relay itself is opt-in.
+            allow_paste: true,
         }
     }
 }
@@ -319,6 +325,9 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
         }
         "relay.allow_tailnet_cgnat" => {
             config.relay.allow_tailnet_cgnat = parse_bool(value)?;
+        }
+        "relay.allow_paste" => {
+            config.relay.allow_paste = parse_bool(value)?;
         }
         "agent_titles.enabled" => {
             config.agent_titles.enabled = parse_bool(value)?;
@@ -726,6 +735,9 @@ mod tests {
         set_value(&mut config, "ui.mouse", "false").unwrap();
         set_value(&mut config, "ui.tab_close_button", "0").unwrap();
         set_value(&mut config, "ui.bell_on_attention", "on").unwrap();
+        assert!(config.relay.allow_paste); // default on
+        set_value(&mut config, "relay.allow_paste", "false").unwrap();
+        assert!(!config.relay.allow_paste);
         assert!(config.ui.sidebar_collapsed);
         assert_eq!(config.ui.prefix_key, "Alt-x");
         assert_eq!(config.ui.scroll_step, 50);

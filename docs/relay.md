@@ -118,5 +118,13 @@ token). `?pane=pane-2` targets a pane other than the active one, `?enter=1`
 submits immediately. Uploads land in `~/Downloads/vmux-remote/` and are capped
 at 16 MiB; bodies that are not a real png/jpeg/gif/webp/bmp are rejected.
 
+The page is on by default (uploads still require a paired device). To turn it
+off — `/paste` and `/v1/paste` then return 404 — flip "paste page" in the
+Settings panel, or:
+
+```sh
+vmux config set relay.allow_paste false
+```
+
 For scripting the same thing over plain SSH, see `vmux send-image` in the
 [CLI reference](cli.md).
