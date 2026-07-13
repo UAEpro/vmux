@@ -1,7 +1,8 @@
 [package]
-name = "vmux"
+name = "vmux-tui"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 description = "The Linux terminal born from the cmux revolution — agent-first TTY multiplexer"
 license = "MIT"
 authors = ["Mayed Abdulla <UAEpro@live.com>"]
@@ -10,6 +11,21 @@ keywords = ["terminal", "multiplexer", "tui", "cli", "tmux"]
 categories = ["command-line-utilities", "development-tools"]
 repository = "https://github.com/UAEpro/vmux"
 homepage = "https://github.com/UAEpro/vmux"
+exclude = [
+    "*.md",
+    "!README.md",
+    ".github/",
+    ".agents/",
+    ".claude/",
+    ".codex/",
+    "install.sh",
+]
+
+# The crate is published as `vmux-tui` (the `vmux` name was already taken on
+# crates.io), but the installed command is still `vmux`.
+[[bin]]
+name = "vmux"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -29,3 +45,13 @@ thiserror = "1"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 unicode-width = "0.1"
 vt100 = "0.16.2"
+
+# Dev builds: optimize dependencies (vt100 parsing, serde_json, ratatui are the
+# hot path and are 10-50x slower unoptimized) while keeping the vmux crate
+# itself at opt-level 0 for fast incremental compiles. Dependencies only
+# recompile when they change, so the one-time cost is paid on the next build.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
