@@ -540,7 +540,10 @@ impl Server {
                     (
                         workspace.id.clone(),
                         workspace.cwd.clone(),
-                        workspace.active_pane.clone().or_else(|| workspace.first_pane()),
+                        workspace
+                            .active_pane
+                            .clone()
+                            .or_else(|| workspace.first_pane()),
                         workspace
                             .all_pane_ids()
                             .into_iter()
@@ -4444,7 +4447,11 @@ mod tests {
         let server = Arc::new(Server::load(&format!("vmux-idle-note-{}", unix_time())).unwrap());
         {
             let mut session = server.session.lock_or_recover();
-            let mut pane = Pane::new("pane-1".to_string(), "claude".to_string(), SplitDirection::Right);
+            let mut pane = Pane::new(
+                "pane-1".to_string(),
+                "claude".to_string(),
+                SplitDirection::Right,
+            );
             touch_agent_status(&mut pane, AgentStatus::Done, true);
             session.panes.insert("pane-1".to_string(), pane);
         }
