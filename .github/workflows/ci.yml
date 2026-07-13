@@ -9,8 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: fmt · clippy · test · build
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,33 +18,49 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+          components: rustfmt
 
       - name: Format
         run: cargo fmt --all -- --check
+
+  check:
+    name: clippy · test · build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A macOS-only failure should not hide the Linux result, or vice versa.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    env:
+      # Isolated XDG so tests never touch the runner's real state. (Do NOT
+      # override HOME — rustup's toolchain lives under $HOME/.rustup, and
+      # pointing HOME elsewhere hides it: "no default toolchain configured".)
+      #
+      # macOS has no XDG_RUNTIME_DIR of its own; vmux falls back to
+      # /tmp/vmux-$uid there, but setting it keeps both runners on the same
+      # paths, so a test that leaks state fails the same way on each.
+      XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
+      XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
+      XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --all-targets
-        env:
-          # Isolated XDG so tests never touch the runner's real state. (Do NOT
-          # override HOME — rustup's toolchain lives under $HOME/.rustup, and
-          # pointing HOME elsewhere hides it: "no default toolchain configured".)
-          XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
-          XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
-          XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
 
       - name: Restart persistence e2e
         run: cargo test --all-targets e2e_restart_preserves_scrollback -- --exact --nocapture
-        env:
-          XDG_RUNTIME_DIR: ${{ runner.temp }}/vmux-xdg-runtime
-          XDG_CONFIG_HOME: ${{ runner.temp }}/vmux-xdg-config
-          XDG_STATE_HOME: ${{ runner.temp }}/vmux-xdg-state
 
       - name: Release build
         run: cargo build --release

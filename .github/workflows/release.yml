@@ -1,8 +1,14 @@
 name: Release
 
 # Cut a release by pushing a semver tag:  git tag v0.1.0 && git push origin v0.1.0
-# Builds a static (musl) x86_64 Linux binary, checksums it, and publishes a
-# GitHub Release. `releases/latest` is what `vmux`'s update notifier reads.
+#
+# Builds one binary per target, then publishes them all to a single GitHub
+# Release. `releases/latest` is what `vmux`'s update notifier reads, and
+# install.sh picks the tarball matching the host's uname -s / -m.
+#
+# Linux binaries are static (musl) so they run on any distro. macOS binaries
+# are built on an arm64 runner; the x86_64 one is a cross-compile, which Apple's
+# toolchain handles natively (both SDK arches ship with Xcode).
 on:
   push:
     tags: ["v*"]
@@ -10,47 +16,148 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+  # Strip via rustc rather than the `strip` binary: GNU strip and Apple strip
+  # take different flags, and this works identically on every target.
+  RUSTFLAGS: -C strip=symbols
+
 jobs:
-  release:
-    name: Build + publish (x86_64 musl static)
+  guard:
+    name: Check tag matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust + musl target
+      # A crates.io publish cannot be undone (only yanked), so refuse to start
+      # a release whose tag disagrees with the version that would be published.
+      - name: Compare versions
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          echo "tag=${tagged} Cargo.toml=${manifest}"
+          if [ "${tagged}" != "${manifest}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${manifest}" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: guard
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One broken target should not hide the others' results.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            musl: true
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - name: Install musl tools
+        if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: Build (static)
-        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
-        id: package
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          name="vmux-${version}-x86_64-unknown-linux-musl"
+          name="vmux-${version}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
-          cp "target/x86_64-unknown-linux-musl/release/vmux" "dist/${name}/"
-          strip "dist/${name}/vmux" || true
-          cp README.md LICENSE "dist/${name}/" 2>/dev/null || true
-          tar -C dist -czf "${name}.tar.gz" "${name}"
-          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
-          echo "tarball=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          cp "target/${{ matrix.target }}/release/vmux" "dist/${name}/"
+          cp README.md LICENSE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          # macOS runners have no sha256sum; Linux runners have no shasum. The
+          # output format is identical, and install.sh verifies with whichever
+          # it finds.
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          else
+            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          fi
 
-      - name: Publish GitHub Release
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Publishing happens once, after every target has built, so a release is
+      # never left half-populated (and so `gh release create` can't race itself
+      # across matrix jobs).
+      - name: Download builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          ls -l dist
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            "${{ steps.package.outputs.tarball }}" \
-            "${{ steps.package.outputs.tarball }}.sha256"
+            dist/*.tar.gz dist/*.tar.gz.sha256
+
+  crates-io:
+    name: Publish to crates.io
+    # Only after every target has built. A publish is permanent (a bad version
+    # can be yanked, never replaced), so it must not be the thing that
+    # discovers a target does not compile.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Cargo reads the token from this variable; set it for the whole job so
+      # the dry run exercises exactly the path the real publish takes.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo publish --locked --dry-run
+          cargo publish --locked

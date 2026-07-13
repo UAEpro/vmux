@@ -25,14 +25,18 @@ language you did not ask for.
 
 ## Install
 
-Prebuilt static binary, Linux x86_64:
+Prebuilt binary — Linux (x86_64, aarch64) and macOS (Apple silicon, Intel):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/UAEpro/vmux/main/install.sh | sh
 ```
 
-This puts `vmux` in `~/.local/bin` (override with `VMUX_INSTALL_DIR`) and
-verifies the release checksum.
+This picks the build for your platform, puts `vmux` in `~/.local/bin` (override
+with `VMUX_INSTALL_DIR`) and verifies the release checksum. The Linux binaries
+are static, so they run on any distro.
+
+Windows is not supported: vmux is built on Unix domain sockets, `fork`/`setsid`
+and POSIX signals. It runs under WSL.
 
 From crates.io, with Rust 1.87 or newer:
 
