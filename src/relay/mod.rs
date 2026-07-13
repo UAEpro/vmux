@@ -1329,6 +1329,21 @@ fn handle_ws_upgrade(
                         .get("ansi")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    // Phone-fit (both must be present): shrink the pane's PTY
+                    // to the viewer while subscribed. The poller holds a lease
+                    // on the daemon and re-signs it every cycle, so a phone
+                    // that dies without unsubscribing restores the pane once
+                    // the lease runs out.
+                    let view_size = match (
+                        params.get("view_cols").and_then(|v| v.as_u64()),
+                        params.get("view_rows").and_then(|v| v.as_u64()),
+                    ) {
+                        (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some((
+                            cols.min(u16::MAX as u64) as u16,
+                            rows.min(u16::MAX as u64) as u16,
+                        )),
+                        _ => None,
+                    };
 
                     // stop existing sub for this surface
                     if let Some(flag) = stop_flags.lock_or_recover().remove(&surface_id) {
@@ -1340,8 +1355,7 @@ fn handle_ws_upgrade(
 
                     let stop = Arc::new(AtomicBool::new(false));
                     stop_flags
-                        .lock()
-                        .expect("flags")
+                        .lock_or_recover()
                         .insert(surface_id.clone(), Arc::clone(&stop));
                     let socket = state.socket.clone();
                     let push = Arc::clone(&push_tx);
@@ -1355,6 +1369,7 @@ fn handle_ws_upgrade(
                             sid,
                             lines,
                             ansi,
+                            view_size,
                             fps,
                             idle_fps,
                             stop,
@@ -1570,6 +1585,13 @@ struct ScreenSnap {
     cursor_y: i64,
 }
 
+/// How long the daemon holds a phone-fit view override without hearing from
+/// us again. Re-signed by the poller every `VIEW_RELEASE_EVERY`, so the pane
+/// restores within seconds of the phone vanishing, while surviving ordinary
+/// poll jitter comfortably.
+const VIEW_LEASE_MS: u64 = 10_000;
+const VIEW_RELEASE_EVERY: Duration = Duration::from_secs(2);
+
 #[allow(clippy::too_many_arguments)]
 fn run_surface_poller(
     socket: PathBuf,
@@ -1577,6 +1599,7 @@ fn run_surface_poller(
     surface_id: String,
     lines: usize,
     ansi: bool,
+    view_size: Option<(u16, u16)>,
     active_fps: u32,
     idle_fps: u32,
     stop: Arc<AtomicBool>,
@@ -1586,8 +1609,27 @@ fn run_surface_poller(
     let mut prev: Option<ScreenSnap> = None;
     let mut last_activity = Instant::now();
     let mut last_checksum = Instant::now() - Duration::from_secs(10);
+    // Force an immediate first lease (before the first frame, so the phone's
+    // first paint is already phone-sized).
+    let mut last_lease = Instant::now() - 2 * VIEW_RELEASE_EVERY;
 
     while !stop.load(Ordering::Relaxed) {
+        if let Some((cols, rows)) = view_size {
+            if last_lease.elapsed() >= VIEW_RELEASE_EVERY {
+                last_lease = Instant::now();
+                // Best-effort: a zoomed pane refuses the override, and the
+                // phone then simply sees the wrapped desktop-size screen.
+                let _ = protocol::request(
+                    &socket,
+                    &Request::SetPaneViewSize {
+                        pane: surface_id.clone(),
+                        cols,
+                        rows,
+                        lease_ms: VIEW_LEASE_MS,
+                    },
+                );
+            }
+        }
         // Non-empty screen diffs bump last_activity so FPS returns to active.
         let current_fps = if last_activity.elapsed() > Duration::from_millis(1500) {
             idle_fps.max(1)
@@ -1663,6 +1705,18 @@ fn run_surface_poller(
         }
 
         thread::sleep(interval);
+    }
+
+    // Explicit restore on the way out (unsubscribe and WS teardown both join
+    // this thread). The lease above is the backstop for paths that never get
+    // here — a killed relay process, a panicking poller.
+    if view_size.is_some() {
+        let _ = protocol::request(
+            &socket,
+            &Request::ClearPaneViewSize {
+                pane: surface_id.clone(),
+            },
+        );
     }
 }
 

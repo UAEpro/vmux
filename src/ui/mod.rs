@@ -6316,6 +6316,10 @@ fn draw_single_pane(
             Paragraph::new(text).style(Style::default().fg(palette.text).bg(palette.surface_alt)),
             content,
         );
+        // Phone-fit: the PTY is being held smaller than this layout box by a
+        // remote viewer. Dim the dead margin and say why, tmux-style, so the
+        // person at the desk knows the pane isn't broken.
+        draw_view_size_margins(frame, content, pane, palette);
         // Host caret tracks the active pane only (hidden while blink is off).
         if show_cursor {
             if let Some((x, y)) = host_cursor_position(pane, content, scroll_offset) {
@@ -6335,6 +6339,81 @@ fn draw_single_pane(
                 .find(|w| w.panes.iter().any(|p| p == pane_id))
                 .and_then(|w| w.layout.as_ref());
             draw_pane_controls(frame, area, pane_id, layout, hover_pane_control, theme);
+        }
+    }
+}
+
+/// When a phone-fit view override is live (`pane.view_size`), the PTY grid is
+/// smaller than the pane's layout box. Dim the unused right/bottom margin and
+/// label it, so the desktop user can tell "a phone is viewing this" from "the
+/// program stopped drawing".
+fn draw_view_size_margins(
+    frame: &mut ratatui::Frame,
+    content: Rect,
+    pane: &crate::model::Pane,
+    palette: ThemePalette,
+) {
+    if pane.view_size.is_none() {
+        return;
+    }
+    // The actual grid the daemon applied (min of layout and view); fall back to
+    // the advertised view size when the snapshot predates the grid fields.
+    let eff_cols = pane
+        .screen_cols
+        .or(pane.view_size.map(|v| v.cols))
+        .unwrap_or(content.width);
+    let eff_rows = pane
+        .screen_rows
+        .or(pane.view_size.map(|v| v.rows))
+        .unwrap_or(content.height);
+    let dim = Style::default()
+        .fg(palette.muted)
+        .bg(palette.background)
+        .add_modifier(Modifier::DIM);
+
+    let right_width = content.width.saturating_sub(eff_cols);
+    if right_width > 0 {
+        let margin = Rect {
+            x: content.x + eff_cols,
+            y: content.y,
+            width: right_width,
+            height: content.height,
+        };
+        frame.render_widget(Block::default().style(dim), margin);
+        let note = "sized by phone";
+        if right_width as usize >= note.len() + 2 && content.height >= 1 {
+            frame.render_widget(
+                Paragraph::new(note).style(dim),
+                Rect {
+                    x: margin.x + 1,
+                    y: margin.y + margin.height / 2,
+                    width: margin.width - 1,
+                    height: 1,
+                },
+            );
+        }
+    }
+    let bottom_height = content.height.saturating_sub(eff_rows);
+    if bottom_height > 0 {
+        let margin = Rect {
+            x: content.x,
+            y: content.y + eff_rows,
+            width: content.width,
+            height: bottom_height,
+        };
+        frame.render_widget(Block::default().style(dim), margin);
+        // Only label here when the right margin couldn't (too narrow or absent).
+        let note = "sized by phone";
+        if (right_width as usize) < note.len() + 2 && content.width as usize >= note.len() + 2 {
+            frame.render_widget(
+                Paragraph::new(note).style(dim),
+                Rect {
+                    x: margin.x + 1,
+                    y: margin.y,
+                    width: margin.width - 1,
+                    height: 1,
+                },
+            );
         }
     }
 }
@@ -9895,6 +9974,40 @@ mod tests {
         let rendered = render_to_string(&session, false);
 
         assert!(rendered.matches('x').count() < 80);
+    }
+
+    #[test]
+    fn phone_sized_pane_labels_its_dead_margin() {
+        let mut session = Session::new("test");
+        let mut pane = crate::model::Pane::new(
+            "pane-1".to_string(),
+            "sh".to_string(),
+            SplitDirection::Right,
+        );
+        pane.output = "hello".to_string();
+        pane.output_formatted = pane.output.clone();
+        // A phone holds this pane at 30 columns; the layout box is ~80.
+        pane.view_size = Some(crate::model::PaneViewSize { cols: 30, rows: 20 });
+        pane.screen_cols = Some(30);
+        pane.screen_rows = Some(20);
+        session.workspaces[0].panes = vec!["pane-1".to_string()];
+        session.workspaces[0].active_pane = Some("pane-1".to_string());
+        session.workspaces[0].layout = Some(LayoutNode::Pane {
+            pane: "pane-1".to_string(),
+        });
+        session.panes.insert("pane-1".to_string(), pane);
+
+        let rendered = render_to_string(&session, false);
+        assert!(
+            rendered.contains("sized by phone"),
+            "margin note missing:\n{rendered}"
+        );
+
+        // Without the override the note must not appear.
+        session.panes.get_mut("pane-1").unwrap().view_size = None;
+        invalidate_pane_line_cache();
+        let rendered = render_to_string(&session, false);
+        assert!(!rendered.contains("sized by phone"));
     }
 
     #[test]

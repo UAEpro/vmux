@@ -370,6 +370,34 @@ fn main() -> Result<()> {
             )?;
             print_response(response)
         }
+        Command::ViewSize {
+            pane,
+            cols,
+            rows,
+            lease_ms,
+            clear,
+        } => {
+            daemon::ensure_running(session)?;
+            let pane = pane
+                .or_else(|| std::env::var("VMUX_PANE_ID").ok())
+                .or_else(|| std::env::var("VMUX_SURFACE_ID").ok())
+                .ok_or_else(|| anyhow!("--pane required (not running inside a vmux pane)"))?;
+            let request = if clear {
+                protocol::Request::ClearPaneViewSize { pane }
+            } else {
+                let (Some(cols), Some(rows)) = (cols, rows) else {
+                    anyhow::bail!("pass --cols and --rows, or --clear");
+                };
+                protocol::Request::SetPaneViewSize {
+                    pane,
+                    cols,
+                    rows,
+                    lease_ms,
+                }
+            };
+            let response = protocol::request(&paths::socket_path(session)?, &request)?;
+            print_response(response)
+        }
         Command::Focus { direction } => {
             daemon::ensure_running(session)?;
             let response = protocol::request(
