@@ -16,8 +16,8 @@ use crate::model::{
     acknowledge_done_status, condense_agent_title, decay_stale_busy, direction_axis,
     infer_agent_status, insert_pane_in_layout, is_coding_agent_command, merge_agent_status,
     next_pane_in_layout, resize_layout, touch_agent_status, unix_time, AgentStatus, ClipboardItem,
-    DaemonInfo, EventRecord, ListeningPort, Notification, Pane, PaneStatus, PaneTab,
-    PullRequestInfo, Session, SurfaceKind,
+    DaemonInfo, EventRecord, ListeningPort, Notification, Pane, PaneStatus, PaneTab, Session,
+    SurfaceKind,
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
@@ -398,38 +398,15 @@ fn chunked_line_count(output: &VecDeque<String>) -> usize {
 }
 
 /// Cached per-workspace metadata populated by a background thread so the
-/// snapshot hot path never spawns git/gh/ss subprocesses.
+/// snapshot hot path never spawns git/ss subprocesses.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct WorkspaceMeta {
     git_branch: Option<String>,
-    pull_request: Option<PullRequestInfo>,
     ports: Vec<ListeningPort>,
     /// Live working directory of the workspace's active pane shell, so the
     /// sidebar path follows `cd` instead of pinning the spawn cwd. `None` when
     /// it can't be read (pane gone, non-Linux) — the persisted cwd then shows.
     cwd: Option<String>,
-}
-
-/// How long a `gh pr view` answer is trusted before the workspace-meta loop
-/// asks GitHub again (sooner if the repo path or branch changes). 60s turns
-/// 720 billed API calls/hour/workspace into at most 60 — the difference
-/// between the sidebar's PR chip and draining the account's 5000/hour quota.
-const PR_INFO_TTL: Duration = Duration::from_secs(60);
-
-/// One remembered `gh pr view` result for a workspace (see `PR_INFO_TTL`).
-struct PrProbe {
-    /// Repo path + branch the answer was fetched for.
-    key: String,
-    at: Instant,
-    value: Option<PullRequestInfo>,
-}
-
-impl PrProbe {
-    /// Still trustworthy: same repo/branch, and younger than the TTL. `None`
-    /// answers count too — a workspace with no PR must not retry every tick.
-    fn is_fresh(&self, key: &str, now: Instant) -> bool {
-        self.key == key && now.duration_since(self.at) < PR_INFO_TTL
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -651,27 +628,18 @@ impl Server {
     }
 
     fn refresh_workspace_meta_loop(self: Arc<Self>) {
-        // PR-probe memory lives with the loop: it must survive ticks (that is
-        // what rate-limits gh) but needs no locking (only this thread grows it).
-        let mut pr_probes: BTreeMap<String, PrProbe> = BTreeMap::new();
         loop {
-            self.refresh_workspace_meta(&mut pr_probes);
+            self.refresh_workspace_meta();
             thread::sleep(Duration::from_secs(5));
         }
     }
 
-    /// Recompute cached git/gh/ss metadata for every workspace. Runs only on
+    /// Recompute cached git/ss metadata for every workspace. Runs only on
     /// the background thread and never holds `panes`/`session` while spawning
-    /// subprocesses.
-    ///
-    /// git/ss are local and cheap, so they run every tick. `gh pr view` is a
-    /// GitHub API call billed against the user's account: at the old
-    /// tick-every-5s rate that was 720 calls/hour *per workspace*, which
-    /// drained the 5000/hour API quota on its own once `gh auth login` had
-    /// run (and burned the anonymous IP limit before that). PR state changes
-    /// rarely, so `pr_probes` re-asks gh only when the workspace's repo path
-    /// or branch changes, or `PR_INFO_TTL` has elapsed.
-    fn refresh_workspace_meta(&self, pr_probes: &mut BTreeMap<String, PrProbe>) {
+    /// subprocesses. Everything here is local and cheap — vmux deliberately
+    /// makes no network calls for sidebar metadata (querying GitHub for PR
+    /// state from a background loop once drained the account's API quota).
+    fn refresh_workspace_meta(&self) {
         let workspaces = {
             let session = self.session.lock_or_recover();
             session
@@ -713,44 +681,15 @@ impl Server {
                 .iter()
                 .filter_map(|pane| pane_pids.get(pane).copied())
                 .collect::<Vec<_>>();
-            let git_branch = git_branch(path);
-
-            // A PR probe is keyed by repo path + branch: switching either asks
-            // gh immediately, everything else waits out the TTL.
-            let probe_key = format!(
-                "{}\n{}",
-                path.display(),
-                git_branch.as_deref().unwrap_or("")
-            );
-            let now = Instant::now();
-            let pull_request = match pr_probes.get(&id) {
-                Some(probe) if probe.is_fresh(&probe_key, now) => probe.value.clone(),
-                _ => {
-                    let value = pull_request_info(path);
-                    pr_probes.insert(
-                        id.clone(),
-                        PrProbe {
-                            key: probe_key,
-                            at: now,
-                            value: value.clone(),
-                        },
-                    );
-                    value
-                }
-            };
-
             updated.insert(
                 id,
                 WorkspaceMeta {
-                    git_branch,
-                    pull_request,
+                    git_branch: git_branch(path),
                     ports: listening_ports_for_roots(&roots),
                     cwd: live_cwd,
                 },
             );
         }
-        // Drop probes for workspaces that no longer exist.
-        pr_probes.retain(|id, _| updated.contains_key(id));
         let mut cache = self.workspace_meta.lock_or_recover();
         if *cache != updated {
             *cache = updated;
@@ -763,11 +702,9 @@ impl Server {
     /// created or re-homed workspace shows its git branch / PR without waiting
     /// for the next 5s background tick. Runs off the request thread and holds no
     /// session/panes lock while spawning git/gh/ss (which are timeout-bounded).
-    /// The empty probe map means a nudge always asks gh — that immediacy is the
-    /// point of a nudge, and nudges are rare (workspace created / re-homed).
     fn nudge_workspace_meta(self: &Arc<Self>) {
         let server = Arc::clone(self);
-        thread::spawn(move || server.refresh_workspace_meta(&mut BTreeMap::new()));
+        thread::spawn(move || server.refresh_workspace_meta());
     }
 
     fn handle_stream(self: Arc<Self>, stream: UnixStream) -> Result<()> {
@@ -3780,7 +3717,11 @@ impl Server {
             for workspace in &mut session.workspaces {
                 if let Some(cached) = meta.get(&workspace.id) {
                     workspace.git_branch = cached.git_branch.clone();
-                    workspace.pull_request = cached.pull_request.clone();
+                    // No longer populated: vmux stopped querying GitHub for PR
+                    // state (background `gh pr view` polling billed the user's
+                    // API quota). Clear rather than skip, so a value persisted
+                    // by an older daemon cannot linger as a stale chip.
+                    workspace.pull_request = None;
                     workspace.ports = cached.ports.clone();
                     // Display-only overlay: the persisted workspace cwd (used
                     // to spawn new panes) is left untouched.
@@ -4734,45 +4675,6 @@ fn git_branch(cwd: &Path) -> Option<String> {
 fn pane_live_cwd(pid: u32) -> Option<String> {
     let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     path.is_absolute().then(|| path.display().to_string())
-}
-
-fn pull_request_info(cwd: &Path) -> Option<PullRequestInfo> {
-    let mut command = Command::new("gh");
-    command
-        .arg("pr")
-        .arg("view")
-        .arg("--json")
-        .arg("number,state,title,url,isDraft")
-        .current_dir(cwd);
-    let output = run_with_timeout(command, METADATA_SUBPROCESS_TIMEOUT)?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_pull_request_info(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_pull_request_info(output: &str) -> Option<PullRequestInfo> {
-    let value: serde_json::Value = serde_json::from_str(output).ok()?;
-    Some(PullRequestInfo {
-        number: value.get("number")?.as_u64()?,
-        state: value
-            .get("state")
-            .and_then(|item| item.as_str())
-            .unwrap_or("UNKNOWN")
-            .to_string(),
-        title: value
-            .get("title")
-            .and_then(|item| item.as_str())
-            .map(ToOwned::to_owned),
-        url: value
-            .get("url")
-            .and_then(|item| item.as_str())
-            .map(ToOwned::to_owned),
-        draft: value
-            .get("isDraft")
-            .and_then(|item| item.as_bool())
-            .unwrap_or(false),
-    })
 }
 
 fn listening_ports_for_roots(roots: &[u32]) -> Vec<ListeningPort> {
@@ -6323,48 +6225,6 @@ mod tests {
         );
         assert_eq!(meta.bytes, Some(1234));
         assert_eq!(meta.redirects, Some(1));
-    }
-
-    /// The PR probe is the daemon's only rate limit on `gh pr view` — get the
-    /// freshness rules wrong in the "always stale" direction and every tick
-    /// bills a GitHub API call again (720/hour/workspace, which drained a real
-    /// account's 5000/hour quota); wrong in the "always fresh" direction and
-    /// the sidebar's PR chip goes permanently stale.
-    #[test]
-    fn pr_probe_freshness_rules() {
-        let now = Instant::now();
-        let probe = PrProbe {
-            key: "/repo\nmain".into(),
-            at: now,
-            value: None, // a no-PR answer is still an answer worth trusting
-        };
-        // Same repo+branch, within TTL: trust it, even when the answer was None.
-        assert!(probe.is_fresh("/repo\nmain", now + PR_INFO_TTL / 2));
-        // TTL elapsed: ask gh again.
-        assert!(!probe.is_fresh("/repo\nmain", now + PR_INFO_TTL));
-        // Branch switch: ask immediately, TTL notwithstanding.
-        assert!(!probe.is_fresh("/repo\nfeature", now + Duration::from_secs(1)));
-        // Repo (cwd) switch likewise.
-        assert!(!probe.is_fresh("/elsewhere\nmain", now + Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn parses_pull_request_info_from_gh_json() {
-        let pr = parse_pull_request_info(
-            r#"{"number":42,"state":"OPEN","title":"Add vmux","url":"https://example.test/pull/42","isDraft":true}"#,
-        )
-        .unwrap();
-
-        assert_eq!(pr.number, 42);
-        assert_eq!(pr.state, "OPEN");
-        assert_eq!(pr.title.as_deref(), Some("Add vmux"));
-        assert_eq!(pr.url.as_deref(), Some("https://example.test/pull/42"));
-        assert!(pr.draft);
-    }
-
-    #[test]
-    fn ignores_invalid_pull_request_json() {
-        assert!(parse_pull_request_info(r#"{"state":"OPEN"}"#).is_none());
     }
 
     #[test]

@@ -4919,16 +4919,14 @@ fn workspace_second_line_text(
                 .as_deref()
                 .map(|branch| format!(" @{branch}"))
                 .unwrap_or_default();
-            let pr = pull_request_label(workspace.pull_request.as_ref());
             let ports = port_label(&workspace.ports);
             let note = workspace_notification(snapshot, &workspace.id, &workspace.panes)
                 .map(|note| format!(" {}", trim_label(&note, 18)))
                 .unwrap_or_default();
             Some(format!(
-                "{}{}{}{}{}",
+                "{}{}{}{}",
                 compact_path(&workspace.cwd),
                 branch,
-                pr,
                 ports,
                 note
             ))
@@ -7769,23 +7767,6 @@ fn port_label(ports: &[crate::model::ListeningPort]) -> String {
     } else {
         format!(" :{joined}")
     }
-}
-
-fn pull_request_label(pr: Option<&crate::model::PullRequestInfo>) -> String {
-    let Some(pr) = pr else {
-        return String::new();
-    };
-    let state = if pr.draft {
-        "draft"
-    } else {
-        match pr.state.as_str() {
-            "OPEN" => "open",
-            "MERGED" => "merged",
-            "CLOSED" => "closed",
-            other => other,
-        }
-    };
-    format!(" #{}:{state}", pr.number)
 }
 
 fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize) -> String {

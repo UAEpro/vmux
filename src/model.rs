@@ -880,6 +880,10 @@ pub fn default_cwd() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// No longer populated: vmux stopped querying GitHub for PR state (the
+/// background `gh pr view` polling billed the user's API quota — the sidebar
+/// is local-only now). The type and the `Workspace.pull_request` field stay
+/// so old state files, old clients, and the phone protocol keep decoding.
 pub struct PullRequestInfo {
     pub number: u64,
     pub state: String,
