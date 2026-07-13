@@ -410,6 +410,28 @@ struct WorkspaceMeta {
     cwd: Option<String>,
 }
 
+/// How long a `gh pr view` answer is trusted before the workspace-meta loop
+/// asks GitHub again (sooner if the repo path or branch changes). 60s turns
+/// 720 billed API calls/hour/workspace into at most 60 — the difference
+/// between the sidebar's PR chip and draining the account's 5000/hour quota.
+const PR_INFO_TTL: Duration = Duration::from_secs(60);
+
+/// One remembered `gh pr view` result for a workspace (see `PR_INFO_TTL`).
+struct PrProbe {
+    /// Repo path + branch the answer was fetched for.
+    key: String,
+    at: Instant,
+    value: Option<PullRequestInfo>,
+}
+
+impl PrProbe {
+    /// Still trustworthy: same repo/branch, and younger than the TTL. `None`
+    /// answers count too — a workspace with no PR must not retry every tick.
+    fn is_fresh(&self, key: &str, now: Instant) -> bool {
+        self.key == key && now.duration_since(self.at) < PR_INFO_TTL
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct CustomAction {
     name: String,
@@ -629,8 +651,11 @@ impl Server {
     }
 
     fn refresh_workspace_meta_loop(self: Arc<Self>) {
+        // PR-probe memory lives with the loop: it must survive ticks (that is
+        // what rate-limits gh) but needs no locking (only this thread grows it).
+        let mut pr_probes: BTreeMap<String, PrProbe> = BTreeMap::new();
         loop {
-            self.refresh_workspace_meta();
+            self.refresh_workspace_meta(&mut pr_probes);
             thread::sleep(Duration::from_secs(5));
         }
     }
@@ -638,7 +663,15 @@ impl Server {
     /// Recompute cached git/gh/ss metadata for every workspace. Runs only on
     /// the background thread and never holds `panes`/`session` while spawning
     /// subprocesses.
-    fn refresh_workspace_meta(&self) {
+    ///
+    /// git/ss are local and cheap, so they run every tick. `gh pr view` is a
+    /// GitHub API call billed against the user's account: at the old
+    /// tick-every-5s rate that was 720 calls/hour *per workspace*, which
+    /// drained the 5000/hour API quota on its own once `gh auth login` had
+    /// run (and burned the anonymous IP limit before that). PR state changes
+    /// rarely, so `pr_probes` re-asks gh only when the workspace's repo path
+    /// or branch changes, or `PR_INFO_TTL` has elapsed.
+    fn refresh_workspace_meta(&self, pr_probes: &mut BTreeMap<String, PrProbe>) {
         let workspaces = {
             let session = self.session.lock_or_recover();
             session
@@ -680,16 +713,44 @@ impl Server {
                 .iter()
                 .filter_map(|pane| pane_pids.get(pane).copied())
                 .collect::<Vec<_>>();
+            let git_branch = git_branch(path);
+
+            // A PR probe is keyed by repo path + branch: switching either asks
+            // gh immediately, everything else waits out the TTL.
+            let probe_key = format!(
+                "{}\n{}",
+                path.display(),
+                git_branch.as_deref().unwrap_or("")
+            );
+            let now = Instant::now();
+            let pull_request = match pr_probes.get(&id) {
+                Some(probe) if probe.is_fresh(&probe_key, now) => probe.value.clone(),
+                _ => {
+                    let value = pull_request_info(path);
+                    pr_probes.insert(
+                        id.clone(),
+                        PrProbe {
+                            key: probe_key,
+                            at: now,
+                            value: value.clone(),
+                        },
+                    );
+                    value
+                }
+            };
+
             updated.insert(
                 id,
                 WorkspaceMeta {
-                    git_branch: git_branch(path),
-                    pull_request: pull_request_info(path),
+                    git_branch,
+                    pull_request,
                     ports: listening_ports_for_roots(&roots),
                     cwd: live_cwd,
                 },
             );
         }
+        // Drop probes for workspaces that no longer exist.
+        pr_probes.retain(|id, _| updated.contains_key(id));
         let mut cache = self.workspace_meta.lock_or_recover();
         if *cache != updated {
             *cache = updated;
@@ -702,9 +763,11 @@ impl Server {
     /// created or re-homed workspace shows its git branch / PR without waiting
     /// for the next 5s background tick. Runs off the request thread and holds no
     /// session/panes lock while spawning git/gh/ss (which are timeout-bounded).
+    /// The empty probe map means a nudge always asks gh — that immediacy is the
+    /// point of a nudge, and nudges are rare (workspace created / re-homed).
     fn nudge_workspace_meta(self: &Arc<Self>) {
         let server = Arc::clone(self);
-        thread::spawn(move || server.refresh_workspace_meta());
+        thread::spawn(move || server.refresh_workspace_meta(&mut BTreeMap::new()));
     }
 
     fn handle_stream(self: Arc<Self>, stream: UnixStream) -> Result<()> {
@@ -6260,6 +6323,29 @@ mod tests {
         );
         assert_eq!(meta.bytes, Some(1234));
         assert_eq!(meta.redirects, Some(1));
+    }
+
+    /// The PR probe is the daemon's only rate limit on `gh pr view` — get the
+    /// freshness rules wrong in the "always stale" direction and every tick
+    /// bills a GitHub API call again (720/hour/workspace, which drained a real
+    /// account's 5000/hour quota); wrong in the "always fresh" direction and
+    /// the sidebar's PR chip goes permanently stale.
+    #[test]
+    fn pr_probe_freshness_rules() {
+        let now = Instant::now();
+        let probe = PrProbe {
+            key: "/repo\nmain".into(),
+            at: now,
+            value: None, // a no-PR answer is still an answer worth trusting
+        };
+        // Same repo+branch, within TTL: trust it, even when the answer was None.
+        assert!(probe.is_fresh("/repo\nmain", now + PR_INFO_TTL / 2));
+        // TTL elapsed: ask gh again.
+        assert!(!probe.is_fresh("/repo\nmain", now + PR_INFO_TTL));
+        // Branch switch: ask immediately, TTL notwithstanding.
+        assert!(!probe.is_fresh("/repo\nfeature", now + Duration::from_secs(1)));
+        // Repo (cwd) switch likewise.
+        assert!(!probe.is_fresh("/elsewhere\nmain", now + Duration::from_secs(1)));
     }
 
     #[test]
