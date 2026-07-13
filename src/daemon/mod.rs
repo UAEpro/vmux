@@ -2725,25 +2725,46 @@ impl Server {
                 target.updated_at = unix_time();
             }
         }
-        session.notifications.push(note.clone());
-        let len = session.notifications.len();
-        if len > 100 {
-            session.notifications.drain(0..len - 100);
+        // Agent hooks fire on every tool call, so a working agent repeats the
+        // identical "busy / agent working" notify many times per minute. A
+        // notify that matches the latest recorded state for the same target is
+        // not news — keep the live pane status fresh (above/below) but don't
+        // append another feed entry, which the relay would forward as yet
+        // another push notification. The next feed entry is the next state
+        // transition: done, needs input, error, or a different message.
+        let duplicate = !clear
+            && session
+                .notifications
+                .iter()
+                .rev()
+                .find(|prev| prev.pane == note.pane && prev.workspace == note.workspace)
+                .is_some_and(|prev| {
+                    !prev.clear
+                        && prev.status == note.status
+                        && prev.color == note.color
+                        && prev.message == note.message
+                });
+        if !duplicate {
+            session.notifications.push(note.clone());
+            let len = session.notifications.len();
+            if len > 100 {
+                session.notifications.drain(0..len - 100);
+            }
+            push_event(
+                &mut session,
+                EventRecord {
+                    id: 0,
+                    time: note.time,
+                    kind: "notification".to_string(),
+                    pane: target_pane.clone(),
+                    workspace: note.workspace.clone(),
+                    status: status.clone(),
+                    key: None,
+                    value: color.clone(),
+                    message: message.clone(),
+                },
+            );
         }
-        push_event(
-            &mut session,
-            EventRecord {
-                id: 0,
-                time: note.time,
-                kind: "notification".to_string(),
-                pane: target_pane.clone(),
-                workspace: note.workspace.clone(),
-                status: status.clone(),
-                key: None,
-                value: color.clone(),
-                message: message.clone(),
-            },
-        );
         drop(session);
         if let Some(runtime_key) = runtime_target {
             if let Some(runtime) = self.panes.lock_or_recover().get_mut(&runtime_key) {
@@ -5364,6 +5385,75 @@ mod tests {
             let session = server.session.lock_or_recover();
             let pane = &session.panes["pane-1"];
             assert_eq!(pane.agent_status, AgentStatus::Attention);
+        }
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn notify_dedupes_repeated_same_state_notifications() {
+        let session = TestSession::new("notify-dedupe");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            for id in ["pane-1", "pane-2"] {
+                session.panes.insert(
+                    id.to_string(),
+                    Pane::new(id.to_string(), "claude".to_string(), SplitDirection::Right),
+                );
+            }
+        }
+        let notify = |pane: &str, status: &str, color: &str, message: &str| {
+            server
+                .notify(
+                    Some(pane.to_string()),
+                    None,
+                    Some(status.to_string()),
+                    Some(color.to_string()),
+                    false,
+                    message.to_string(),
+                )
+                .unwrap();
+        };
+
+        // Hook events repeat "busy / agent working" on every tool call — only
+        // the first lands in the feed, even with another pane interleaved.
+        notify("pane-1", "busy", "yellow", "agent working");
+        notify("pane-2", "busy", "yellow", "agent working");
+        notify("pane-1", "busy", "yellow", "agent working");
+        notify("pane-1", "busy", "yellow", "agent working");
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(session.notifications.len(), 2);
+            assert_eq!(session.events.len(), 2);
+            // The live sidebar status still updates on suppressed notifies.
+            assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Busy);
+        }
+
+        // State transitions are news again: done, then back to busy.
+        notify("pane-1", "done", "green", "agent hook completed");
+        notify("pane-1", "busy", "yellow", "agent working");
+        // Same status but a different message is a new request, not a repeat.
+        notify("pane-1", "attention", "blue", "approve edit to foo.rs");
+        notify("pane-1", "attention", "blue", "approve edit to bar.rs");
+        {
+            let session = server.session.lock_or_recover();
+            let messages: Vec<&str> = session
+                .notifications
+                .iter()
+                .filter(|note| note.pane.as_deref() == Some("pane-1"))
+                .map(|note| note.message.as_str())
+                .collect();
+            assert_eq!(
+                messages,
+                [
+                    "agent working",
+                    "agent hook completed",
+                    "agent working",
+                    "approve edit to foo.rs",
+                    "approve edit to bar.rs",
+                ]
+            );
         }
 
         fs::remove_file(server.state_path.clone()).ok();

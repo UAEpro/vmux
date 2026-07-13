@@ -167,9 +167,17 @@ pub fn grok_skill_path(home: &Path) -> PathBuf {
 }
 
 fn config_home(home: &Path) -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
+    // Honor XDG_CONFIG_HOME only for the real home directory. A caller probing
+    // an alternate home (the tests) must resolve every path under that home —
+    // otherwise a global XDG_CONFIG_HOME (CI sets one) makes every fake-home
+    // test share a single hooks.sh, so an install test pollutes the
+    // not-detected test and its cleanup misses the file entirely.
+    if home == home_dir() {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg);
+        }
+    }
+    home.join(".config")
 }
 
 /// Status for every supported coding-agent integration.
@@ -761,12 +769,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_home() -> PathBuf {
+        // A clock stamp alone is not unique: macOS ticks CLOCK_REALTIME in
+        // microseconds, and the parallel test threads call this at the same
+        // instant — two tests sharing one "home" makes install tests bleed
+        // into the not-detected test. The counter makes each home unique
+        // regardless of clock granularity.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("vmux-agent-hooks-{}-{}", std::process::id(), stamp));
+        let dir = std::env::temp_dir().join(format!(
+            "vmux-agent-hooks-{}-{}-{}",
+            std::process::id(),
+            stamp,
+            seq
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
