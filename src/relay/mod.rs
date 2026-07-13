@@ -1323,6 +1323,12 @@ fn handle_ws_upgrade(
                         .and_then(|v| v.as_u64())
                         .unwrap_or(200)
                         .max(1) as usize;
+                    // Colour is opt-in per subscription: clients that predate
+                    // it (the cmux-remote app) keep receiving plain text.
+                    let ansi = params
+                        .get("ansi")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
 
                     // stop existing sub for this surface
                     if let Some(flag) = stop_flags.lock_or_recover().remove(&surface_id) {
@@ -1348,6 +1354,7 @@ fn handle_ws_upgrade(
                             workspace_id,
                             sid,
                             lines,
+                            ansi,
                             fps,
                             idle_fps,
                             stop,
@@ -1569,6 +1576,7 @@ fn run_surface_poller(
     _workspace_id: String,
     surface_id: String,
     lines: usize,
+    ansi: bool,
     active_fps: u32,
     idle_fps: u32,
     stop: Arc<AtomicBool>,
@@ -1588,7 +1596,7 @@ fn run_surface_poller(
         };
         let interval = Duration::from_millis((1000 / current_fps as u64).max(20));
 
-        match read_surface_screen(&socket, &surface_id, lines) {
+        match read_surface_screen(&socket, &surface_id, lines, ansi) {
             Ok(snap) => {
                 let ops = if let Some(ref old) = prev {
                     diff_ops(old, &snap)
@@ -1695,13 +1703,19 @@ fn screen_hash(screen: &ScreenSnap) -> String {
     dig.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-fn read_surface_screen(socket: &Path, surface_id: &str, lines: usize) -> Result<ScreenSnap> {
+fn read_surface_screen(
+    socket: &Path,
+    surface_id: &str,
+    lines: usize,
+    ansi: bool,
+) -> Result<ScreenSnap> {
     let resp = protocol::request(
         socket,
         &Request::ReadScreen {
             pane: Some(surface_id.to_string()),
             scrollback: false,
             limit_bytes: Some(256_000),
+            ansi,
         },
     )?;
     if !resp.ok {
@@ -1857,7 +1871,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
         "surface.read_text" => {
             let surface = req_str(params, "surface_id")?;
             let lines = params.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-            let snap = read_surface_screen(socket, &surface, lines)?;
+            let snap = read_surface_screen(socket, &surface, lines, false)?;
             Ok(json!({
                 "text": snap.rows.join("\n"),
                 "surface_id": surface,

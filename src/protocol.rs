@@ -302,6 +302,11 @@ pub enum Request {
         scrollback: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit_bytes: Option<usize>,
+        /// Render the screen with per-row self-contained SGR colour codes
+        /// (fg/bg/bold/italic/underline/inverse). Off by default: existing
+        /// callers get the plain text they always did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ansi: bool,
     },
     Search {
         pane: Option<String>,
@@ -911,6 +916,7 @@ mod tests {
             pane: Some("pane-1".to_string()),
             scrollback: true,
             limit_bytes: None,
+            ansi: false,
         })
         .unwrap();
         assert_eq!(encoded, r#"{"action":"read-screen","pane":"pane-1"}"#);
@@ -922,6 +928,7 @@ mod tests {
             pane: Some("pane-1".to_string()),
             scrollback: false,
             limit_bytes: Some(4096),
+            ansi: false,
         })
         .unwrap();
         assert_eq!(

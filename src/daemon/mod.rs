@@ -1085,8 +1085,9 @@ impl Server {
                 pane,
                 scrollback,
                 limit_bytes,
+                ansi,
             } => {
-                let data = self.read_screen(pane, scrollback, limit_bytes)?;
+                let data = self.read_screen(pane, scrollback, limit_bytes, ansi)?;
                 Ok(Response::ok(data))
             }
             Request::Search { pane, query } => {
@@ -2793,6 +2794,7 @@ impl Server {
         pane: Option<String>,
         include_scrollback: bool,
         limit_bytes: Option<usize>,
+        ansi: bool,
     ) -> Result<serde_json::Value> {
         let pane_id = self.resolve_pane(pane)?;
         let runtime_key = self
@@ -2806,9 +2808,14 @@ impl Server {
                 .or_else(|| panes.get(&pane_id))
                 .map(|runtime| {
                     let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
+                    let screen_text = if ansi {
+                        screen_contents_ansi(runtime.parser.screen())
+                    } else {
+                        runtime.parser.screen().contents()
+                    };
                     let mut value = serde_json::json!({
                         "pane": pane_id,
-                        "screen": runtime.parser.screen().contents(),
+                        "screen": screen_text,
                         "rows": runtime.size.rows,
                         "cols": runtime.size.cols,
                         "cursor_row": cursor_row,
@@ -4872,6 +4879,113 @@ pub(crate) fn trim_output(output: String, max_len: usize) -> String {
     }
 }
 
+/// Serialize a vt100 screen to text with SGR colour codes, one line per row.
+///
+/// Each row is self-contained: styling is (re)established from a reset
+/// whenever attributes change and reset again at end of row, so consumers may
+/// treat rows independently (the relay diffs and ships rows one at a time).
+/// Only SGR is emitted — no cursor movement, no OSC — so a client needs
+/// nothing beyond a small colour-code parser.
+fn screen_contents_ansi(screen: &vt100::Screen) -> String {
+    #[derive(PartialEq, Clone, Copy, Default)]
+    struct Style {
+        fg: vt100::Color,
+        bg: vt100::Color,
+        bold: bool,
+        italic: bool,
+        underline: bool,
+        inverse: bool,
+    }
+
+    fn push_sgr(out: &mut String, style: &Style) {
+        out.push_str("\x1b[0");
+        if style.bold {
+            out.push_str(";1");
+        }
+        if style.italic {
+            out.push_str(";3");
+        }
+        if style.underline {
+            out.push_str(";4");
+        }
+        if style.inverse {
+            out.push_str(";7");
+        }
+        match style.fg {
+            vt100::Color::Default => {}
+            vt100::Color::Idx(i) if i < 8 => {
+                let _ = write!(out, ";{}", 30 + u16::from(i));
+            }
+            vt100::Color::Idx(i) if i < 16 => {
+                let _ = write!(out, ";{}", 82 + u16::from(i));
+            }
+            vt100::Color::Idx(i) => {
+                let _ = write!(out, ";38;5;{i}");
+            }
+            vt100::Color::Rgb(r, g, b) => {
+                let _ = write!(out, ";38;2;{r};{g};{b}");
+            }
+        }
+        match style.bg {
+            vt100::Color::Default => {}
+            vt100::Color::Idx(i) if i < 8 => {
+                let _ = write!(out, ";{}", 40 + u16::from(i));
+            }
+            vt100::Color::Idx(i) if i < 16 => {
+                let _ = write!(out, ";{}", 92 + u16::from(i));
+            }
+            vt100::Color::Idx(i) => {
+                let _ = write!(out, ";48;5;{i}");
+            }
+            vt100::Color::Rgb(r, g, b) => {
+                let _ = write!(out, ";48;2;{r};{g};{b}");
+            }
+        }
+        out.push('m');
+    }
+
+    use std::fmt::Write;
+    let (rows, cols) = screen.size();
+    let mut out = String::new();
+    for row in 0..rows {
+        if row > 0 {
+            out.push('\n');
+        }
+        let mut current = Style::default();
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            // A wide glyph's continuation cell repeats nothing.
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let style = Style {
+                fg: cell.fgcolor(),
+                bg: cell.bgcolor(),
+                bold: cell.bold(),
+                italic: cell.italic(),
+                underline: cell.underline(),
+                inverse: cell.inverse(),
+            };
+            if style != current {
+                push_sgr(&mut out, &style);
+                current = style;
+            }
+            let contents = cell.contents();
+            if contents.is_empty() {
+                out.push(' ');
+            } else {
+                out.push_str(contents);
+            }
+        }
+        if current != Style::default() {
+            out.push_str("\x1b[0m");
+        }
+    }
+    out
+}
+
 fn scrollback_limit(limit_bytes: Option<usize>) -> usize {
     limit_bytes.unwrap_or(16_000).min(1_000_000)
 }
@@ -4880,6 +4994,43 @@ fn scrollback_limit(limit_bytes: Option<usize>) -> usize {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn screen_contents_ansi_preserves_colors_and_resets_per_row() {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(b"\x1b[31mred\x1b[0m plain\r\n\x1b[1;38;5;46mbold-green\x1b[0m\r\nno-style");
+        let out = screen_contents_ansi(parser.screen());
+        let rows: Vec<&str> = out.split('\n').collect();
+        assert_eq!(rows.len(), 4);
+
+        // Row 0: red fg for "red", reset back to default for " plain".
+        assert!(rows[0].contains("\x1b[0;31mred"), "row0 = {:?}", rows[0]);
+        assert!(rows[0].contains("\x1b[0m plain"), "row0 = {:?}", rows[0]);
+        // Rows are self-contained: any styled row ends in a reset.
+        assert!(rows[0].trim_end().ends_with('n') || rows[0].ends_with("\x1b[0m"));
+
+        // Row 1: bold + 256-colour foreground survive.
+        assert!(
+            rows[1].contains("\x1b[0;1;38;5;46mbold-green"),
+            "row1 = {:?}",
+            rows[1]
+        );
+
+        // Row 2: no escapes at all when nothing is styled.
+        assert!(!rows[2].contains('\x1b'), "row2 = {:?}", rows[2]);
+        assert!(rows[2].starts_with("no-style"));
+    }
+
+    #[test]
+    fn screen_contents_ansi_plain_screen_matches_contents() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process(b"hello");
+        let ansi = screen_contents_ansi(parser.screen());
+        // With no styling anywhere, the ANSI form differs from contents() only
+        // by preserved cell padding (spaces), never by escapes.
+        assert!(!ansi.contains('\x1b'));
+        assert!(ansi.starts_with("hello"));
+    }
 
     /// A disposable session name that removes its own runtime/state files.
     ///
