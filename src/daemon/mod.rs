@@ -2435,6 +2435,15 @@ impl Server {
             clear,
             message: message.clone(),
         };
+        // Claude Code's Notification hook fires ~60s after every finished turn
+        // with "Claude is waiting for your input". That idle notice carries no
+        // new request, so it must not overwrite the Stop hook's ✅ with 🙋 —
+        // record it in the feed, but leave agent_status and the banner alone.
+        let idle_notice = is_idle_prompt_notification(&message)
+            && status
+                .as_deref()
+                .map(|status| matches!(parse_agent_status(status), AgentStatus::Attention))
+                .unwrap_or(true);
         let mut session = self.session.lock_or_recover();
         let mut runtime_target = None;
         if let Some(pane_id) = &target_pane {
@@ -2443,6 +2452,8 @@ impl Server {
                 if clear {
                     target.notification_color = None;
                     target.notification_message = None;
+                } else if idle_notice {
+                    // keep current status/banner
                 } else if let Some(status) = &status {
                     apply_explicit_agent_status(target, status, color.as_deref(), &message);
                 } else if !message.is_empty() {
@@ -2479,6 +2490,8 @@ impl Server {
                 if clear {
                     runtime.pane.notification_color = None;
                     runtime.pane.notification_message = None;
+                } else if idle_notice {
+                    // keep current status/banner
                 } else if let Some(status) = &status {
                     apply_explicit_agent_status(
                         &mut runtime.pane,
@@ -3028,9 +3041,11 @@ impl Server {
                     touch_agent_status(&mut runtime.pane, next, pinned);
                 }
                 if let Some(message) = notifications.last() {
-                    touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
-                    runtime.pane.notification_color = Some("blue".to_string());
-                    runtime.pane.notification_message = Some(message.clone());
+                    if !is_idle_prompt_notification(message) {
+                        touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
+                        runtime.pane.notification_color = Some("blue".to_string());
+                        runtime.pane.notification_message = Some(message.clone());
+                    }
                 }
                 // Light fields only — no contents()/formatted/scrollback join here.
                 let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
@@ -3854,6 +3869,16 @@ fn parse_agent_status(status: &str) -> AgentStatus {
     }
 }
 
+/// True for informational "the prompt is idle" notices. Claude Code fires its
+/// Notification hook (and, when configured, an OSC 9 terminal notification)
+/// with "Claude is waiting for your input" 60s after a turn ends. Unlike a
+/// permission request ("Claude needs your permission to use Bash"), it asks
+/// nothing new of the user, so it must not flip a finished-turn ✅ into 🙋.
+fn is_idle_prompt_notification(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("waiting for your input") || message.contains("waiting for input")
+}
+
 /// Apply a hook/CLI status so it sticks in the sidebar (pinned).
 ///
 /// Done/busy/error clear the pane notification banner so workspace_status shows
@@ -4412,6 +4437,54 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("decode request"));
+    }
+
+    #[test]
+    fn idle_prompt_notification_does_not_demote_done() {
+        let server = Arc::new(Server::load(&format!("vmux-idle-note-{}", unix_time())).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            let mut pane = Pane::new("pane-1".to_string(), "claude".to_string(), SplitDirection::Right);
+            touch_agent_status(&mut pane, AgentStatus::Done, true);
+            session.panes.insert("pane-1".to_string(), pane);
+        }
+
+        // Claude's 60s-idle Notification hook must not flip ✅ → 🙋 …
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("attention".to_string()),
+                None,
+                false,
+                "Claude is waiting for your input".to_string(),
+            )
+            .unwrap();
+        {
+            let session = server.session.lock_or_recover();
+            let pane = &session.panes["pane-1"];
+            assert_eq!(pane.agent_status, AgentStatus::Done);
+            assert_eq!(pane.notification_message, None);
+        }
+
+        // … but a real permission request still does.
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("attention".to_string()),
+                None,
+                false,
+                "Claude needs your permission to use Bash".to_string(),
+            )
+            .unwrap();
+        {
+            let session = server.session.lock_or_recover();
+            let pane = &session.panes["pane-1"];
+            assert_eq!(pane.agent_status, AgentStatus::Attention);
+        }
+
+        fs::remove_file(server.state_path.clone()).ok();
     }
 
     #[test]
