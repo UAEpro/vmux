@@ -334,6 +334,10 @@ pub fn serve(
         "  health:  curl -s http://127.0.0.1:{}/v1/health",
         port_of(&config.listen).unwrap_or(4399)
     );
+    eprintln!(
+        "  paste:   http://<this-host>:{}/paste — paste screenshots from any browser into the active pane",
+        port_of(&config.listen).unwrap_or(4399)
+    );
     eprintln!("  config:  {}", path.display());
     eprintln!("  devices: {}", devices_path()?.display());
     eprintln!("  max conns: {MAX_RELAY_CONNECTIONS}");
@@ -749,7 +753,14 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// HTTP request bodies are only small JSON payloads (register/apns); file
 /// uploads go over the WebSocket channel, not here. Cap well below MAX_WS_MSG so
 /// an unauthenticated peer can't force a 24 MiB allocation per connection.
+/// Exception: POST /v1/paste carries raw screenshot bytes and is allowed
+/// MAX_PASTE_BODY — but only after the device token is validated, so the
+/// pre-auth allocation bound stays at this cap.
 const MAX_HTTP_BODY: usize = 256 * 1024;
+/// Body cap for authenticated POST /v1/paste (browser screenshot paste).
+const MAX_PASTE_BODY: usize = 16 * 1024 * 1024;
+/// Served at GET /paste: browser page that pastes clipboard images into panes.
+const PASTE_PAGE: &str = include_str!("paste_page.html");
 /// Bound on the per-connection outbound push queue. A stalled client blocks
 /// `ws.send` up to the 30s write timeout; with an unbounded channel the surface
 /// pollers would buffer ~30s of full-snapshot frames in memory. When the queue
@@ -829,7 +840,18 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    if content_len > MAX_HTTP_BODY {
+    // /v1/paste is the one route allowed a large body, and only once the
+    // Bearer token checks out — unauthenticated peers keep the small cap.
+    let body_cap = if method == "POST" && path == "/v1/paste" {
+        if auth_device_from_headers(&headers, &state.devices).is_none() {
+            write_http(&mut stream, 401, "text/plain", b"unauthorized")?;
+            return Ok(());
+        }
+        MAX_PASTE_BODY
+    } else {
+        MAX_HTTP_BODY
+    };
+    if content_len > body_cap {
         write_http(&mut stream, 413, "text/plain", b"payload too large")?;
         return Ok(());
     }
@@ -855,6 +877,42 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
     let device_id = auth_device_from_headers(&headers, &state.devices);
 
     match (method.as_str(), path.as_str()) {
+        ("GET", "/paste") => {
+            // Static page, no secrets: pairing/auth happens from its JS via
+            // the same registration flow the phone app uses.
+            let page = PASTE_PAGE.replace("{{SESSION}}", &state.config.session);
+            write_http(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                page.as_bytes(),
+            )?;
+        }
+        ("POST", "/v1/paste") => {
+            if device_id.is_none() {
+                write_http(&mut stream, 401, "text/plain", b"unauthorized")?;
+                return Ok(());
+            }
+            match paste_upload(&state, &target, &body) {
+                Ok(v) => {
+                    write_http(
+                        &mut stream,
+                        200,
+                        "application/json",
+                        v.to_string().as_bytes(),
+                    )?;
+                }
+                Err(err) => {
+                    let body = json!({ "error": err.to_string() });
+                    write_http(
+                        &mut stream,
+                        400,
+                        "application/json",
+                        body.to_string().as_bytes(),
+                    )?;
+                }
+            }
+        }
         ("GET", "/v1/health") => {
             let body = json!({
                 "ok": true,
@@ -2067,6 +2125,16 @@ fn file_upload(params: &Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("data required"))?;
     let bytes = decode_base64(b64)?;
+    let (path, safe) = save_upload(name, &bytes)?;
+    Ok(json!({
+        "path": path.display().to_string(),
+        "filename": safe,
+    }))
+}
+
+/// Save uploaded bytes under ~/Downloads/vmux-remote with a sanitized,
+/// collision-proof name. Returns (path, sanitized filename).
+fn save_upload(name: &str, bytes: &[u8]) -> Result<(PathBuf, String)> {
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -2087,10 +2155,8 @@ fn file_upload(params: &Value) -> Result<Value> {
         })
         .collect();
     // Unique name + create_new so same-second uploads never clobber (bugs.md P3#18).
-    let mut path = PathBuf::new();
-    let mut written = false;
     for _ in 0..8 {
-        path = dir.join(format!("{}-{}-{}", now_secs(), random_hex(8), safe));
+        let path = dir.join(format!("{}-{}-{}", now_secs(), random_hex(8), safe));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -2098,21 +2164,54 @@ fn file_upload(params: &Value) -> Result<Value> {
         {
             Ok(mut f) => {
                 use std::io::Write;
-                f.write_all(&bytes)?;
-                written = true;
-                break;
+                f.write_all(bytes)?;
+                return Ok((path, safe));
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.into()),
         }
     }
-    if !written {
-        anyhow::bail!("could not create unique upload path");
+    anyhow::bail!("could not create unique upload path");
+}
+
+/// POST /v1/paste — raw image bytes in the body (from the /paste browser
+/// page). Saves the image and types its path into the target pane (the
+/// active pane unless `?pane=` is given), which agents like Claude Code pick
+/// up as an image attachment. `?enter=1` submits with a carriage return.
+fn paste_upload(state: &RelayState, target: &str, body: &[u8]) -> Result<Value> {
+    let ext = crate::image_extension(body)
+        .ok_or_else(|| anyhow!("body is not an image (expected png, jpeg, gif, webp, or bmp)"))?;
+    let query = parse_query(target);
+    let pane = query.get("pane").cloned();
+    let enter = matches!(
+        query.get("enter").map(String::as_str),
+        Some("1") | Some("true")
+    );
+    let (path, _) = save_upload(&format!("paste.{ext}"), body)?;
+    let mut data = format!("{} ", path.display());
+    if enter {
+        data.push('\r');
     }
+    call(&state.socket, &Request::Input { pane, data })?;
     Ok(json!({
         "path": path.display().to_string(),
-        "filename": safe,
+        "bytes": body.len(),
+        "enter": enter,
     }))
+}
+
+/// Minimal query-string parser: `/v1/paste?pane=pane-2&enter=1` →
+/// {pane: "pane-2", enter: "1"}. Values are used as-is (pane ids and flags
+/// are plain ASCII; no percent-decoding needed).
+fn parse_query(target: &str) -> HashMap<String, String> {
+    target
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>> {
@@ -2206,6 +2305,36 @@ fn port_of(listen: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_query_extracts_pane_and_enter() {
+        let q = parse_query("/v1/paste?pane=pane-2&enter=1");
+        assert_eq!(q.get("pane").map(String::as_str), Some("pane-2"));
+        assert_eq!(q.get("enter").map(String::as_str), Some("1"));
+        assert!(parse_query("/v1/paste").is_empty());
+        assert!(parse_query("/v1/paste?").is_empty());
+    }
+
+    #[test]
+    fn paste_page_is_self_contained_and_templated() {
+        assert!(PASTE_PAGE.contains("{{SESSION}}"));
+        assert!(PASTE_PAGE.contains("/v1/paste"));
+        assert!(PASTE_PAGE.contains("/v1/devices/me/register"));
+        // CSP-free page must not pull remote assets.
+        assert!(!PASTE_PAGE.contains("https://"));
+        assert!(!PASTE_PAGE.contains("http://"));
+    }
+
+    #[test]
+    fn save_upload_sanitizes_and_never_clobbers() {
+        let (a, safe) = save_upload("../../etc/pass wd.png", b"x").unwrap();
+        assert_eq!(safe, "pass_wd.png");
+        let (b, _) = save_upload("../../etc/pass wd.png", b"y").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(fs::read(&a).unwrap(), b"x");
+        fs::remove_file(&a).ok();
+        fs::remove_file(&b).ok();
+    }
 
     #[test]
     fn screen_hash_stable() {

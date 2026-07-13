@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vmux paste — {{SESSION}}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #101418; color: #d8dee6;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 24px; gap: 16px;
+  }
+  h1 { font-size: 18px; font-weight: 600; }
+  h1 span { color: #7aa2f7; }
+  #zone {
+    width: min(560px, 92vw); min-height: 240px;
+    border: 2px dashed #3b4453; border-radius: 12px;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 10px; padding: 24px;
+    text-align: center; transition: border-color .15s, background .15s;
+  }
+  #zone.hot { border-color: #7aa2f7; background: #16203a; }
+  #zone p { color: #8b96a5; }
+  kbd {
+    background: #232a35; border: 1px solid #3b4453; border-bottom-width: 3px;
+    border-radius: 6px; padding: 2px 8px; font-size: 13px;
+  }
+  label { display: flex; gap: 8px; align-items: center; color: #8b96a5; font-size: 14px; }
+  #status { min-height: 24px; font-size: 14px; color: #8b96a5; word-break: break-all; text-align: center; max-width: 92vw; }
+  #status.ok { color: #9ece6a; }
+  #status.err { color: #f7768e; }
+  button, input[type=file]::file-selector-button {
+    background: #232a35; color: #d8dee6; border: 1px solid #3b4453;
+    border-radius: 8px; padding: 8px 14px; font-size: 14px; cursor: pointer;
+  }
+  input[type=file] { font-size: 13px; color: #8b96a5; max-width: 260px; }
+</style>
+</head>
+<body>
+<h1>Paste a screenshot into <span>{{SESSION}}</span></h1>
+<div id="zone">
+  <p><kbd>Cmd</kbd>+<kbd>V</kbd> / <kbd>Ctrl</kbd>+<kbd>V</kbd> to paste an image,<br>or drop a file here</p>
+  <input id="file" type="file" accept="image/*">
+</div>
+<label><input id="enter" type="checkbox"> press Enter in the pane after pasting</label>
+<div id="status">the image is saved on the host and its path is typed into the active pane</div>
+<script>
+(() => {
+  const zone = document.getElementById('zone');
+  const status = document.getElementById('status');
+  const enterBox = document.getElementById('enter');
+  enterBox.checked = localStorage.getItem('vmux-paste-enter') === '1';
+  enterBox.addEventListener('change', () =>
+    localStorage.setItem('vmux-paste-enter', enterBox.checked ? '1' : '0'));
+
+  let token = localStorage.getItem('vmux-paste-token') || '';
+
+  function show(msg, cls) { status.textContent = msg; status.className = cls || ''; }
+
+  async function register(secret) {
+    const headers = secret ? { 'X-Vmux-Bootstrap': secret } : {};
+    const r = await fetch('/v1/devices/me/register', { method: 'POST', headers });
+    if (!r.ok) throw new Error('pairing refused (HTTP ' + r.status + ')');
+    const j = await r.json();
+    token = j.token;
+    localStorage.setItem('vmux-paste-token', token);
+  }
+
+  async function ensureToken() {
+    if (token) return;
+    show('pairing this browser with the relay…');
+    try {
+      await register('');
+    } catch (e) {
+      const secret = prompt(
+        'Pairing was refused. If the relay is configured with a bootstrap ' +
+        'secret, enter it (otherwise connect over Tailscale and reload):');
+      if (secret === null || secret === '') throw e;
+      await register(secret);
+    }
+  }
+
+  async function post(blob) {
+    return fetch('/v1/paste?enter=' + (enterBox.checked ? '1' : '0'), {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': blob.type || 'application/octet-stream',
+      },
+      body: blob,
+    });
+  }
+
+  async function send(blob) {
+    if (!blob) { show('no image found', 'err'); return; }
+    try {
+      show('sending ' + Math.max(1, Math.round(blob.size / 1024)) + ' KB…');
+      await ensureToken();
+      let r = await post(blob);
+      if (r.status === 401) {   // stale token (device revoked) — re-pair once
+        token = '';
+        localStorage.removeItem('vmux-paste-token');
+        await ensureToken();
+        r = await post(blob);
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { show('failed: ' + (j.error || 'HTTP ' + r.status), 'err'); return; }
+      show('sent → ' + j.path + (j.enter ? '  (submitted)' : '  — press Enter in the pane'), 'ok');
+    } catch (e) {
+      show(String(e.message || e), 'err');
+    }
+  }
+
+  window.addEventListener('paste', (e) => {
+    for (const item of e.clipboardData.items) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        send(item.getAsFile());
+        return;
+      }
+    }
+    show('clipboard has no image (take the screenshot with a copy-to-clipboard shortcut)', 'err');
+  });
+
+  ['dragenter', 'dragover'].forEach((n) => zone.addEventListener(n, (e) => {
+    e.preventDefault(); zone.classList.add('hot');
+  }));
+  ['dragleave', 'drop'].forEach((n) => zone.addEventListener(n, (e) => {
+    e.preventDefault(); zone.classList.remove('hot');
+  }));
+  zone.addEventListener('drop', (e) => {
+    const f = [...e.dataTransfer.files].find((f) => f.type.startsWith('image/'));
+    send(f || e.dataTransfer.files[0]);
+  });
+  document.getElementById('file').addEventListener('change', (e) => {
+    if (e.target.files.length) send(e.target.files[0]);
+    e.target.value = '';
+  });
+})();
+</script>
+</body>
+</html>

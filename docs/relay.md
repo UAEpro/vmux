@@ -98,3 +98,25 @@ To check the relay is reachable before you touch the phone:
 curl -s http://$(tailscale ip -4):4399/v1/health
 # {"ok":true,"version":"…","backend":"vmux",…}
 ```
+
+## The paste page
+
+The relay also serves a browser page for getting screenshots into agents when
+you are SSH'd in from another machine — the case where Ctrl+V inside Claude
+Code can never work, because the image is in *your laptop's* clipboard and the
+agent only checks the host's.
+
+Open `http://<host>:4399/paste` in any browser on the tailnet, press
+`Cmd+V`/`Ctrl+V` (or drop an image file), and the relay saves the image on the
+host and types its path into the active pane. Claude Code and friends pick the
+path up as an attachment. Nothing to install on the laptop or phone; the page
+pairs itself with the relay using the same device registration as the app, and
+the token sticks in browser storage.
+
+The endpoint behind it is `POST /v1/paste` (raw image bytes, `Bearer` device
+token). `?pane=pane-2` targets a pane other than the active one, `?enter=1`
+submits immediately. Uploads land in `~/Downloads/vmux-remote/` and are capped
+at 16 MiB; bodies that are not a real png/jpeg/gif/webp/bmp are rejected.
+
+For scripting the same thing over plain SSH, see `vmux send-image` in the
+[CLI reference](cli.md).

@@ -133,28 +133,32 @@ printf '\033]9;needs input\a'          # or just an OSC escape
 
 Claude Code's Ctrl+V image paste reads the clipboard of the machine it runs
 on. When you SSH into a box running vmux, your screenshot is on your laptop,
-so Claude says "No image found on clipboard". `vmux send-image` bridges that:
-it saves image bytes on the host and types the file path into a pane, which
-Claude Code picks up as an attachment.
+so Claude says "No image found on clipboard". vmux bridges that two ways.
 
-From your laptop, one command sends the clipboard image straight into the
-active pane on the server:
+**The paste page — nothing to install.** With the [relay](docs/relay.md)
+running (`vmux relay serve`), open `http://<host>:4399/paste` in any browser
+on your tailnet and press `Cmd+V`. The image is saved on the host and its
+path is typed into the active pane, where Claude Code picks it up as an
+attachment. Works from a phone too — same page, photo picker included. Keep
+the tab around and pasting a screenshot is: screenshot, switch tab, `Cmd+V`.
+
+**`vmux send-image` — for the terminal.** Pipes image bytes over SSH and
+types the saved path into a pane:
 
 ```sh
 # macOS (brew install pngpaste)
 pngpaste - | ssh yourbox vmux send-image -
 
-# Linux, Wayland
-wl-paste --type image/png | ssh yourbox vmux send-image -
+# or with no tools at all: Cmd+Shift+4 saves to Desktop, then
+ssh yourbox vmux send-image - < ~/Desktop/Screen*.png
 
-# Linux, X11
-xclip -selection clipboard -t image/png -o | ssh yourbox vmux send-image -
+# Linux: wl-paste --type image/png (Wayland) or
+#        xclip -selection clipboard -t image/png -o (X11), piped the same way
 ```
 
-Add a shell alias (`alias shot='pngpaste - | ssh yourbox vmux send-image -'`)
-and pasting a screenshot becomes: take screenshot, type `shot`, press Enter in
-Claude. `--pane pane-2` targets a specific pane, `--enter` submits
-immediately, and a plain file works too: `vmux send-image shot.png`.
+For both, `--pane pane-2` / `?pane=pane-2` targets a specific pane and
+`--enter` / `?enter=1` submits immediately. A plain file works too:
+`vmux send-image shot.png`.
 
 ## Docs
 

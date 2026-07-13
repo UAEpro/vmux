@@ -3025,7 +3025,8 @@ fn read_image_input(file: &str) -> Result<Vec<u8>> {
 
 /// Sniff the image type from magic bytes. Agents only attach real images, so
 /// reject unrecognized data instead of typing a junk path into the pane.
-fn image_extension(bytes: &[u8]) -> Option<&'static str> {
+/// Shared with the relay's browser paste endpoint.
+pub(crate) fn image_extension(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         return Some("png");
     }
