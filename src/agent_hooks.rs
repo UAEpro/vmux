@@ -167,9 +167,17 @@ pub fn grok_skill_path(home: &Path) -> PathBuf {
 }
 
 fn config_home(home: &Path) -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
+    // Honor XDG_CONFIG_HOME only for the real home directory. A caller probing
+    // an alternate home (the tests) must resolve every path under that home —
+    // otherwise a global XDG_CONFIG_HOME (CI sets one) makes every fake-home
+    // test share a single hooks.sh, so an install test pollutes the
+    // not-detected test and its cleanup misses the file entirely.
+    if home == home_dir() {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg);
+        }
+    }
+    home.join(".config")
 }
 
 /// Status for every supported coding-agent integration.
