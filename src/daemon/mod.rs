@@ -4394,6 +4394,12 @@ fn git_branch(cwd: &Path) -> Option<String> {
 /// Live working directory of a pane's shell via `/proc/<pid>/cwd`, so the
 /// sidebar path follows `cd`. Best-effort: `None` when the process is gone,
 /// the cwd was deleted, or `/proc` is unavailable (non-Linux).
+/// The pane process's current working directory.
+///
+/// Linux only: this reads `/proc/<pid>/cwd`, which macOS does not have, so it
+/// returns `None` there and the sidebar falls back to the workspace's stored
+/// cwd rather than the pane's live one. Reading it on macOS needs
+/// `proc_pidinfo(PROC_PIDVNODEPATHINFO)` via libproc.
 fn pane_live_cwd(pid: u32) -> Option<String> {
     let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     path.is_absolute().then(|| path.display().to_string())
@@ -5241,11 +5247,24 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// `/proc` is Linux-only, so this asserted `Some(cwd)` on a platform where
+    /// `pane_live_cwd` can only ever return `None`. It failed on every macOS
+    /// run — which nobody saw, because the workflow was invalid and CI had never
+    /// executed a single job.
     #[test]
+    #[cfg(target_os = "linux")]
     fn pane_live_cwd_reads_proc_cwd() {
         let expected = std::env::current_dir().unwrap().display().to_string();
         assert_eq!(pane_live_cwd(std::process::id()), Some(expected));
         assert_eq!(pane_live_cwd(u32::MAX), None);
+    }
+
+    /// The macOS half of the same contract: no `/proc`, so no live cwd. Pins the
+    /// graceful degradation rather than leaving the platform untested.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn pane_live_cwd_is_unavailable_without_proc() {
+        assert_eq!(pane_live_cwd(std::process::id()), None);
     }
 
     #[test]
