@@ -42,11 +42,25 @@ pub fn ensure_running(session: &str) -> Result<()> {
     Err(anyhow!("vmux daemon did not start"))
 }
 
-pub fn start_detached(session: &str) -> Result<()> {
+/// Entry point for the (non-foreground) `vmux daemon` subcommand.
+///
+/// `VMUX_DAEMONIZE=1` marks the helper process that `start_detached` spawns:
+/// it means "become the daemon yourself" rather than "spawn a helper". Only
+/// this subcommand may honor it. It used to be honored inside
+/// `start_detached` itself, which every `ensure_running` call reaches — and
+/// since panes inherited the daemon's environment (including this variable),
+/// any command that started a new session from inside a vmux pane silently
+/// daemonized *itself*: the CLI forked into a detached daemon nobody asked
+/// for and the parent exited 0 having run nothing. `vmux smoke` inside a
+/// pane produced a zombie daemon per run this way.
+pub fn start_detached_or_daemonize(session: &str) -> Result<()> {
     if std::env::var_os("VMUX_DAEMONIZE").is_some() {
         return daemonize_current_process(session);
     }
+    start_detached(session)
+}
 
+pub fn start_detached(session: &str) -> Result<()> {
     if is_running(session) {
         println!(
             "vmux daemon already running at {}",
@@ -112,6 +126,11 @@ fn daemonize_current_process(session: &str) -> Result<()> {
         }
         return Err(err).context("daemonize vmux");
     }
+    // We are the daemon now; the marker has done its job. Scrub it so pane
+    // children don't inherit it — a shell inside a pane carrying
+    // VMUX_DAEMONIZE=1 would make any `vmux` command that starts a new
+    // session daemonize itself instead of spawning a proper helper.
+    std::env::remove_var("VMUX_DAEMONIZE");
     ignore_hangup_signal()?;
     let err = serve_foreground(session).err();
     if let Some(err) = err {
@@ -1116,6 +1135,7 @@ impl Server {
                 self.save()?;
                 self.log("daemon shutting down").ok();
                 self.cleanup_runtime_files();
+                self.release_session_lock();
                 thread::spawn(|| {
                     thread::sleep(Duration::from_millis(50));
                     std::process::exit(0);
@@ -3817,6 +3837,25 @@ impl Server {
         fs::remove_file(&self.pid_path).ok();
     }
 
+    /// Release the session flock so a successor daemon can start immediately.
+    ///
+    /// `Shutdown` unlinks the socket before this process exits, so callers see
+    /// "not running" while the flock is still held for the response-flush grace
+    /// period. Without an explicit unlock, an `ensure_running` issued in that
+    /// window (the restore phase of `vmux smoke` does exactly this) spawns a
+    /// daemon that fails `try_lock_session` and dies — "vmux daemon helper
+    /// exited with exit status: 0".
+    #[cfg(unix)]
+    fn release_session_lock(&self) {
+        use std::os::unix::io::AsRawFd;
+        if let Some(lock) = &self._session_lock {
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn release_session_lock(&self) {}
+
     fn save(&self) -> Result<()> {
         self.touch();
         // Hold save_lock across the ENTIRE save — snapshot capture through
@@ -5080,6 +5119,33 @@ mod tests {
         }
         server.cleanup_runtime_files();
         let _ = state_path;
+    }
+
+    /// A successor daemon must be able to take the session lock as soon as the
+    /// outgoing daemon has said "shutting down", not only after its process
+    /// exits. `Shutdown` unlinks the socket immediately (so `is_running` goes
+    /// false) but the process lives another ~50ms to flush the response — and
+    /// the flock used to live with it, so a restart issued in that window
+    /// failed with "vmux daemon helper exited with exit status: 0".
+    #[test]
+    fn shutdown_releases_the_session_lock_for_a_successor() {
+        let session = TestSession::new("lock-release");
+        let server = Server::load(session.as_str()).unwrap();
+
+        // While the daemon holds the lock, a successor must be refused.
+        assert!(
+            paths::try_lock_session(session.as_str()).is_err(),
+            "second lock while daemon holds it should fail"
+        );
+
+        // What Shutdown does, minus the process::exit.
+        server.cleanup_runtime_files();
+        server.release_session_lock();
+
+        assert!(
+            paths::try_lock_session(session.as_str()).is_ok(),
+            "successor must acquire the lock as soon as shutdown released it"
+        );
     }
 
     /// The generation counter is what makes the UI repaint: clients poll with

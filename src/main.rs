@@ -44,7 +44,7 @@ fn main() -> Result<()> {
             if foreground {
                 daemon::serve_foreground(session)
             } else {
-                daemon::start_detached(session)
+                daemon::start_detached_or_daemonize(session)
             }
         }
         Command::NewPane {
