@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,27 +21,7 @@ use crate::model::{
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
-
-/// Extension trait for locking a [`Mutex`] while tolerating poisoning.
-trait MutexExt<T> {
-    fn lock_or_recover(&self) -> MutexGuard<'_, T>;
-}
-
-impl<T> MutexExt<T> for Mutex<T> {
-    /// Lock the mutex, recovering the guard even if a previous holder panicked
-    /// and poisoned it (`unwrap_or_else(|p| p.into_inner())`).
-    ///
-    /// Recovering is correct here because the guarded structures (session
-    /// state, the pane runtime map, workspace/metadata caches, etc.) remain
-    /// structurally valid after a panic: a panic mid-update can at worst leave
-    /// stale or partial data. That is strictly better than the alternative of
-    /// `lock().unwrap()`, where a single panicking connection/pane thread would
-    /// poison the mutex and cascade into every later lock panicking too,
-    /// crashing the daemon and killing every user's session.
-    fn lock_or_recover(&self) -> MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
+use crate::sync::MutexExt;
 
 pub fn ensure_running(session: &str) -> Result<()> {
     if is_running(session) {
@@ -237,8 +217,6 @@ fn cleanup_stale_runtime(session: &str) -> Result<()> {
     Ok(())
 }
 
-/// Maximum bytes of decoded terminal output retained per pane for scrollback.
-const SCROLLBACK_CAP: usize = 16_000;
 /// How often the idle-decay sweep runs.
 const DECAY_TICK_SECS: u64 = 4;
 /// An unpinned (heuristic) Busy spinner with no output for this long is demoted
@@ -250,7 +228,7 @@ struct PaneRuntime {
     generation: u64,
     pane: Pane,
     // PTY OS handles. Kept in `Option` so they can be dropped the moment the
-    // child exits (finding 4): a short-lived pane would otherwise pin its
+    // child exits: a short-lived pane would otherwise pin its
     // master/writer/killer file descriptors in the map until an explicit
     // kill/prune, leaking FDs. The captured `parser`/`output` below survive so
     // the UI can still read an exited pane's final screen and scrollback.
@@ -260,7 +238,9 @@ struct PaneRuntime {
     // append_output/snapshot for every pane).
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
-    // Recent decoded output chunks. Bounded by `output_bytes` to SCROLLBACK_CAP
+    /// Byte budget for `output`, from `ui.scrollback_bytes`.
+    scrollback_cap: usize,
+    // Recent decoded output chunks. Bounded by `output_bytes` to `scrollback_cap`
     // so materializing the joined scrollback stays O(cap) rather than O(total).
     output: VecDeque<String>,
     output_bytes: usize,
@@ -307,7 +287,7 @@ enum LlmTitleState {
 }
 
 impl PaneRuntime {
-    /// Join the retained output chunks (already bounded to ~SCROLLBACK_CAP).
+    /// Join the retained output chunks (already bounded to ~`scrollback_cap`).
     fn joined_output(&self) -> String {
         self.output.iter().cloned().collect()
     }
@@ -315,20 +295,30 @@ impl PaneRuntime {
     /// Push a decoded chunk, tracking the running byte total and evicting the
     /// oldest chunks once the cap is exceeded.
     fn push_output(&mut self, text: String) {
-        push_bounded_output(&mut self.output, &mut self.output_bytes, text);
+        push_bounded_output(
+            &mut self.output,
+            &mut self.output_bytes,
+            text,
+            self.scrollback_cap,
+        );
     }
 }
 
 /// Append `text` to a byte-bounded output deque, evicting the oldest chunks
-/// while the running total exceeds SCROLLBACK_CAP (the most recent chunk is
+/// while the running total exceeds `cap` (the most recent chunk is
 /// always kept). Keeps materializing the joined scrollback O(cap).
-fn push_bounded_output(output: &mut VecDeque<String>, output_bytes: &mut usize, text: String) {
+fn push_bounded_output(
+    output: &mut VecDeque<String>,
+    output_bytes: &mut usize,
+    text: String,
+    cap: usize,
+) {
     if text.is_empty() {
         return;
     }
     *output_bytes += text.len();
     output.push_back(text);
-    while *output_bytes > SCROLLBACK_CAP && output.len() > 1 {
+    while *output_bytes > cap && output.len() > 1 {
         if let Some(front) = output.pop_front() {
             *output_bytes -= front.len();
         }
@@ -398,7 +388,7 @@ struct Server {
     next_workspace: Mutex<u64>,
     next_runtime: Mutex<u64>,
     // Serializes state-file writes so concurrent handlers can't interleave
-    // writes into a shared temp file or race the rename (finding 11).
+    // writes into a shared temp file or race the rename.
     save_lock: Mutex<u64>,
     /// Debounced persistence: PTY reader threads set this; a background writer
     /// flushes within ~500ms instead of blocking on every OSC notification.
@@ -406,6 +396,9 @@ struct Server {
     /// Monotonic generation bumped on any session/runtime change. Clients pass
     /// this as Snapshot.since to skip full reserializations when idle.
     generation: std::sync::atomic::AtomicU64,
+    /// Set by `Shutdown` so the debounced save loop stops before the process
+    /// exits and cannot re-create a state file a caller just cleaned up.
+    shutting_down: std::sync::atomic::AtomicBool,
     // Only one attached UI should drive PTY dimensions at a time. Without this,
     // a small phone terminal and a large desktop terminal can resize the same
     // panes back and forth on every refresh.
@@ -415,6 +408,9 @@ struct Server {
     /// Automatic agent tab naming. Read once at start: changing it takes effect
     /// on the next daemon start (`vmux kill && vmux attach`).
     agent_titles: crate::config::AgentTitleSettings,
+    /// Per-pane scrollback byte budget (`ui.scrollback_bytes`). Read once at
+    /// start, like `agent_titles`.
+    scrollback_cap: usize,
     /// Session lock file fd held for the daemon lifetime (single-instance).
     #[cfg(unix)]
     _session_lock: Option<std::fs::File>,
@@ -480,6 +476,9 @@ impl Server {
         #[cfg(unix)]
         let session_lock = paths::try_lock_session(session_name)?;
 
+        // Read once at start; `normalized()` clamps scrollback_bytes.
+        let config = crate::config::load().unwrap_or_default().normalized();
+
         Ok(Self {
             session_name: session_name.to_string(),
             socket_path: paths::socket_path(session_name)?,
@@ -496,9 +495,11 @@ impl Server {
             save_lock: Mutex::new(0),
             save_dirty: std::sync::atomic::AtomicBool::new(false),
             generation: std::sync::atomic::AtomicU64::new(1),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             pane_size_owner: Mutex::new(None),
             exit_notify: (Mutex::new(()), std::sync::Condvar::new()),
-            agent_titles: crate::config::load().unwrap_or_default().agent_titles,
+            agent_titles: config.agent_titles,
+            scrollback_cap: config.ui.scrollback_bytes,
             #[cfg(unix)]
             _session_lock: session_lock,
         })
@@ -523,7 +524,7 @@ impl Server {
             thread::spawn(move || server.refresh_workspace_meta_loop());
         }
         {
-            // Debounced state writer (improve.md #37).
+            // Debounced state writer.
             let server = Arc::clone(&self);
             thread::spawn(move || server.save_loop());
         }
@@ -630,7 +631,7 @@ impl Server {
         let mut cache = self.workspace_meta.lock_or_recover();
         if *cache != updated {
             *cache = updated;
-            // Metadata changes must invalidate Snapshot.since (bugs.md P2#9).
+            // Metadata changes must invalidate Snapshot.since.
             self.touch();
         }
     }
@@ -964,7 +965,7 @@ impl Server {
             }
             Request::SetWorkspacePinned { workspace, pinned } => {
                 let mut session = self.session.lock_or_recover();
-                // Accept a workspace name OR id (finding 10).
+                // Accept a workspace name OR id.
                 let id = session
                     .resolve_workspace_selector(&workspace)
                     .map_err(anyhow::Error::msg)?;
@@ -980,7 +981,7 @@ impl Server {
                 position,
             } => {
                 let mut session = self.session.lock_or_recover();
-                // Accept a workspace name OR id (finding 10).
+                // Accept a workspace name OR id.
                 let id = session
                     .resolve_workspace_selector(&workspace)
                     .map_err(anyhow::Error::msg)?;
@@ -1110,6 +1111,8 @@ impl Server {
                 Ok(Response::empty())
             }
             Request::Shutdown => {
+                self.shutting_down
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.save()?;
                 self.log("daemon shutting down").ok();
                 self.cleanup_runtime_files();
@@ -1556,6 +1559,7 @@ impl Server {
                 master: Some(master),
                 writer: Some(Arc::new(Mutex::new(writer))),
                 killer: Some(killer),
+                scrollback_cap: self.scrollback_cap,
                 output: VecDeque::with_capacity(2048),
                 output_bytes: 0,
                 pending: Vec::new(),
@@ -1614,7 +1618,7 @@ impl Server {
 
     fn target_workspace_and_cwd(&self, workspace: Option<String>) -> Result<(String, PathBuf)> {
         let session = self.session.lock_or_recover();
-        // Accept a workspace name OR id, matching switch/rename (finding 10).
+        // Accept a workspace name OR id, matching switch/rename.
         let target = match workspace {
             Some(selector) => session
                 .resolve_workspace_selector(&selector)
@@ -1697,7 +1701,7 @@ impl Server {
     fn close_workspace(&self, workspace: Option<String>) -> Result<crate::model::Workspace> {
         let closed = {
             let mut session = self.session.lock_or_recover();
-            // Accept a workspace name OR id (finding 10).
+            // Accept a workspace name OR id.
             let target = match workspace {
                 Some(selector) => Some(
                     session
@@ -1712,7 +1716,7 @@ impl Server {
         };
 
         // Close every pane in every tab of the workspace — not only the active
-        // tab's live `panes` view (improve.md #3).
+        // tab's live `panes` view.
         for pane in closed.all_pane_ids() {
             self.remove_pane_runtimes(pane);
         }
@@ -1730,7 +1734,7 @@ impl Server {
         let pane = self.resolve_pane(pane)?;
         let moved = {
             let mut session = self.session.lock_or_recover();
-            // Accept a workspace name OR id (finding 10).
+            // Accept a workspace name OR id.
             let target = session
                 .resolve_workspace_selector(&workspace)
                 .map_err(anyhow::Error::msg)?;
@@ -1743,7 +1747,7 @@ impl Server {
     }
 
     fn prune_exited(&self, workspace: Option<String>, all: bool) -> Result<serde_json::Value> {
-        // Accept a workspace name OR id (finding 10).
+        // Accept a workspace name OR id.
         let workspace = if all {
             None
         } else if let Some(selector) = workspace {
@@ -2016,7 +2020,7 @@ impl Server {
         let pane_id = self.resolve_pane(pane)?;
         // With tabs the live runtime is keyed `pane-N::tab-M`; resolve the active
         // tab's key (falling back to the bare key) so we capture the correct
-        // final scrollback before the process is killed (finding 5).
+        // final scrollback before the process is killed.
         let runtime_key = self
             .active_runtime_key(&pane_id)
             .unwrap_or_else(|_| pane_id.clone());
@@ -2446,7 +2450,7 @@ impl Server {
         }
         if let Some(workspace) = workspace {
             let session = self.session.lock_or_recover();
-            // Accept a workspace name OR id (finding 10).
+            // Accept a workspace name OR id.
             let workspace = session
                 .resolve_workspace_selector(&workspace)
                 .map_err(anyhow::Error::msg)?;
@@ -2827,11 +2831,19 @@ impl Server {
         if query.is_empty() {
             return Err(anyhow!("search query cannot be empty"));
         }
-        let (screen, scrollback) = {
+        // LOCK ORDER: release `panes` before taking `session` (see the field
+        // comments). Reading the persisted fallback inside the `panes` block
+        // would nest session-under-panes, against the documented order.
+        let from_runtime = {
             let panes = self.panes.lock_or_recover();
-            if let Some(runtime) = panes.get(&runtime_key).or_else(|| panes.get(&pane_id)) {
-                (runtime.parser.screen().contents(), runtime.joined_output())
-            } else {
+            panes
+                .get(&runtime_key)
+                .or_else(|| panes.get(&pane_id))
+                .map(|runtime| (runtime.parser.screen().contents(), runtime.joined_output()))
+        };
+        let (screen, scrollback) = match from_runtime {
+            Some(pair) => pair,
+            None => {
                 let output = self
                     .session
                     .lock_or_recover()
@@ -2875,15 +2887,23 @@ impl Server {
             .active_runtime_key(&pane_id)
             .unwrap_or_else(|_| pane_id.clone());
         let limit = scrollback_limit(limit_bytes);
-        let text = {
+        // LOCK ORDER: release `panes` before falling back to `session`.
+        let from_runtime = {
             let panes = self.panes.lock_or_recover();
-            if let Some(runtime) = panes.get(&runtime_key).or_else(|| panes.get(&pane_id)) {
-                if scrollback {
-                    trim_output(runtime.joined_output(), limit)
-                } else {
-                    runtime.parser.screen().contents()
-                }
-            } else {
+            panes
+                .get(&runtime_key)
+                .or_else(|| panes.get(&pane_id))
+                .map(|runtime| {
+                    if scrollback {
+                        trim_output(runtime.joined_output(), limit)
+                    } else {
+                        runtime.parser.screen().contents()
+                    }
+                })
+        };
+        let text = match from_runtime {
+            Some(text) => text,
+            None => {
                 let pane = self
                     .session
                     .lock_or_recover()
@@ -2994,7 +3014,7 @@ impl Server {
         pane.output_formatted.clear();
         // Also clear the persisted scrollback (not just output); otherwise a
         // later snapshot/sync copies the old history back into the pane and its
-        // active tab (finding 6). sync_active_pane_tab then propagates the
+        // active tab. sync_active_pane_tab then propagates the
         // cleared state into the active tab's captured record.
         pane.scrollback.clear();
         pane.scrollback_formatted.clear();
@@ -3024,7 +3044,7 @@ impl Server {
         };
         // Validate the pane actually exists so callers fail with a clear
         // "unknown pane" here rather than a confusing downstream "not running"
-        // error (finding 13).
+        // error.
         if !session.panes.contains_key(&pane_id) {
             return Err(anyhow!("unknown pane {pane_id}"));
         }
@@ -3035,7 +3055,7 @@ impl Server {
         let Some(workspace) = workspace else {
             return Ok(None);
         };
-        // Accept a workspace name OR id, matching switch/rename (finding 10).
+        // Accept a workspace name OR id, matching switch/rename.
         let id = self
             .session
             .lock_or_recover()
@@ -3083,7 +3103,7 @@ impl Server {
         bytes: &[u8],
     ) {
         // Hot path: update the vt100 parser + light metadata only. Heavy screen
-        // strings are materialized lazily in snapshot() (improve.md #36).
+        // strings are materialized lazily in snapshot().
         let Some((light, notifications, auto_title, llm_screen)) = ({
             let mut panes = self.panes.lock_or_recover();
             let runtime = panes.get_mut(runtime_key);
@@ -3352,6 +3372,17 @@ impl Server {
     fn save_loop(self: Arc<Self>) {
         loop {
             thread::sleep(Duration::from_millis(400));
+            // Stop before writing once shutdown has begun. `Shutdown` does its
+            // own final save and then removes the socket/pid, which makes
+            // `is_running()` false while this process is still alive — so a
+            // debounced write landing here would re-create the state file after
+            // a caller (e.g. `vmux smoke`) had already cleaned it up.
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return;
+            }
             if self
                 .save_dirty
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -3395,7 +3426,7 @@ impl Server {
                 let contents = runtime.parser.screen().contents();
                 let raw = runtime.joined_output();
                 runtime.pane.output = contents;
-                runtime.pane.scrollback = trim_output(raw, SCROLLBACK_CAP);
+                runtime.pane.scrollback = trim_output(raw, self.scrollback_cap);
                 runtime_pane = Some(runtime.pane.clone());
                 // Release the PTY OS handles now that the child is gone; the
                 // parser/output stay so the UI keeps the final screen state.
@@ -3526,7 +3557,7 @@ impl Server {
                             }
                             // Also keep plain scrollback string in runtime for persist/save.
                             let raw = runtime.joined_output();
-                            runtime.pane.scrollback = trim_output(raw.clone(), SCROLLBACK_CAP);
+                            runtime.pane.scrollback = trim_output(raw.clone(), self.scrollback_cap);
                             runtime.pane.output = contents.clone();
                             runtime.pane.output_formatted = formatted.clone();
                             runtime.pane.scrollback_formatted =
@@ -3567,7 +3598,7 @@ impl Server {
             if let Some((contents, formatted, raw, scrollback_formatted)) = output {
                 pane.output = contents;
                 pane.output_formatted = formatted;
-                pane.scrollback = trim_output(raw, SCROLLBACK_CAP);
+                pane.scrollback = trim_output(raw, self.scrollback_cap);
                 pane.scrollback_formatted = scrollback_formatted;
             } else if let Some(stored) = session.panes.get(&pane.id) {
                 pane.output = stored.output.clone();
@@ -3800,7 +3831,7 @@ impl Server {
             let mut session = self.session.lock_or_recover();
             session.flush_tabs();
         }
-        // Persist must materialize runtime screen/scrollback (bugs.md P0#1).
+        // Persist must materialize runtime screen/scrollback.
         // Light `snapshot(false)` leaves empty strings from append_output's
         // hot path and loses history across daemon restart.
         let mut snapshot = self.snapshot(true)?;
@@ -3882,7 +3913,7 @@ fn truncate_on_char_boundary(s: &mut String, max: usize) {
 fn push_event(session: &mut Session, mut event: EventRecord) {
     session.next_event_id = session.next_event_id.saturating_add(1).max(1);
     event.id = session.next_event_id;
-    // Bound message length at the protocol boundary (newimp §9).
+    // Bound message length at the protocol boundary.
     const MAX_EVENT_MSG: usize = 4_096;
     truncate_on_char_boundary(&mut event.message, MAX_EVENT_MSG);
     session.events.push(event);
@@ -4294,7 +4325,7 @@ fn load_custom_actions(cwd: &Path) -> Result<Option<(PathBuf, Vec<CustomAction>)
 
 fn find_vmux_config(cwd: &Path) -> Option<PathBuf> {
     // Stop at $HOME so a workspace under /tmp cannot pick up /tmp/vmux.json
-    // planted by another user (improve.md P3).
+    // planted by another user.
     let home = dirs::home_dir();
     for dir in cwd.ancestors() {
         for name in ["vmux.json", ".vmux.json"] {
@@ -4803,10 +4834,66 @@ fn scrollback_limit(limit_bytes: Option<usize>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A disposable session name that removes its own runtime/state files.
+    ///
+    /// Daemon tests write to the *real* XDG dirs, so they must not collide with
+    /// each other or leave anything behind. Two things went wrong before this
+    /// existed:
+    ///
+    /// 1. Names were built from `unix_time()` alone — one-second granularity and
+    ///    no PID, so two tests in the same second (or two `cargo test` runs in
+    ///    two worktrees, which the repo's own workflow encourages) collided on
+    ///    the same session and the same flock.
+    /// 2. Cleanup was a bare statement at the end of the test body, so any
+    ///    failing assertion panicked straight past it. The leaked `*.json` files
+    ///    then showed up as phantom sessions in the developer's real `vmux ls`.
+    ///
+    /// Cleanup lives in `Drop` so it runs on the panicking path too.
+    struct TestSession {
+        name: String,
+    }
+
+    impl TestSession {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            Self {
+                name: format!(
+                    "vmux-test-{label}-{}-{}-{unique}",
+                    std::process::id(),
+                    unix_time()
+                ),
+            }
+        }
+
+        fn as_str(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl Drop for TestSession {
+        fn drop(&mut self) {
+            for path in [
+                paths::state_path(&self.name).ok(),
+                paths::lock_path(&self.name).ok(),
+                paths::pid_path(&self.name).ok(),
+                paths::socket_path(&self.name).ok(),
+                paths::log_path(&self.name).ok(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                fs::remove_file(path).ok();
+            }
+        }
+    }
 
     #[test]
     fn handle_stream_returns_json_error_for_unknown_request() {
-        let server = Arc::new(Server::load(&format!("vmux-decode-test-{}", unix_time())).unwrap());
+        let session = TestSession::new("decode");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
         let (mut client, daemon) = UnixStream::pair().unwrap();
         let worker = {
             let server = Arc::clone(&server);
@@ -4834,7 +4921,8 @@ mod tests {
 
     #[test]
     fn idle_prompt_notification_does_not_demote_done() {
-        let server = Arc::new(Server::load(&format!("vmux-idle-note-{}", unix_time())).unwrap());
+        let session = TestSession::new("idle-note");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
         {
             let mut session = server.session.lock_or_recover();
             let mut pane = Pane::new(
@@ -4915,7 +5003,8 @@ mod tests {
 
     #[test]
     fn load_marks_saved_panes_restored_and_relaunches_them() {
-        let session_name = format!("vmux-restore-test-{}-{}", std::process::id(), unix_time());
+        let _guard = TestSession::new("restore");
+        let session_name = _guard.as_str().to_string();
         let state_path = paths::state_path(&session_name).unwrap();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::new(&session_name);
@@ -4953,13 +5042,30 @@ mod tests {
         assert!(server.panes.lock_or_recover().contains_key("pane-1"));
         let snapshot = server.snapshot(false).unwrap();
         let pane = snapshot.panes.get("pane-1").unwrap();
-        assert!(matches!(
-            pane.status,
-            PaneStatus::Running | PaneStatus::Exited
-        ));
+        // The relaunched pane must be a *live* process, not the stale saved pid.
         assert_ne!(pane.pid, Some(999_999));
+        assert!(pane.pid.is_some(), "relaunched pane must have a real pid");
         assert_eq!(pane.output, "old output");
         assert_eq!(pane.scrollback, "old scrollback");
+
+        // `printf` exits immediately. Wait for the reaper rather than accepting
+        // `Running | Exited`: that OR made the assertion unfalsifiable, and the
+        // reader thread's `mark_exited` calls `save()`, so ending the test while
+        // it is still in flight re-creates the state file after cleanup.
+        let exited = (0..200).any(|_| {
+            let done = matches!(
+                server.snapshot(false).unwrap().panes["pane-1"].status,
+                PaneStatus::Exited
+            );
+            if !done {
+                thread::sleep(Duration::from_millis(10));
+            }
+            done
+        });
+        assert!(
+            exited,
+            "relaunched pane should be reaped after printf exits"
+        );
 
         if let Some(mut runtime) = server.panes.lock_or_recover().remove("pane-1") {
             if let Some(mut killer) = runtime.killer.take() {
@@ -4967,16 +5073,74 @@ mod tests {
             }
         }
         server.cleanup_runtime_files();
-        fs::remove_file(state_path).ok();
+        let _ = state_path;
+    }
+
+    /// The generation counter is what makes the UI repaint: clients poll with
+    /// `Snapshot { since }` and the daemon short-circuits to `unchanged` when the
+    /// counter has not moved. A mutation that forgets to bump it is invisible —
+    /// the screen simply never updates — which makes this the cheapest possible
+    /// bug to introduce and the hardest to notice. Nothing guarded it before.
+    #[test]
+    fn mutating_requests_bump_the_generation_counter() {
+        let session = TestSession::new("generation");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+
+        let mutations: Vec<(&str, Request)> = vec![
+            (
+                "new-workspace",
+                Request::NewWorkspace {
+                    name: "gen-ws".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "new-tab",
+                Request::NewTab {
+                    workspace: None,
+                    title: Some("gen-tab".into()),
+                    command: None,
+                },
+            ),
+            (
+                "rename-workspace",
+                Request::RenameWorkspace {
+                    workspace: "gen-ws".into(),
+                    name: "gen-ws-renamed".into(),
+                },
+            ),
+        ];
+
+        for (label, request) in mutations {
+            let before = server.generation();
+            server.dispatch(request).unwrap();
+            let after = server.generation();
+            assert!(
+                after > before,
+                "{label} mutated state but did not bump the generation \
+                 ({before} -> {after}); the UI would never repaint"
+            );
+        }
+
+        // The converse: a read must NOT bump it, or `since` never short-circuits
+        // and every client re-fetches the whole session on every poll.
+        let before = server.generation();
+        server.dispatch(Request::Agents).unwrap();
+        assert_eq!(
+            server.generation(),
+            before,
+            "a read-only request must not bump the generation"
+        );
     }
 
     #[test]
     fn activating_base_tab_migrates_legacy_runtime_without_orphaning() {
-        // Regression for finding 2: a pane created before it had tabs keeps its
+        // Regression: a pane created before it had tabs keeps its
         // runtime under the bare `pane-N` key. Adding a tab and switching back to
         // the base tab must reuse that runtime (re-keyed to `pane-N::tab-1`)
         // rather than orphaning it and spawning a duplicate shell.
-        let session_name = format!("vmux-tabkey-test-{}-{}", std::process::id(), unix_time());
+        let _guard = TestSession::new("tabkey");
+        let session_name = _guard.as_str().to_string();
         let state_path = paths::state_path(&session_name).unwrap();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::new(&session_name);
@@ -5210,7 +5374,8 @@ mod tests {
 
     #[test]
     fn pane_size_sync_uses_single_attach_owner() {
-        let server = Server::load(&format!("vmux-size-owner-test-{}", unix_time())).unwrap();
+        let session = TestSession::new("size-owner");
+        let server = Server::load(session.as_str()).unwrap();
         server
             .resize_ptys(BTreeMap::new(), Some("desktop".to_string()), true)
             .unwrap();
@@ -5597,15 +5762,18 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
 
     #[test]
     fn push_output_bounds_scrollback_by_bytes() {
+        // An explicit cap, not the default: this asserts the budget is honoured,
+        // whatever `ui.scrollback_bytes` happens to be set to.
+        const CAP: usize = 16_000;
         let mut output: VecDeque<String> = VecDeque::new();
         let mut output_bytes = 0;
         for _ in 0..1000 {
-            push_bounded_output(&mut output, &mut output_bytes, "x".repeat(1000));
+            push_bounded_output(&mut output, &mut output_bytes, "x".repeat(1000), CAP);
         }
-        assert!(output_bytes <= SCROLLBACK_CAP);
+        assert!(output_bytes <= CAP);
         let joined: String = output.iter().cloned().collect();
         assert_eq!(joined.len(), output_bytes);
-        assert!(joined.len() <= SCROLLBACK_CAP);
+        assert!(joined.len() <= CAP);
         // The most recent chunk is always retained.
         assert!(output.back().is_some());
     }
@@ -5680,7 +5848,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
 
     #[test]
     fn load_recovers_from_corrupt_state_file() {
-        let session_name = format!("vmux-corrupt-test-{}-{}", std::process::id(), unix_time());
+        let _guard = TestSession::new("corrupt");
+        let session_name = _guard.as_str().to_string();
         let state_path = paths::state_path(&session_name).unwrap();
         fs::write(&state_path, b"{ this is not valid json").unwrap();
 
@@ -5745,7 +5914,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
     #[test]
     fn full_snapshot_materializes_runtime_output_for_persist() {
         // Light path clears heavy strings; persist/full path must refill them.
-        let session_name = format!("vmux-persist-{}-{}", std::process::id(), unix_time());
+        let _guard = TestSession::new("persist");
+        let session_name = _guard.as_str().to_string();
         let server = Server::load(&session_name).unwrap();
         {
             let mut panes = server.panes.lock_or_recover();
@@ -5757,6 +5927,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 killer: None,
                 output: std::collections::VecDeque::new(),
                 output_bytes: 0,
+                scrollback_cap: crate::config::default_scrollback_bytes(),
                 pending: Vec::new(),
                 osc_tail: String::new(),
                 parser: vt100::Parser::new(24, 80, 1000),
@@ -5809,7 +5980,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
     /// End-to-end: live runtime output → save → drop server → reload → history intact.
     #[test]
     fn e2e_restart_preserves_scrollback_across_save_reload() {
-        let session_name = format!("vmux-e2e-restart-{}-{}", std::process::id(), unix_time());
+        let _guard = TestSession::new("e2e-restart");
+        let session_name = _guard.as_str().to_string();
         let state_path = paths::state_path(&session_name).unwrap();
         let lock_path = paths::lock_path(&session_name).unwrap();
         let marker = "vmux-e2e-restart-marker-42";
@@ -5843,6 +6015,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                     killer: None,
                     output: VecDeque::new(),
                     output_bytes: 0,
+                    scrollback_cap: crate::config::default_scrollback_bytes(),
                     pending: Vec::new(),
                     osc_tail: String::new(),
                     parser: vt100::Parser::new(24, 80, 1000),
@@ -5870,11 +6043,18 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         let on_disk: Session =
             serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
         let disk_pane = on_disk.panes.get("pane-1").expect("pane on disk");
+        // Assert both fields independently, not `output || scrollback`. The P0
+        // this test guards was scrollback being dropped from the state file
+        // *while `output` survived*, so an OR here cannot see its own regression.
         assert!(
-            disk_pane.output.contains(marker) || disk_pane.scrollback.contains(marker),
-            "state file must contain marker; out={:?} sb={:?}",
-            disk_pane.output,
+            disk_pane.scrollback.contains(marker),
+            "state file must persist scrollback; sb={:?}",
             disk_pane.scrollback
+        );
+        assert!(
+            disk_pane.output.contains(marker),
+            "state file must persist screen output; out={:?}",
+            disk_pane.output
         );
 
         // Phase 2: cold start from disk (lock re-acquired after drop).
@@ -5894,15 +6074,17 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
             let loaded = server.session.lock_or_recover();
             let pane = loaded.panes.get("pane-1").expect("pane after reload");
             assert!(
-                pane.output.contains(marker) || pane.scrollback.contains(marker),
-                "reload must keep history; out={:?} sb={:?}",
-                pane.output,
+                pane.scrollback.contains(marker),
+                "reload must keep scrollback; sb={:?}",
                 pane.scrollback
             );
-            assert!(matches!(
-                pane.status,
-                PaneStatus::Restored | PaneStatus::Running | PaneStatus::Exited
-            ));
+            assert!(
+                pane.output.contains(marker),
+                "reload must keep screen output; out={:?}",
+                pane.output
+            );
+            // A pane loaded from disk has not been relaunched yet.
+            assert_eq!(pane.status, PaneStatus::Restored);
         }
 
         fs::remove_file(state_path).ok();

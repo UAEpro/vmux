@@ -29,6 +29,7 @@ use crate::config::{LmuxConfig, RelaySettings};
 use crate::daemon;
 use crate::paths;
 use crate::protocol::{self, Request, Response};
+use crate::sync::MutexExt;
 use std::process::{Command as ProcessCommand, Stdio};
 
 const RELAY_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -128,6 +129,14 @@ pub fn load_or_init_config(path: &Path) -> Result<RelayConfig> {
     }
     fs::write(path, serde_json::to_string_pretty(&cfg)? + "\n")
         .with_context(|| format!("write default relay config {}", path.display()))?;
+    // This file carries `bootstrap_secret`. The config dir is already 0700, but
+    // the device store next to it sets an explicit mode and the one file with a
+    // shared secret in it should not be the exception.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
     Ok(cfg)
 }
 
@@ -161,7 +170,7 @@ impl DeviceStore {
     fn load(path: PathBuf) -> Result<Self> {
         let devices = if path.exists() {
             let raw = fs::read_to_string(&path)?;
-            // Fail closed on corrupt storage (bugs.md P2#13) — never treat as empty.
+            // Fail closed on corrupt storage — never treat as empty.
             let file: DeviceFile = serde_json::from_str(&raw).with_context(|| {
                 format!(
                     "parse device store {} failed; refusing to wipe (repair or delete the file)",
@@ -208,7 +217,7 @@ impl DeviceStore {
         hostname: &str,
         plain_token: &str,
     ) -> Result<()> {
-        let mut guard = self.devices.lock().expect("device store lock");
+        let mut guard = self.devices.lock_or_recover();
         guard.insert(
             device_id.to_string(),
             DeviceRecord {
@@ -225,7 +234,7 @@ impl DeviceStore {
     }
 
     fn revoke(&self, device_id: &str) -> Result<bool> {
-        let mut guard = self.devices.lock().expect("device store lock");
+        let mut guard = self.devices.lock_or_recover();
         let removed = guard.remove(device_id).is_some();
         if removed {
             Self::persist_locked(&self.path, &guard)?;
@@ -235,7 +244,7 @@ impl DeviceStore {
 
     fn validate_token(&self, token: &str) -> Option<String> {
         let hash = sha256_hex(token);
-        let guard = self.devices.lock().expect("device store lock");
+        let guard = self.devices.lock_or_recover();
         let mut found = None;
         for d in guard.values() {
             // Constant-time-ish compare on the hex hash (equal length SHA-256 hex).
@@ -247,7 +256,7 @@ impl DeviceStore {
     }
 
     fn set_apns(&self, device_id: &str, token: &str, env: &str) -> Result<()> {
-        let mut guard = self.devices.lock().expect("device store lock");
+        let mut guard = self.devices.lock_or_recover();
         let Some(dev) = guard.get_mut(device_id) else {
             bail!("unknown device");
         };
@@ -279,7 +288,7 @@ struct RelayState {
     active_connections: AtomicUsize,
 }
 
-/// Max simultaneous TCP connections accepted by the relay (bugs.md P1#7).
+/// Max simultaneous TCP connections accepted by the relay.
 const MAX_RELAY_CONNECTIONS: usize = 64;
 
 // ─── Public CLI entry points ────────────────────────────────────────────────
@@ -368,7 +377,7 @@ pub fn serve(
             break;
         }
         let Ok(stream) = stream else { continue };
-        // Cap concurrent handlers before spawning a thread (bugs.md P1#7).
+        // Cap concurrent handlers before spawning a thread.
         let active = state.active_connections.load(Ordering::Relaxed);
         if active >= MAX_RELAY_CONNECTIONS {
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -754,7 +763,7 @@ fn ureq_get_health(url: &str) -> Result<String> {
 
 // ─── HTTP connection handling ───────────────────────────────────────────────
 
-/// Request-line / header limits for unauthenticated peers (bugs.md P1#7).
+/// Request-line / header limits for unauthenticated peers.
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -1193,7 +1202,7 @@ fn handle_ws_upgrade(
         Arc::new(Mutex::new(HashMap::new()));
     let push_tx = Arc::new(Mutex::new(None::<std::sync::mpsc::SyncSender<String>>));
     let (tx, rx) = std::sync::mpsc::sync_channel::<String>(PUSH_CHANNEL_CAP);
-    *push_tx.lock().expect("push lock") = Some(tx);
+    *push_tx.lock_or_recover() = Some(tx);
 
     // Event poller for notifications
     let events_stop = Arc::new(AtomicBool::new(false));
@@ -1316,7 +1325,7 @@ fn handle_ws_upgrade(
                         .max(1) as usize;
 
                     // stop existing sub for this surface
-                    if let Some(flag) = stop_flags.lock().expect("flags").remove(&surface_id) {
+                    if let Some(flag) = stop_flags.lock_or_recover().remove(&surface_id) {
                         flag.store(true, Ordering::Relaxed);
                     }
                     if let Some(handle) = active_subs.remove(&surface_id) {
@@ -1355,7 +1364,7 @@ fn handle_ws_upgrade(
                         .get("surface_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if let Some(flag) = stop_flags.lock().expect("flags").remove(surface_id) {
+                    if let Some(flag) = stop_flags.lock_or_recover().remove(surface_id) {
                         flag.store(true, Ordering::Relaxed);
                     }
                     if let Some(handle) = active_subs.remove(surface_id) {
@@ -1396,7 +1405,7 @@ fn handle_ws_upgrade(
     }
 
     events_stop.store(true, Ordering::Relaxed);
-    for (_, flag) in stop_flags.lock().expect("flags").drain() {
+    for (_, flag) in stop_flags.lock_or_recover().drain() {
         flag.store(true, Ordering::Relaxed);
     }
     for (_, handle) in active_subs.drain() {
@@ -1571,7 +1580,7 @@ fn run_surface_poller(
     let mut last_checksum = Instant::now() - Duration::from_secs(10);
 
     while !stop.load(Ordering::Relaxed) {
-        // Non-empty screen diffs bump last_activity so FPS returns to active (bugs.md P2#15).
+        // Non-empty screen diffs bump last_activity so FPS returns to active.
         let current_fps = if last_activity.elapsed() > Duration::from_millis(1500) {
             idle_fps.max(1)
         } else {
@@ -2170,7 +2179,7 @@ fn save_upload(name: &str, bytes: &[u8]) -> Result<(PathBuf, String)> {
             }
         })
         .collect();
-    // Unique name + create_new so same-second uploads never clobber (bugs.md P3#18).
+    // Unique name + create_new so same-second uploads never clobber.
     for _ in 0..8 {
         let path = dir.join(format!("{}-{}-{}", now_secs(), random_hex(8), safe));
         match fs::OpenOptions::new()
@@ -2321,6 +2330,164 @@ fn port_of(listen: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Device registration policy ─────────────────────────────────────────
+    //
+    // `relay/auth.rs` is the relay's only network-facing security surface, and
+    // it had no tests at all. Both of the behaviours pinned below are *already
+    // fixed bugs* (the bootstrap-secret gate, and the localhost device-id
+    // collision) that nothing stopped from silently regressing.
+
+    fn auth_state(mutate: impl FnOnce(&mut RelayConfig)) -> RelayState {
+        let mut config = RelayConfig {
+            allow_localhost: true,
+            ..RelayConfig::default()
+        };
+        mutate(&mut config);
+        let devices = std::env::temp_dir().join(format!(
+            "vmux-authtest-{}-{}.json",
+            std::process::id(),
+            random_hex(8)
+        ));
+        RelayState {
+            config,
+            devices: DeviceStore::load(devices).unwrap(),
+            socket: PathBuf::from("/nonexistent/vmux-authtest.sock"),
+            boot_id: "test-boot".into(),
+            started_at: 0,
+            running: AtomicBool::new(true),
+            active_connections: AtomicUsize::new(0),
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn is_forbidden<T>(result: &std::result::Result<T, RegisterError>) -> bool {
+        matches!(result, Err(RegisterError::Forbidden(_)))
+    }
+
+    #[test]
+    fn bootstrap_secret_is_required_on_every_registration_path() {
+        // The policy: a configured non-empty bootstrap secret
+        // gates *every* path — including localhost, which is otherwise admitted.
+        let state = auth_state(|c| c.bootstrap_secret = Some("s3cret".into()));
+
+        assert!(
+            is_forbidden(&register_device(&state, "127.0.0.1", &headers(&[]))),
+            "localhost must not bypass a configured bootstrap secret"
+        );
+        assert!(
+            is_forbidden(&register_device(
+                &state,
+                "127.0.0.1",
+                &headers(&[("x-vmux-bootstrap", "wrong")])
+            )),
+            "a wrong secret must be refused"
+        );
+        assert!(
+            register_device(
+                &state,
+                "127.0.0.1",
+                &headers(&[("x-vmux-bootstrap", "s3cret")])
+            )
+            .is_ok(),
+            "the correct secret must be accepted"
+        );
+    }
+
+    #[test]
+    fn bootstrap_header_accepts_both_header_forms_and_rejects_near_misses() {
+        let state = auth_state(|c| c.bootstrap_secret = Some("s3cret".into()));
+        assert!(bootstrap_header_matches(
+            &state,
+            &headers(&[("x-vmux-bootstrap", "s3cret")])
+        ));
+        assert!(bootstrap_header_matches(
+            &state,
+            &headers(&[("authorization", "Bootstrap s3cret")])
+        ));
+        // A prefix must not pass: the digest compare exists precisely so length
+        // and timing leak nothing.
+        assert!(!bootstrap_header_matches(
+            &state,
+            &headers(&[("x-vmux-bootstrap", "s3cre")])
+        ));
+        assert!(!bootstrap_header_matches(&state, &headers(&[])));
+
+        // An *empty* configured secret is not a secret — it must not admit a
+        // caller who also sends nothing.
+        let empty = auth_state(|c| c.bootstrap_secret = Some(String::new()));
+        assert!(!bootstrap_header_matches(&empty, &headers(&[])));
+        assert!(!bootstrap_header_matches(
+            &empty,
+            &headers(&[("x-vmux-bootstrap", "")])
+        ));
+    }
+
+    #[test]
+    fn localhost_registration_honours_allow_localhost() {
+        let denied = auth_state(|c| c.allow_localhost = false);
+        assert!(is_forbidden(&register_device(
+            &denied,
+            "127.0.0.1",
+            &headers(&[])
+        )));
+
+        let allowed = auth_state(|c| c.allow_localhost = true);
+        assert!(register_device(&allowed, "127.0.0.1", &headers(&[])).is_ok());
+    }
+
+    #[test]
+    fn each_localhost_pairing_is_a_distinct_device() {
+        // Loopback has no stable node identity, so a fixed node_key would hash
+        // to ONE device_id for every local client and each new pairing would
+        // overwrite the previous device's token. Two pairings, two devices.
+        let state = auth_state(|c| c.allow_localhost = true);
+        let (first_id, first_token) = register_device(&state, "127.0.0.1", &headers(&[])).unwrap();
+        let (second_id, second_token) =
+            register_device(&state, "127.0.0.1", &headers(&[])).unwrap();
+
+        assert_ne!(first_id, second_id, "each pairing must be its own device");
+        assert_ne!(first_token, second_token);
+        // The first device's token must still resolve to the first device — the
+        // second pairing did not clobber it.
+        assert_eq!(
+            state.devices.validate_token(&first_token).as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(
+            state.devices.validate_token(&second_token).as_deref(),
+            Some(second_id.as_str())
+        );
+    }
+
+    #[test]
+    fn cgnat_peer_needs_the_opt_in_and_cannot_skip_allow_login() {
+        // A CGNAT peer with no whois identity: refused unless explicitly opted
+        // in, and refused even then when allow_login is set (whois is the only
+        // thing that can prove a login, so the fallback must not stand in).
+        let off = auth_state(|c| c.allow_tailnet_cgnat = false);
+        assert!(is_forbidden(&register_device(
+            &off,
+            "100.64.0.1",
+            &headers(&[])
+        )));
+
+        let on_with_allowlist = auth_state(|c| {
+            c.allow_tailnet_cgnat = true;
+            c.allow_login = vec!["someone@example.com".into()];
+        });
+        assert!(is_forbidden(&register_device(
+            &on_with_allowlist,
+            "100.64.0.1",
+            &headers(&[])
+        )));
+    }
 
     #[test]
     fn relay_config_without_allow_paste_defaults_on() {

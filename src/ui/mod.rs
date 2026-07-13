@@ -99,7 +99,7 @@ impl Drop for TerminalGuard {
         // Best-effort restore; ignore errors since we may be unwinding. Leaving
         // the alternate screen / disabling mouse capture is harmless even if
         // entering it never succeeded. Always disable mouse/paste — Settings
-        // may have toggled capture after construction (improve.md #20).
+        // may have toggled capture after construction.
         let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
         let _ = execute!(io::stdout(), event::DisableMouseCapture);
         let _ = execute!(io::stdout(), event::DisableBracketedPaste);
@@ -224,7 +224,7 @@ struct Ui {
     /// changes, which would otherwise appear only after the next 150ms tick.
     /// `Cell` so the `&self` `rpc()` helper can set it.
     pending_refresh: std::cell::Cell<bool>,
-    /// Coalesced keystroke payload for the active pane (newimp §6).
+    /// Coalesced keystroke payload for the active pane.
     /// Flushed after ~8 ms idle, on paste/navigation, or when the buffer is large.
     input_batch: String,
     input_batch_pane: Option<String>,
@@ -1152,7 +1152,7 @@ impl Ui {
                 last_refresh = Instant::now();
             }
 
-            // Adaptive poll: faster while typing/active, slower when idle (newimp §6).
+            // Adaptive poll: faster while typing/active, slower when idle.
             let active_recently = self
                 .last_typing_at
                 .map(|t| t.elapsed() < Duration::from_millis(800))
@@ -1300,7 +1300,7 @@ impl Ui {
     /// the previous refresh (used to drive dirty-flag rendering).
     ///
     /// Uses Snapshot.since generation short-circuit when the daemon reports
-    /// unchanged (improve.md #35).
+    /// unchanged.
     fn refresh(&mut self) -> Result<bool> {
         // Lean poll: skip event history and scrollback strings except for
         // panes the user is currently scrolled back in.
@@ -1569,7 +1569,7 @@ impl Ui {
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
-                    // Ignore drags under modals/overlays (bugs.md P2#10).
+                    // Ignore drags under modals/overlays.
                     if self.pending_confirm.is_some()
                         || self.rename_dialog.is_some()
                         || !matches!(self.mode, UiMode::Panes)
@@ -1683,7 +1683,7 @@ impl Ui {
                 _ => {}
             },
             Event::Paste(text) => {
-                // Never paste into a hidden pane under overlays/modals (bugs.md P2#10).
+                // Never paste into a hidden pane under overlays/modals.
                 if self.pending_confirm.is_some()
                     || self.rename_dialog.is_some()
                     || !matches!(self.mode, UiMode::Panes)
@@ -2366,7 +2366,7 @@ impl Ui {
                 {
                     *self.action_error.get_mut() = Some(format!("save config: {err:#}"));
                 }
-                // Never fail attach on relay start/stop (improve.md #14).
+                // Never fail attach on relay start/stop.
                 let settings = self.relay_settings();
                 let session = self.session.clone();
                 match crate::relay::apply_enabled(&session, &settings) {
@@ -3111,7 +3111,7 @@ impl Ui {
         self.update_hover(column, row)?;
         let (width, height) = terminal_size()?;
         let layout_cols = self.layout_sidebar_cols();
-        // Modal-first: dialogs own input before sidebar resize / chrome (bugs.md P2#10).
+        // Modal-first: dialogs own input before sidebar resize / chrome.
         if self.rename_dialog.is_some() {
             let main = confirm_main_area(layout_cols, width, height);
             if let Some((ok, cancel)) = rename_button_rects(main) {
@@ -3212,7 +3212,7 @@ impl Ui {
                 }
             }
         }
-        // Context menu is an overlay but must accept item clicks (bugs.md P2#11).
+        // Context menu is an overlay but must accept item clicks.
         if self.mode == UiMode::ContextMenu {
             let menu = confirm_main_area(layout_cols, width, height);
             if self.handle_context_click(menu, column, row)? {
@@ -3222,7 +3222,7 @@ impl Ui {
             return Ok(false);
         }
         // Overlays (settings/commands/picker/…) own the main area — do not
-        // let clicks fall through to hidden pane × buttons (improve.md #19).
+        // let clicks fall through to hidden pane × buttons.
         if !matches!(self.mode, UiMode::Panes) {
             return Ok(false);
         }
@@ -3470,7 +3470,7 @@ impl Ui {
     fn handle_context_click(&mut self, area: Rect, column: u16, row: u16) -> Result<bool> {
         // The menu is a bordered list inside `area`; only clicks within it select
         // an item. Ignore clicks elsewhere (e.g. the sidebar) so a matching ROW
-        // alone can't trigger a menu action (bugs.md P2#11: hit-test row AND col).
+        // alone can't trigger a menu action.
         if !point_in_rect(area, column, row) {
             return Ok(false);
         }
@@ -7038,7 +7038,7 @@ fn selected_text_from_pane(
     let (start_col, start_row, end_col, end_row) =
         selection_range_in_content(selection, content_area)?;
     // When scrolled back, copy from scrollback using the same window mapping
-    // as the renderer (improve.md #22).
+    // as the renderer.
     let source = if scroll_offset > 0 && !pane.scrollback.is_empty() {
         pane.scrollback.as_str()
     } else {

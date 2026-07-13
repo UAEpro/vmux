@@ -77,8 +77,24 @@ pub fn validate_session_name(session: &str) -> Result<()> {
             "invalid session name {session:?}: must not contain '/', '\\', '..', or NUL bytes"
         );
     }
+    if RESERVED_STATE_STEMS.contains(&session) {
+        anyhow::bail!(
+            "invalid session name {session:?}: reserved for vmux's own state file of that name"
+        );
+    }
     Ok(())
 }
+
+/// File stems the daemon writes into the state dir that are *not* sessions.
+///
+/// These share the state dir with `<session>.json`, so they matter twice over.
+/// `list_sessions` enumerates `*.json` there and filters through
+/// `validate_session_name`, so without this list they surface as phantom
+/// sessions in `vmux sessions` — `update-check` appears on every install once
+/// the daily check has run. And a session actually *named* one of these would
+/// have its state file collide with the real one, letting a session clobber the
+/// relay's device store (which holds auth token hashes).
+const RESERVED_STATE_STEMS: &[&str] = &["update-check", "relay-devices"];
 
 pub fn socket_path(session: &str) -> Result<PathBuf> {
     validate_session_name(session)?;
@@ -170,7 +186,7 @@ pub fn read_pid_file(path: &Path) -> Option<u32> {
 }
 
 /// PID file record: `pid` on line 1, optional process starttime (jiffies) on line 2.
-/// Starttime prevents signalling a recycled PID after a crash (bugs.md P1#2).
+/// Starttime prevents signalling a recycled PID after a crash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PidRecord {
     pub pid: u32,
@@ -354,5 +370,39 @@ mod tests {
         assert!(sessions
             .iter()
             .any(|session| session.name == name && !session.running));
+    }
+
+    #[test]
+    fn reserved_state_stems_are_not_sessions() {
+        // The daemon's own state files live beside `<session>.json`. Before this
+        // was reserved, the daily update check made `update-check` show up in
+        // `vmux sessions` on every install.
+        for reserved in RESERVED_STATE_STEMS {
+            assert!(
+                validate_session_name(reserved).is_err(),
+                "expected {reserved:?} to be rejected as a session name"
+            );
+            assert!(state_path(reserved).is_err());
+        }
+    }
+
+    #[test]
+    fn list_sessions_skips_the_daemons_own_state_files() {
+        // Materialize the real files list_sessions would otherwise report.
+        let update = update_cache_path().unwrap();
+        let had_update = update.exists();
+        if !had_update {
+            fs::write(&update, "{}").unwrap();
+        }
+        let sessions = list_sessions().unwrap();
+        if !had_update {
+            fs::remove_file(&update).ok();
+        }
+        for reserved in RESERVED_STATE_STEMS {
+            assert!(
+                !sessions.iter().any(|s| s.name == *reserved),
+                "{reserved:?} is a daemon state file, not a session, but was listed"
+            );
+        }
     }
 }

@@ -80,7 +80,7 @@ impl Default for RelaySettings {
             port: 4399,
             allow_localhost: false,
             // Safer default: require Tailscale whois (or bootstrap) rather than
-            // trusting any CGNAT peer (newimp §8).
+            // trusting any CGNAT peer.
             allow_tailnet_cgnat: false,
             // On by default: uploads still require a paired device token, and
             // the relay itself is opt-in.
@@ -104,6 +104,15 @@ pub struct UiConfig {
     pub prefix_key: String,
     #[serde(default = "default_scroll_step")]
     pub scroll_step: usize,
+    /// Bytes of raw output retained per pane for scrollback and persistence.
+    ///
+    /// This was a hardcoded 16 KB — roughly 200 lines at 80 columns, against
+    /// tmux's 2000-line default. vmux's whole premise is that you detach, an
+    /// agent keeps working, and you reattach to find its output waiting, so the
+    /// retained history has to be big enough to hold that work. Takes effect on
+    /// the next daemon start.
+    #[serde(default = "default_scrollback_bytes")]
+    pub scrollback_bytes: usize,
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default = "default_workspace_second_line")]
@@ -145,6 +154,7 @@ impl Default for UiConfig {
             sidebar_fit: false,
             prefix_key: default_prefix_key(),
             scroll_step: default_scroll_step(),
+            scrollback_bytes: default_scrollback_bytes(),
             theme: default_theme(),
             workspace_second_line: default_workspace_second_line(),
             cursor_blink: true,
@@ -168,6 +178,9 @@ impl LmuxConfig {
             self.ui.prefix_key = self.ui.prefix_key.trim().to_string();
         }
         self.ui.scroll_step = self.ui.scroll_step.clamp(1, 50);
+        // Floor at the old default so a config cannot make history useless;
+        // ceiling keeps a runaway pane's retained output bounded.
+        self.ui.scrollback_bytes = self.ui.scrollback_bytes.clamp(16_000, 5_000_000);
         self.ui.sidebar_width = clamp_sidebar_width(self.ui.sidebar_width);
         self.ui.theme = normalize_theme(&self.ui.theme);
         self.ui.workspace_second_line =
@@ -235,6 +248,11 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
             config.ui.scroll_step = value
                 .parse::<usize>()
                 .map_err(|_| anyhow!("ui.scroll_step must be a positive integer"))?;
+        }
+        "ui.scrollback_bytes" => {
+            config.ui.scrollback_bytes = value
+                .parse::<usize>()
+                .map_err(|_| anyhow!("ui.scrollback_bytes must be a positive integer"))?;
         }
         "ui.theme" => {
             let normalized = value.trim().to_ascii_lowercase();
@@ -393,6 +411,11 @@ pub fn default_prefix_key() -> String {
 
 pub fn default_scroll_step() -> usize {
     5
+}
+
+/// ~2500 lines at 80 columns, in the same ballpark as tmux's 2000-line default.
+pub fn default_scrollback_bytes() -> usize {
+    200_000
 }
 
 pub fn default_theme() -> String {
@@ -559,7 +582,7 @@ pub fn load_from_path(path: &Path) -> Result<LmuxConfig> {
 }
 
 /// Load config for mutating commands (`config set`, Settings panel). Fails closed
-/// on parse errors so a typo cannot be overwritten with defaults (bugs.md P1#5).
+/// on parse errors so a typo cannot be overwritten with defaults.
 pub fn load_for_mutation() -> Result<(std::path::PathBuf, LmuxConfig)> {
     let path = paths::config_path()?;
     // Distinguish "genuinely absent" from "broken symlink". `exists()` follows

@@ -7,6 +7,7 @@ mod model;
 mod paths;
 mod protocol;
 mod relay;
+mod sync;
 mod ui;
 mod update;
 
@@ -1892,7 +1893,7 @@ fn normalize_agent_names(agents: Vec<String>) -> Result<Vec<String>> {
 fn write_agent_team_file(cwd: &std::path::Path, agents: &[String]) -> Result<String> {
     fs::create_dir_all(cwd)?;
     let path = cwd.join("AGENTS.md");
-    // Never clobber an existing project AGENTS.md (improve.md #6).
+    // Never clobber an existing project AGENTS.md.
     if path.exists() {
         return Ok(path.display().to_string());
     }
@@ -1984,7 +1985,7 @@ fn relative_workspace_id(snapshot: &model::Session, delta: isize) -> Result<Stri
 }
 
 fn ssh_command(host: &str, remote_command: Option<&str>) -> String {
-    // `--` stops option injection via host (improve.md: ProxyCommand footgun).
+    // `--` stops option injection via host.
     match remote_command {
         Some(command) if !command.trim().is_empty() => {
             format!("ssh -- {} {}", shell_quote(host), shell_quote(command))
@@ -2107,7 +2108,7 @@ fn wait_timeout_ms(timeout: Option<u64>) -> Option<u64> {
 
 fn print_logs(session: &str, lines: usize) -> Result<()> {
     let path = paths::log_path(session)?;
-    // Seek from the end in chunks so multi-GB logs do not load entirely (improve.md #41).
+    // Seek from the end in chunks so multi-GB logs do not load entirely.
     let text = tail_file_lines(&path, lines)
         .map_err(|err| anyhow!("read log {}: {err}", path.display()))?;
     print!("{text}");
