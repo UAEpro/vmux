@@ -17,18 +17,20 @@ pub struct LmuxConfig {
     pub agent_titles: AgentTitleSettings,
 }
 
-/// Automatic tab naming for panes running a coding agent.
+/// Automatic tab naming for panes running **any** coding agent.
 ///
-/// The daemon reads the title the agent sets on the terminal (OSC 0/2) and
-/// condenses it to one or two words. Agents that never set a title fall back to
-/// `llm_command`, which is asked to name the session from what is on screen.
+/// Sources (first match wins per update; all are free except the last):
+/// 1. Terminal title the agent sets (OSC 0/2) — Claude Code, Codex, etc.
+/// 2. `UserPromptSubmit` / hook prompt via `vmux hooks event` — any agent with hooks.
+/// 3. Meaningful busy status message — `vmux set-status busy --message "…"`.
+/// 4. `llm_command` screen summary after `llm_delay_ms` — last resort.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AgentTitleSettings {
     /// Master switch. Off leaves every tab title exactly as the user set it.
     pub enabled: bool,
-    /// Ask `llm_command` to name the tab when the agent sets no terminal title.
-    /// Costs one short model call per pane; the OSC path is free.
+    /// Ask `llm_command` to name the tab when no free source produced a title.
+    /// Costs one short model call per pane; OSC / hooks / status paths are free.
     pub llm_fallback: bool,
     /// Headless command that reads a prompt on stdin and prints a short title.
     pub llm_command: String,

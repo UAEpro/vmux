@@ -1014,7 +1014,8 @@ pub enum HooksCommand {
     Status,
     /// Install vmux sidebar status hooks for coding agents (and shell helpers).
     ///
-    /// Writes Claude Code settings, Codex hooks.json, Grok skill, and shell helpers.
+    /// Writes Claude Code settings, Codex hooks.json, Grok hooks
+    /// (`~/.grok/hooks/vmux.json`) plus the control skill, and shell helpers.
     /// Safe to re-run (idempotent; merges without wiping existing hooks).
     Install {
         /// One of: shell, claude, codex, grok (default: all).

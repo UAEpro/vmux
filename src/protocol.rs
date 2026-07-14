@@ -283,6 +283,11 @@ pub enum Request {
         color: Option<String>,
         clear: bool,
         message: String,
+        /// Optional auto tab title for **any** coding agent (condensed user
+        /// prompt from `UserPromptSubmit` hooks, or a short task label). Free
+        /// alternative to OSC terminal titles and the LLM fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     Notifications {
         limit: usize,
@@ -307,6 +312,14 @@ pub enum Request {
         /// callers get the plain text they always did.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ansi: bool,
+        /// Also return up to this many lines of true pane history (the live
+        /// parser's scrollback, complete rows) as a `history` array, oldest
+        /// first. 0 (the default) returns none. Unlike the raw `scrollback`
+        /// ring this is loss-free: diff-drawing TUIs skip unchanged cells
+        /// when repainting, so replaying the ring elsewhere reconstructs
+        /// fragments; the live grid never forgot them.
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        history_lines: usize,
     },
     Search {
         pane: Option<String>,
@@ -491,6 +504,10 @@ fn is_false(value: &bool) -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 fn default_true() -> bool {
@@ -969,6 +986,7 @@ mod tests {
             scrollback: true,
             limit_bytes: None,
             ansi: false,
+            history_lines: 0,
         })
         .unwrap();
         assert_eq!(encoded, r#"{"action":"read-screen","pane":"pane-1"}"#);
@@ -981,6 +999,7 @@ mod tests {
             scrollback: false,
             limit_bytes: Some(4096),
             ansi: false,
+            history_lines: 0,
         })
         .unwrap();
         assert_eq!(
@@ -1141,11 +1160,27 @@ mod tests {
             color: Some("yellow".to_string()),
             clear: false,
             message: "agents running".to_string(),
+            title: None,
         })
         .unwrap();
         assert_eq!(
             encoded,
             r#"{"action":"notify","pane":null,"workspace":"ws-2","status":"busy","color":"yellow","clear":false,"message":"agents running"}"#
+        );
+
+        let with_title = serde_json::to_string(&Request::Notify {
+            pane: Some("pane-1".to_string()),
+            workspace: None,
+            status: Some("busy".to_string()),
+            color: Some("yellow".to_string()),
+            clear: false,
+            message: "agent working".to_string(),
+            title: Some("fixing parser".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            with_title,
+            r#"{"action":"notify","pane":"pane-1","status":"busy","color":"yellow","clear":false,"message":"agent working","title":"fixing parser"}"#
         );
     }
 

@@ -15,9 +15,9 @@ use crate::cli::{BroadcastScope, SplitDirection};
 use crate::model::{
     acknowledge_done_status, condense_agent_title, decay_stale_busy, direction_axis,
     infer_agent_status, insert_pane_in_layout, is_coding_agent_command, merge_agent_status,
-    next_pane_in_layout, resize_layout, touch_agent_status, unix_time, AgentStatus, ClipboardItem,
-    DaemonInfo, EventRecord, ListeningPort, Notification, Pane, PaneStatus, PaneTab, Session,
-    SurfaceKind,
+    next_pane_in_layout, resize_layout, title_from_status_message, touch_agent_status, unix_time,
+    AgentStatus, ClipboardItem, DaemonInfo, EventRecord, ListeningPort, Notification, Pane,
+    PaneStatus, PaneTab, Session, SurfaceKind,
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
@@ -171,6 +171,7 @@ pub fn serve_foreground(session: &str) -> Result<()> {
         );
     }
     let server = Arc::new(Server::load(session)?);
+    server.reap_orphan_panes()?;
     server.restore_saved_panes()?;
     server.ensure_initial_pane()?;
     server.save()?;
@@ -1100,8 +1101,9 @@ impl Server {
                 color,
                 clear,
                 message,
+                title,
             } => {
-                let note = self.notify(pane, workspace, status, color, clear, message)?;
+                let note = self.notify(pane, workspace, status, color, clear, message, title)?;
                 Ok(Response::ok(note))
             }
             Request::Notifications { limit } => {
@@ -1129,8 +1131,9 @@ impl Server {
                 scrollback,
                 limit_bytes,
                 ansi,
+                history_lines,
             } => {
-                let data = self.read_screen(pane, scrollback, limit_bytes, ansi)?;
+                let data = self.read_screen(pane, scrollback, limit_bytes, ansi, history_lines)?;
                 Ok(Response::ok(data))
             }
             Request::Search { pane, query } => {
@@ -1211,6 +1214,43 @@ impl Server {
             .is_empty();
         if needs_pane {
             self.new_pane(SplitDirection::Right, default_shell(), None, None, None)?;
+        }
+        Ok(())
+    }
+
+    /// Drop saved panes that no workspace tab references. They can appear
+    /// when a save races a tab close, and once loaded they are pure zombies:
+    /// nothing on screen can ever show them, but the status bar counts them
+    /// ("panes:8" with four visible) and their stale agent statuses pollute
+    /// the busy/done/error tallies.
+    fn reap_orphan_panes(self: &Arc<Self>) -> Result<()> {
+        let removed = {
+            let mut session = self.session.lock_or_recover();
+            let referenced: std::collections::HashSet<String> = session
+                .workspaces
+                .iter()
+                .flat_map(|w| w.all_pane_ids().into_iter().map(|p| p.to_string()))
+                .collect();
+            let orphans: Vec<String> = session
+                .panes
+                .keys()
+                .filter(|id| !referenced.contains(*id))
+                .cloned()
+                .collect();
+            for id in &orphans {
+                session.panes.remove(id);
+            }
+            orphans
+        };
+        if !removed.is_empty() {
+            self.log(&format!(
+                "reaped {} orphan pane(s) not referenced by any tab: {}",
+                removed.len(),
+                removed.join(", ")
+            ))
+            .ok();
+            // save() touches the generation, so attached UIs repaint.
+            self.save()?;
         }
         Ok(())
     }
@@ -2387,11 +2427,14 @@ impl Server {
             ws.add_tab(title)
         };
         // Optional first pane in the new tab.
+        // No explicit pane title: let it auto-title from its process, like any
+        // other pane. Passing the tab's title froze a copy of the default
+        // ("tab") on the pane forever, even after the tab auto-renamed.
         let pane = if let Some(command) = command.filter(|c| !c.trim().is_empty()) {
             Some(self.new_pane(
                 SplitDirection::Right,
                 command,
-                Some(tab.title.clone()),
+                None,
                 Some(workspace_id.clone()),
                 None,
             )?)
@@ -2400,7 +2443,7 @@ impl Server {
             Some(self.new_pane(
                 SplitDirection::Right,
                 String::new(),
-                Some(tab.title.clone()),
+                None,
                 Some(workspace_id.clone()),
                 None,
             )?)
@@ -2667,6 +2710,8 @@ impl Server {
         Ok(vec![self.resolve_pane(pane)?])
     }
 
+    // Mirrors the Notify request fields; grouping would obscure the 1:1 map.
+    #[allow(clippy::too_many_arguments)]
     fn notify(
         &self,
         pane: Option<String>,
@@ -2675,6 +2720,7 @@ impl Server {
         color: Option<String>,
         clear: bool,
         mut message: String,
+        title: Option<String>,
     ) -> Result<Notification> {
         // Bound the stored message like events are (see push_event); the raw
         // request body can be up to the 16 MB request cap otherwise.
@@ -2685,6 +2731,25 @@ impl Server {
             pane
         } else {
             Some(self.resolve_pane(pane.clone())?)
+        };
+        // Agent-agnostic free title path (any coding agent, not just Grok):
+        //   1. explicit `title` from hooks (UserPromptSubmit prompt condensed)
+        //   2. a meaningful busy message (`set-status busy --message "fix auth"`)
+        // OSC titles are handled on the PTY reader path; LLM is last-resort.
+        let auto_title = if self.agent_titles.enabled && !clear {
+            title.as_deref().and_then(condense_agent_title).or_else(|| {
+                let busy = status
+                    .as_deref()
+                    .map(|s| matches!(parse_agent_status(s), AgentStatus::Busy))
+                    .unwrap_or(false);
+                if busy {
+                    title_from_status_message(&message)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
         };
         let note = Notification {
             time: unix_time(),
@@ -2786,8 +2851,17 @@ impl Server {
                         color.clone().or_else(|| Some("blue".to_string()));
                     runtime.pane.notification_message = Some(message.clone());
                 }
+                if let Some(title) = auto_title.as_ref() {
+                    // Same bookkeeping as OSC titles: skip the LLM fallback and
+                    // remember what we already put on the tab.
+                    runtime.llm_title_state = LlmTitleState::Done;
+                    runtime.auto_title = Some(title.clone());
+                }
                 runtime.pane.updated_at = unix_time();
             }
+        }
+        if let (Some(pane_id), Some(title)) = (target_pane.as_deref(), auto_title.as_deref()) {
+            self.apply_auto_tab_title(pane_id, title);
         }
         self.save()?;
         Ok(note)
@@ -2988,6 +3062,7 @@ impl Server {
         include_scrollback: bool,
         limit_bytes: Option<usize>,
         ansi: bool,
+        history_lines: usize,
     ) -> Result<serde_json::Value> {
         let pane_id = self.resolve_pane(pane)?;
         let runtime_key = self
@@ -2995,33 +3070,44 @@ impl Server {
             .unwrap_or_else(|_| pane_id.clone());
         let limit = scrollback_limit(limit_bytes);
         let output = {
-            let panes = self.panes.lock_or_recover();
-            panes
-                .get(&runtime_key)
-                .or_else(|| panes.get(&pane_id))
-                .map(|runtime| {
-                    let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
-                    let screen_text = if ansi {
-                        screen_contents_ansi(runtime.parser.screen())
-                    } else {
-                        runtime.parser.screen().contents()
-                    };
-                    let mut value = serde_json::json!({
-                        "pane": pane_id,
-                        "screen": screen_text,
-                        "rows": runtime.size.rows,
-                        "cols": runtime.size.cols,
-                        "cursor_row": cursor_row,
-                        "cursor_col": cursor_col,
-                    });
-                    if include_scrollback {
-                        // joined_output() concatenates the whole ring (~16KB); only
-                        // pay for it when the caller actually wants scrollback.
-                        let raw = runtime.joined_output();
-                        value["scrollback"] = serde_json::json!(trim_output(raw, limit));
-                    }
-                    value
-                })
+            let mut panes = self.panes.lock_or_recover();
+            let key = if panes.contains_key(&runtime_key) {
+                Some(runtime_key.clone())
+            } else if panes.contains_key(&pane_id) {
+                Some(pane_id.clone())
+            } else {
+                None
+            };
+            key.and_then(|k| panes.get_mut(&k)).map(|runtime| {
+                let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
+                let screen_text = if ansi {
+                    screen_contents_ansi(runtime.parser.screen())
+                } else {
+                    runtime.parser.screen().contents()
+                };
+                let mut value = serde_json::json!({
+                    "pane": pane_id,
+                    "screen": screen_text,
+                    "rows": runtime.size.rows,
+                    "cols": runtime.size.cols,
+                    "cursor_row": cursor_row,
+                    "cursor_col": cursor_col,
+                });
+                if include_scrollback {
+                    // joined_output() concatenates the whole ring (~16KB); only
+                    // pay for it when the caller actually wants scrollback.
+                    let raw = runtime.joined_output();
+                    value["scrollback"] = serde_json::json!(trim_output(raw, limit));
+                }
+                if history_lines > 0 {
+                    value["history"] = serde_json::json!(parser_history_rows(
+                        &mut runtime.parser,
+                        history_lines,
+                        ansi
+                    ));
+                }
+                value
+            })
         };
         if let Some(output) = output {
             return Ok(output);
@@ -5166,6 +5252,46 @@ pub(crate) fn row_contents_ansi(screen: &vt100::Screen, row: u16) -> String {
     out
 }
 
+/// The pane's true history: the live parser's scrollback rows, oldest first.
+///
+/// Loss-free where raw-ring replay is not — diff-drawing TUIs skip cells that
+/// have not changed, so a replay elsewhere reconstructs fragments, but this
+/// grid has been fed every byte since the pane started. Walks scrollback
+/// offsets (each puts one older row at visible row 0) and restores the view.
+fn parser_history_rows(parser: &mut vt100::Parser, lines: usize, ansi: bool) -> Vec<String> {
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let available = parser.screen().scrollback().min(lines);
+    let mut rows = Vec::with_capacity(available);
+    for offset in (1..=available).rev() {
+        parser.screen_mut().set_scrollback(offset);
+        let row = if ansi {
+            row_contents_ansi(parser.screen(), 0)
+        } else {
+            let screen = parser.screen();
+            let (_, cols) = screen.size();
+            let mut plain = String::new();
+            for col in 0..cols {
+                let Some(cell) = screen.cell(0, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    plain.push(' ');
+                } else {
+                    plain.push_str(contents);
+                }
+            }
+            plain
+        };
+        rows.push(row.trim_end().to_string());
+    }
+    parser.screen_mut().set_scrollback(0);
+    rows
+}
+
 /// Serialize a vt100 screen to text with SGR colour codes, one line per row.
 /// Only SGR is emitted — no cursor movement, no OSC — so a client needs
 /// nothing beyond a small colour-code parser.
@@ -5189,6 +5315,40 @@ fn scrollback_limit(limit_bytes: Option<usize>) -> usize {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn parser_history_rows_returns_complete_lines() {
+        let mut parser = vt100::Parser::new(4, 30, 100);
+        for i in 1..=20 {
+            parser.process(format!("full-line-{i}\r\n").as_bytes());
+        }
+        let history = parser_history_rows(&mut parser, 50, false);
+        assert!(history.iter().any(|r| r == "full-line-1"), "{history:?}");
+        // Complete rows — never a suffix fragment.
+        assert!(history
+            .iter()
+            .all(|r| r.is_empty() || r.starts_with("full-line-")));
+        // The view offset is restored so live reads are unaffected.
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn parser_history_rows_caps_and_orders() {
+        let mut parser = vt100::Parser::new(4, 30, 100);
+        for i in 1..=60 {
+            parser.process(format!("l{i}\r\n").as_bytes());
+        }
+        let history = parser_history_rows(&mut parser, 10, false);
+        assert_eq!(history.len(), 10);
+        // Newest window of history, oldest first within it.
+        let nums: Vec<i32> = history
+            .iter()
+            .map(|r| r.trim_start_matches('l').parse().unwrap())
+            .collect();
+        let mut sorted = nums.clone();
+        sorted.sort_unstable();
+        assert_eq!(nums, sorted);
+    }
 
     #[test]
     fn screen_contents_ansi_preserves_colors_and_resets_per_row() {
@@ -5334,6 +5494,7 @@ mod tests {
                 None,
                 false,
                 "Claude is waiting for your input".to_string(),
+                None,
             )
             .unwrap();
         {
@@ -5352,6 +5513,7 @@ mod tests {
                 None,
                 false,
                 "Claude needs your permission to use Bash".to_string(),
+                None,
             )
             .unwrap();
         {
@@ -5385,6 +5547,7 @@ mod tests {
                     Some(color.to_string()),
                     false,
                     message.to_string(),
+                    None,
                 )
                 .unwrap();
         };
@@ -5459,6 +5622,59 @@ mod tests {
         assert_eq!(actions[0].title.as_deref(), Some("tests"));
         assert_eq!(actions[0].direction, Some(SplitDirection::Down));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reap_orphan_panes_drops_panes_no_tab_references() {
+        let _guard = TestSession::new("orphans");
+        let session_name = _guard.as_str().to_string();
+        let state_path = paths::state_path(&session_name).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::new(&session_name);
+        session.workspaces[0].cwd = cwd.display().to_string();
+        session.workspaces[0].panes = vec!["pane-1".to_string()];
+        session.workspaces[0].active_pane = Some("pane-1".to_string());
+        session.workspaces[0].layout = Some(crate::model::LayoutNode::Pane {
+            pane: "pane-1".to_string(),
+        });
+        let pane = Pane::new("pane-1".to_string(), String::new(), SplitDirection::Right);
+        session.panes.insert("pane-1".to_string(), pane);
+        // The zombie: saved in the map, referenced by no workspace or tab.
+        let orphan = Pane::new("pane-9".to_string(), String::new(), SplitDirection::Right);
+        session.panes.insert("pane-9".to_string(), orphan);
+        fs::write(&state_path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
+
+        let server = Arc::new(Server::load(&session_name).unwrap());
+        server.reap_orphan_panes().unwrap();
+
+        let loaded = server.session.lock_or_recover();
+        assert!(
+            loaded.panes.contains_key("pane-1"),
+            "referenced pane must stay"
+        );
+        assert!(
+            !loaded.panes.contains_key("pane-9"),
+            "orphan pane must be reaped — it is invisible but pollutes the status counts"
+        );
+    }
+
+    #[test]
+    fn new_tab_pane_does_not_freeze_the_tab_title() {
+        let _guard = TestSession::new("tabtitle");
+        let server = Arc::new(Server::load(_guard.as_str()).unwrap());
+        let data = server.new_tab(None, None, None).unwrap();
+        let pane_id = data
+            .get("pane")
+            .and_then(|p| p.get("id"))
+            .and_then(|v| v.as_str())
+            .expect("new tab should open a pane")
+            .to_string();
+        let session = server.session.lock_or_recover();
+        let title = &session.panes.get(&pane_id).unwrap().title;
+        assert_ne!(
+            title, "tab",
+            "a tab's first pane must auto-title from its process, not freeze the default tab title"
+        );
     }
 
     #[test]

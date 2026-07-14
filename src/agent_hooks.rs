@@ -89,7 +89,7 @@ impl IntegrationKind {
             IntegrationKind::Shell => "shell hooks",
             IntegrationKind::Claude => "claude code",
             IntegrationKind::Codex => "codex",
-            IntegrationKind::Grok => "grok skill",
+            IntegrationKind::Grok => "grok build",
         }
     }
 
@@ -164,6 +164,11 @@ pub fn grok_skill_path(home: &Path) -> PathBuf {
         .join("skills")
         .join("vmux-control")
         .join("SKILL.md")
+}
+
+/// Grok Build loads every `~/.grok/hooks/*.json` at session start.
+pub fn grok_hooks_path(home: &Path) -> PathBuf {
+    home.join(".grok").join("hooks").join("vmux.json")
 }
 
 fn config_home(home: &Path) -> PathBuf {
@@ -360,9 +365,10 @@ fn codex_status(home: &Path) -> IntegrationStatus {
 }
 
 fn grok_status(home: &Path) -> IntegrationStatus {
-    let path = grok_skill_path(home);
+    let path = grok_hooks_path(home);
+    let skill = grok_skill_path(home);
     let grok_dir = home.join(".grok");
-    if !grok_dir.is_dir() && !path.is_file() {
+    if !grok_dir.is_dir() && !path.is_file() && !skill.is_file() {
         return IntegrationStatus {
             kind: IntegrationKind::Grok,
             state: InstallState::NotDetected,
@@ -370,37 +376,51 @@ fn grok_status(home: &Path) -> IntegrationStatus {
             detail: "~/.grok not found (Grok Build not installed yet)".to_string(),
         };
     }
-    if path.is_file() {
-        let content = fs::read_to_string(&path).unwrap_or_default();
-        if content.contains("lmux ") && !content.contains("vmux ") {
-            IntegrationStatus {
-                kind: IntegrationKind::Grok,
-                state: InstallState::Missing,
-                path,
-                detail: "stale lmux skill — run: vmux hooks install --agent grok".to_string(),
-            }
-        } else if content.contains("set-status") && content.contains("vmux") {
-            IntegrationStatus {
-                kind: IntegrationKind::Grok,
-                state: InstallState::Installed,
-                path,
-                detail: "vmux-control skill installed".to_string(),
-            }
+    if !path.is_file() {
+        // Skill-only installs (pre-hooks era) are incomplete: without lifecycle
+        // hooks Grok never reports busy/done and never auto-titles tabs.
+        let detail = if skill.is_file() {
+            "skill present but hooks missing — run: vmux hooks install --agent grok".to_string()
         } else {
-            IntegrationStatus {
-                kind: IntegrationKind::Grok,
-                state: InstallState::Missing,
-                path,
-                detail: "skill file incomplete — run: vmux hooks install --agent grok".to_string(),
-            }
-        }
-    } else {
-        IntegrationStatus {
+            "no ~/.grok/hooks/vmux.json — run: vmux hooks install --agent grok".to_string()
+        };
+        return IntegrationStatus {
             kind: IntegrationKind::Grok,
             state: InstallState::Missing,
             path,
-            detail: "vmux-control skill not installed".to_string(),
-        }
+            detail,
+        };
+    }
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let has_marker = content.contains(VMUX_HOOK_MARKER);
+    let has_stop = content.contains("\"Stop\"") && has_marker;
+    let has_prompt = content.contains("\"UserPromptSubmit\"") && has_marker;
+    let (state, detail) = if hooks_look_stale(&content) {
+        (
+            InstallState::Missing,
+            "stale lmux hooks — run: vmux hooks install --agent grok".to_string(),
+        )
+    } else if has_stop && has_prompt {
+        (
+            InstallState::Installed,
+            "UserPromptSubmit→🔄+tab title  Stop→✅  (~/.grok/hooks/vmux.json)".to_string(),
+        )
+    } else if has_marker {
+        (
+            InstallState::Missing,
+            "partial vmux hooks (need UserPromptSubmit + Stop)".to_string(),
+        )
+    } else {
+        (
+            InstallState::Missing,
+            "no vmux hooks in ~/.grok/hooks/vmux.json".to_string(),
+        )
+    };
+    IntegrationStatus {
+        kind: IntegrationKind::Grok,
+        state,
+        path,
+        detail,
     }
 }
 
@@ -745,21 +765,64 @@ fn group_has_vmux_hook(group: &Value) -> bool {
 }
 
 fn install_grok(home: &Path) -> Result<InstallResult> {
-    let path = grok_skill_path(home);
+    // Real lifecycle hooks — Grok Build does not set OSC terminal titles, so
+    // UserPromptSubmit is what drives both the sidebar status and free tab
+    // titles (prompt text condensed by `vmux hooks event`).
+    let path = grok_hooks_path(home);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let content = crate::vmux_control_skill_markdown();
-    let previous = fs::read_to_string(&path).unwrap_or_default();
-    let changed = previous != content;
-    if changed {
-        write_atomic(&path, content)?;
+    let (previous, mut root) = read_json_object_file(&path)?;
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        anyhow::bail!(
+            "{} has a non-object \"hooks\" value; refusing to overwrite without confirmation",
+            path.display()
+        );
     }
+    let hooks_obj = hooks.as_object_mut().unwrap();
+    // Lifecycle → sidebar emoji (+ tab title on UserPromptSubmit):
+    //   UserPromptSubmit / PreToolUse / PostToolUse → 🔄 busy
+    //   Notification / PermissionDenied → 🙋 needs input
+    //   Stop → ✅ done
+    //   StopFailure → ❌ error
+    ensure_event_hook(hooks_obj, "UserPromptSubmit");
+    ensure_event_hook(hooks_obj, "PreToolUse");
+    ensure_event_hook(hooks_obj, "PostToolUse");
+    ensure_event_hook(hooks_obj, "Notification");
+    ensure_event_hook(hooks_obj, "PermissionDenied");
+    ensure_event_hook(hooks_obj, "Stop");
+    ensure_event_hook(hooks_obj, "StopFailure");
+
+    let next = serde_json::to_string_pretty(&root)?;
+    let next = format!("{next}\n");
+    let mut changed = previous.trim() != next.trim();
+    if changed {
+        backup_file_bytes(&path, &previous)?;
+        write_atomic(&path, &next)?;
+    }
+
+    // Keep the control skill too — agents still use it for pane/send/browser.
+    let skill_path = grok_skill_path(home);
+    if let Some(parent) = skill_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let skill = crate::vmux_control_skill_markdown();
+    let previous_skill = fs::read_to_string(&skill_path).unwrap_or_default();
+    if previous_skill != skill {
+        write_atomic(&skill_path, skill)?;
+        changed = true;
+    }
+
     Ok(InstallResult {
         kind: IntegrationKind::Grok,
         path,
         changed,
-        detail: "vmux-control skill for Grok Build / agent workflows".to_string(),
+        detail: "UserPromptSubmit→🔄+tab title  Stop→✅  (+ vmux-control skill)".to_string(),
     })
 }
 
@@ -829,9 +892,32 @@ mod tests {
         assert!(codex.contains(VMUX_HOOK_MARKER));
         assert!(codex.contains("\"PermissionRequest\""));
 
+        let grok = fs::read_to_string(grok_hooks_path(&home)).unwrap();
+        assert!(grok.contains(VMUX_HOOK_MARKER));
+        assert!(grok.contains("\"UserPromptSubmit\""));
+        assert!(grok.contains("\"Stop\""));
         let skill = fs::read_to_string(grok_skill_path(&home)).unwrap();
         assert!(skill.contains("set-status"));
 
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn install_grok_writes_hooks_and_skill() {
+        let home = temp_home();
+        fs::create_dir_all(home.join(".grok")).unwrap();
+        let result = install_grok(&home).unwrap();
+        assert!(result.changed);
+        assert_eq!(result.path, grok_hooks_path(&home));
+        assert!(grok_hooks_path(&home).is_file());
+        assert!(grok_skill_path(&home).is_file());
+        let status = grok_status(&home);
+        assert_eq!(status.state, InstallState::Installed);
+        // Skill alone is not enough.
+        fs::remove_file(grok_hooks_path(&home)).unwrap();
+        let status = grok_status(&home);
+        assert_eq!(status.state, InstallState::Missing);
+        assert!(status.detail.contains("hooks missing") || status.detail.contains("hooks"));
         fs::remove_dir_all(home).ok();
     }
 

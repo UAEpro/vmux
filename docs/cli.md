@@ -110,7 +110,7 @@ vmux hooks install                  # all detected agents
 vmux hooks status
 vmux hooks install --agent claude   # ~/.claude/settings.json
 vmux hooks install --agent codex    # ~/.codex/hooks.json
-vmux hooks install --agent grok     # ~/.grok/skills/vmux-control
+vmux hooks install --agent grok     # ~/.grok/hooks/vmux.json (+ skill)
 vmux hooks install --agent shell
 
 eval "$(vmux hooks shell)"
