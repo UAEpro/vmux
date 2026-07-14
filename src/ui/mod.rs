@@ -8523,10 +8523,9 @@ fn command_palette_lines(
     }
     let width = width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut command_index = 0usize;
     let mut last_section: Option<CommandPaletteSection> = None;
 
-    for entry in entries {
+    for (command_index, entry) in entries.iter().enumerate() {
         if last_section != Some(entry.section) {
             if last_section.is_some() {
                 // Breathing room between sections.
@@ -8596,7 +8595,6 @@ fn command_palette_lines(
                 Span::styled(shortcut, Style::default().fg(palette.muted)),
             ]));
         }
-        command_index += 1;
     }
     lines
 }
@@ -10678,10 +10676,17 @@ mod tests {
         let lines = command_palette_lines(&entries, 0, "Ctrl-b", 80, UiTheme::Midnight);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(!texts.is_empty());
-        assert!(texts[0].starts_with("> split-right"));
-        assert!(texts[0].contains("open a pane to the right"));
+        // First line is the section header for the selected entry's group.
+        assert!(texts[0].contains("PANES"));
+        // Selected row uses a block marker and includes name, description, shortcut.
+        let selected = texts
+            .iter()
+            .find(|line| line.contains("split-right"))
+            .expect("selected split-right row");
+        assert!(selected.contains("›"));
+        assert!(selected.contains("open a pane to the right"));
         // The shortcut column shows the configured prefix + suffix key.
-        assert!(texts[0].contains("Ctrl-b %"));
+        assert!(selected.contains("Ctrl-b %"));
         assert!(texts.iter().any(|line| line.contains("new-workspace")));
         assert!(texts.iter().any(|line| line.contains("duplicate-pane")));
         assert!(texts.iter().any(|line| line.contains("restart-pane")));
@@ -10698,8 +10703,9 @@ mod tests {
     #[test]
     fn command_palette_lines_report_no_matches_when_empty() {
         let lines = command_palette_lines(&[], 0, "Ctrl-b", 80, UiTheme::Midnight);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert!(line_text(&lines[0]).contains("(no matches)"));
+        assert!(line_text(&lines[1]).contains("Esc clears"));
     }
 
     #[test]
