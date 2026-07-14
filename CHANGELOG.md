@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.4.1 — 2026-07-14
+
+Bug-fix and polish release. Upgrade with the install one-liner,
+`cargo install vmux-tui`, or wait for the in-app update notice.
+
+### Fixed
+
+- **Fullscreen agents (Codex and similar) can scroll with the mouse wheel.**
+  xterm DECSET 1007 alternate-scroll is tracked and wheel events become
+  cursor keys while the app is on the alternate screen. Mouse tracking still
+  wins when the app requests it; ClearPane keeps negotiated input modes so
+  the child does not need to renegotiate after a clear.
+- **True pane history from the live parser** (ring replay demoted to
+  fallback), and orphan panes are reaped at load instead of freezing tab
+  titles onto panes.
+
+### Added
+
+- **Automatic tab names for every coding agent.** Same free pipeline for
+  Claude, Codex, Grok, Aider, Cursor, and other detected agents:
+  1. OSC terminal title (when the agent sets one)
+  2. `UserPromptSubmit` hook prompt via `vmux hooks event`
+  3. Meaningful `set-status busy --message "…"` text
+  4. Optional LLM screen summary as last resort
+- **Real Grok Build lifecycle hooks** at `~/.grok/hooks/vmux.json` (sidebar
+  status + prompt-based tab titles). The control skill is still installed
+  alongside. Skill-only installs are reported incomplete until hooks are
+  present.
+
+### Changed
+
+- Docs and CLI point Grok install at hooks (not skill-only).
+- Feature worktrees are documented under `.worktrees/` (gitignored).
+
 ## v0.4.0 — 2026-07-14
 
 Feature release, built around the phone (vmux Remote) workflow.
