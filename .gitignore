@@ -11,6 +11,9 @@ Cargo.lock.bak
 *~
 .DS_Store
 
+# Feature worktrees (git worktree add .worktrees/<feature> -b <feature>)
+.worktrees/
+
 # Local agent / tool state (do not commit)
 .claude/
 .codex/
