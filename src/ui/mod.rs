@@ -503,11 +503,72 @@ struct ThemePalette {
     on_cursor: Color,
 }
 
+/// Visual group for the command palette. Order here is display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CommandPaletteSection {
+    Panes,
+    Focus,
+    Tabs,
+    Workspaces,
+    Agent,
+    Panels,
+}
+
+impl CommandPaletteSection {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Panes,
+            Self::Focus,
+            Self::Tabs,
+            Self::Workspaces,
+            Self::Agent,
+            Self::Panels,
+        ]
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Panes => "PANES",
+            Self::Focus => "FOCUS & RESIZE",
+            Self::Tabs => "TABS",
+            Self::Workspaces => "WORKSPACES",
+            Self::Agent => "AGENT STATUS",
+            Self::Panels => "PANELS & UI",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Panes => "⧉",
+            Self::Focus => "⇔",
+            Self::Tabs => "☰",
+            Self::Workspaces => "▣",
+            Self::Agent => "●",
+            Self::Panels => "⚙",
+        }
+    }
+
+    /// Accent color for this section's header and command names.
+    fn color(self, palette: ThemePalette) -> Color {
+        match self {
+            Self::Panes => palette.command,
+            Self::Focus => palette.success,
+            Self::Tabs => palette.active,
+            Self::Workspaces => palette.warning,
+            Self::Agent => palette.hover,
+            Self::Panels => palette.active,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CommandPaletteEntry {
     name: &'static str,
     description: &'static str,
     action: CommandPaletteAction,
+    section: CommandPaletteSection,
+    /// Optional leading glyph shown next to the command name.
+    icon: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4122,13 +4183,57 @@ fn draw_commands(
     let palette = theme.palette();
     let inner_width = area.width.saturating_sub(2);
     let entries = filter_command_entries(filter);
+    let match_count = entries.len();
+    let total_count = command_palette_entries().len();
+
     let mut lines = Vec::new();
-    // Search box showing what has been typed so far.
+
+    // Title strip: counts + filter hint.
+    let count_label = if filter.is_empty() {
+        format!("{total_count} commands")
+    } else {
+        format!("{match_count} of {total_count}")
+    };
     lines.push(Line::from(vec![
-        Span::styled("› ", Style::default().fg(palette.active)),
-        Span::styled(filter.to_string(), Style::default().fg(palette.text)),
-        Span::styled("▏", Style::default().fg(palette.muted)),
+        Span::styled(
+            " ⌘  Command palette ",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("· {count_label}"),
+            Style::default().fg(palette.muted),
+        ),
     ]));
+
+    // Search field with filled background so it reads as an input box.
+    let placeholder = if filter.is_empty() {
+        "type to filter…".to_string()
+    } else {
+        filter.to_string()
+    };
+    let search_fg = if filter.is_empty() {
+        palette.muted
+    } else {
+        palette.text
+    };
+    let search_pad = (inner_width as usize)
+        .saturating_sub(4)
+        .saturating_sub(UnicodeWidthStr::width(placeholder.as_str()))
+        .saturating_sub(1);
+    lines.push(Line::from(vec![
+        Span::styled(
+            " 🔍 ",
+            Style::default().fg(palette.active).bg(palette.surface_alt),
+        ),
+        Span::styled(
+            format!("{placeholder}▏{}", " ".repeat(search_pad)),
+            Style::default().fg(search_fg).bg(palette.surface_alt),
+        ),
+    ]));
+    lines.push(Line::from(Span::raw("")));
+
     lines.extend(command_palette_lines(
         &entries,
         selected,
@@ -4136,6 +4241,40 @@ fn draw_commands(
         inner_width,
         theme,
     ));
+
+    // Footer with key hints.
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " ↑↓",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" move  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(palette.success)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" run  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            format!("{prefix_label} <key>"),
+            Style::default()
+                .fg(palette.command)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" shortcut", Style::default().fg(palette.muted)),
+    ]));
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel_block(" commands ", palette))
@@ -8085,8 +8224,237 @@ fn command_filter_score(query: &str, entry: &CommandPaletteEntry) -> Option<i32>
     best
 }
 
-/// Palette entries matching `filter`, ranked best-first. Ties (including the
-/// empty-filter case, where every entry scores equally) keep declaration order.
+fn command_palette_entries() -> Vec<CommandPaletteEntry> {
+    use CommandPaletteSection::*;
+    vec![
+        // ── Panes ──────────────────────────────────────────────
+        CommandPaletteEntry {
+            name: "split-right",
+            description: "open a pane to the right",
+            action: CommandPaletteAction::SplitRight,
+            section: Panes,
+            icon: "▸",
+        },
+        CommandPaletteEntry {
+            name: "split-down",
+            description: "open a pane below",
+            action: CommandPaletteAction::SplitDown,
+            section: Panes,
+            icon: "▾",
+        },
+        CommandPaletteEntry {
+            name: "kill-pane",
+            description: "kill the active pane",
+            action: CommandPaletteAction::KillPane,
+            section: Panes,
+            icon: "✕",
+        },
+        CommandPaletteEntry {
+            name: "duplicate-pane",
+            description: "duplicate active pane to the right",
+            action: CommandPaletteAction::DuplicatePane,
+            section: Panes,
+            icon: "⧉",
+        },
+        CommandPaletteEntry {
+            name: "restart-pane",
+            description: "restart the active pane",
+            action: CommandPaletteAction::RestartPane,
+            section: Panes,
+            icon: "↻",
+        },
+        CommandPaletteEntry {
+            name: "clear-pane",
+            description: "clear active pane capture",
+            action: CommandPaletteAction::ClearPane,
+            section: Panes,
+            icon: "⌫",
+        },
+        CommandPaletteEntry {
+            name: "copy-pane",
+            description: "copy active pane screen",
+            action: CommandPaletteAction::CopyPane,
+            section: Panes,
+            icon: "⎘",
+        },
+        CommandPaletteEntry {
+            name: "paste",
+            description: "paste clipboard into active pane",
+            action: CommandPaletteAction::PastePane,
+            section: Panes,
+            icon: "📋",
+        },
+        CommandPaletteEntry {
+            name: "zoom-pane",
+            description: "toggle active pane zoom",
+            action: CommandPaletteAction::ToggleZoom,
+            section: Panes,
+            icon: "⛶",
+        },
+        // ── Focus & resize ─────────────────────────────────────
+        CommandPaletteEntry {
+            name: "focus-left",
+            description: "focus pane left",
+            action: CommandPaletteAction::FocusLeft,
+            section: Focus,
+            icon: "←",
+        },
+        CommandPaletteEntry {
+            name: "focus-right",
+            description: "focus pane right",
+            action: CommandPaletteAction::FocusRight,
+            section: Focus,
+            icon: "→",
+        },
+        CommandPaletteEntry {
+            name: "focus-up",
+            description: "focus pane above",
+            action: CommandPaletteAction::FocusUp,
+            section: Focus,
+            icon: "↑",
+        },
+        CommandPaletteEntry {
+            name: "focus-down",
+            description: "focus pane below",
+            action: CommandPaletteAction::FocusDown,
+            section: Focus,
+            icon: "↓",
+        },
+        CommandPaletteEntry {
+            name: "resize-left",
+            description: "resize split left",
+            action: CommandPaletteAction::ResizeLeft,
+            section: Focus,
+            icon: "⇐",
+        },
+        CommandPaletteEntry {
+            name: "resize-right",
+            description: "resize split right",
+            action: CommandPaletteAction::ResizeRight,
+            section: Focus,
+            icon: "⇒",
+        },
+        CommandPaletteEntry {
+            name: "resize-up",
+            description: "resize split up",
+            action: CommandPaletteAction::ResizeUp,
+            section: Focus,
+            icon: "⇑",
+        },
+        CommandPaletteEntry {
+            name: "resize-down",
+            description: "resize split down",
+            action: CommandPaletteAction::ResizeDown,
+            section: Focus,
+            icon: "⇓",
+        },
+        // ── Tabs ───────────────────────────────────────────────
+        CommandPaletteEntry {
+            name: "new-tab",
+            description: "open a new tab in the active workspace",
+            action: CommandPaletteAction::NewTab,
+            section: Tabs,
+            icon: "+",
+        },
+        CommandPaletteEntry {
+            name: "next-tab",
+            description: "activate next workspace tab",
+            action: CommandPaletteAction::NextTab,
+            section: Tabs,
+            icon: "»",
+        },
+        CommandPaletteEntry {
+            name: "previous-tab",
+            description: "activate previous workspace tab",
+            action: CommandPaletteAction::PreviousTab,
+            section: Tabs,
+            icon: "«",
+        },
+        // ── Workspaces ─────────────────────────────────────────
+        CommandPaletteEntry {
+            name: "new-workspace",
+            description: "create a workspace",
+            action: CommandPaletteAction::NewWorkspace,
+            section: Workspaces,
+            icon: "+",
+        },
+        CommandPaletteEntry {
+            name: "close-workspace",
+            description: "close the active workspace",
+            action: CommandPaletteAction::CloseWorkspace,
+            section: Workspaces,
+            icon: "✕",
+        },
+        CommandPaletteEntry {
+            name: "next-workspace",
+            description: "switch to the next workspace",
+            action: CommandPaletteAction::NextWorkspace,
+            section: Workspaces,
+            icon: "»",
+        },
+        CommandPaletteEntry {
+            name: "previous-workspace",
+            description: "switch to the previous workspace",
+            action: CommandPaletteAction::PreviousWorkspace,
+            section: Workspaces,
+            icon: "«",
+        },
+        // ── Agent status ───────────────────────────────────────
+        CommandPaletteEntry {
+            name: "status-busy",
+            description: "mark active agent busy",
+            action: CommandPaletteAction::StatusBusy,
+            section: Agent,
+            icon: "🔄",
+        },
+        CommandPaletteEntry {
+            name: "status-attention",
+            description: "mark active agent needs input",
+            action: CommandPaletteAction::StatusAttention,
+            section: Agent,
+            icon: "🙋",
+        },
+        CommandPaletteEntry {
+            name: "status-done",
+            description: "mark active agent done",
+            action: CommandPaletteAction::StatusDone,
+            section: Agent,
+            icon: "✅",
+        },
+        CommandPaletteEntry {
+            name: "status-idle",
+            description: "mark active agent idle",
+            action: CommandPaletteAction::StatusIdle,
+            section: Agent,
+            icon: "○",
+        },
+        // ── Panels & UI ────────────────────────────────────────
+        CommandPaletteEntry {
+            name: "notifications",
+            description: "open the notification panel",
+            action: CommandPaletteAction::ToggleNotifications,
+            section: Panels,
+            icon: "🔔",
+        },
+        CommandPaletteEntry {
+            name: "actions",
+            description: "open project actions",
+            action: CommandPaletteAction::ToggleActions,
+            section: Panels,
+            icon: "⚡",
+        },
+        CommandPaletteEntry {
+            name: "settings",
+            description: "open UI theme and behavior settings",
+            action: CommandPaletteAction::Settings,
+            section: Panels,
+            icon: "⚙",
+        },
+    ]
+}
+
+/// Palette entries matching `filter`, in display order: section groups first,
+/// then score (when filtering) / declaration order within each section.
 fn filter_command_entries(filter: &str) -> Vec<CommandPaletteEntry> {
     let mut scored: Vec<(i32, usize, CommandPaletteEntry)> = command_palette_entries()
         .into_iter()
@@ -8095,168 +8463,42 @@ fn filter_command_entries(filter: &str) -> Vec<CommandPaletteEntry> {
             command_filter_score(filter, &entry).map(|score| (score, index, entry))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, _, entry)| entry).collect()
+    // Keep section-major order so colorful headers stay stable while filtering.
+    let mut ordered = Vec::with_capacity(scored.len());
+    for section in CommandPaletteSection::all() {
+        let mut group: Vec<(i32, usize, CommandPaletteEntry)> = scored
+            .extract_if(.., |(_, _, entry)| entry.section == *section)
+            .collect();
+        if filter.trim().is_empty() {
+            group.sort_by_key(|(_, index, _)| *index);
+        } else {
+            group.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        }
+        ordered.extend(group.into_iter().map(|(_, _, entry)| entry));
+    }
+    ordered
 }
 
-fn command_palette_entries() -> Vec<CommandPaletteEntry> {
-    vec![
-        CommandPaletteEntry {
-            name: "split-right",
-            description: "open a pane to the right",
-            action: CommandPaletteAction::SplitRight,
-        },
-        CommandPaletteEntry {
-            name: "split-down",
-            description: "open a pane below",
-            action: CommandPaletteAction::SplitDown,
-        },
-        CommandPaletteEntry {
-            name: "new-workspace",
-            description: "create a workspace",
-            action: CommandPaletteAction::NewWorkspace,
-        },
-        CommandPaletteEntry {
-            name: "kill-pane",
-            description: "kill the active pane",
-            action: CommandPaletteAction::KillPane,
-        },
-        CommandPaletteEntry {
-            name: "duplicate-pane",
-            description: "duplicate active pane to the right",
-            action: CommandPaletteAction::DuplicatePane,
-        },
-        CommandPaletteEntry {
-            name: "restart-pane",
-            description: "restart the active pane",
-            action: CommandPaletteAction::RestartPane,
-        },
-        CommandPaletteEntry {
-            name: "clear-pane",
-            description: "clear active pane capture",
-            action: CommandPaletteAction::ClearPane,
-        },
-        CommandPaletteEntry {
-            name: "copy-pane",
-            description: "copy active pane screen",
-            action: CommandPaletteAction::CopyPane,
-        },
-        CommandPaletteEntry {
-            name: "paste",
-            description: "paste clipboard into active pane",
-            action: CommandPaletteAction::PastePane,
-        },
-        CommandPaletteEntry {
-            name: "status-busy",
-            description: "mark active agent busy",
-            action: CommandPaletteAction::StatusBusy,
-        },
-        CommandPaletteEntry {
-            name: "status-attention",
-            description: "mark active agent needs input",
-            action: CommandPaletteAction::StatusAttention,
-        },
-        CommandPaletteEntry {
-            name: "status-done",
-            description: "mark active agent done",
-            action: CommandPaletteAction::StatusDone,
-        },
-        CommandPaletteEntry {
-            name: "status-idle",
-            description: "mark active agent idle",
-            action: CommandPaletteAction::StatusIdle,
-        },
-        CommandPaletteEntry {
-            name: "close-workspace",
-            description: "close the active workspace",
-            action: CommandPaletteAction::CloseWorkspace,
-        },
-        CommandPaletteEntry {
-            name: "next-workspace",
-            description: "switch to the next workspace",
-            action: CommandPaletteAction::NextWorkspace,
-        },
-        CommandPaletteEntry {
-            name: "previous-workspace",
-            description: "switch to the previous workspace",
-            action: CommandPaletteAction::PreviousWorkspace,
-        },
-        CommandPaletteEntry {
-            name: "notifications",
-            description: "open the notification panel",
-            action: CommandPaletteAction::ToggleNotifications,
-        },
-        CommandPaletteEntry {
-            name: "actions",
-            description: "open project actions",
-            action: CommandPaletteAction::ToggleActions,
-        },
-        CommandPaletteEntry {
-            name: "settings",
-            description: "open UI theme and behavior settings",
-            action: CommandPaletteAction::Settings,
-        },
-        CommandPaletteEntry {
-            name: "zoom-pane",
-            description: "toggle active pane zoom",
-            action: CommandPaletteAction::ToggleZoom,
-        },
-        CommandPaletteEntry {
-            name: "next-tab",
-            description: "activate next workspace tab",
-            action: CommandPaletteAction::NextTab,
-        },
-        CommandPaletteEntry {
-            name: "previous-tab",
-            description: "activate previous workspace tab",
-            action: CommandPaletteAction::PreviousTab,
-        },
-        CommandPaletteEntry {
-            name: "new-tab",
-            description: "open a new tab in the active workspace",
-            action: CommandPaletteAction::NewTab,
-        },
-        CommandPaletteEntry {
-            name: "focus-left",
-            description: "focus pane left",
-            action: CommandPaletteAction::FocusLeft,
-        },
-        CommandPaletteEntry {
-            name: "focus-right",
-            description: "focus pane right",
-            action: CommandPaletteAction::FocusRight,
-        },
-        CommandPaletteEntry {
-            name: "focus-up",
-            description: "focus pane above",
-            action: CommandPaletteAction::FocusUp,
-        },
-        CommandPaletteEntry {
-            name: "focus-down",
-            description: "focus pane below",
-            action: CommandPaletteAction::FocusDown,
-        },
-        CommandPaletteEntry {
-            name: "resize-left",
-            description: "resize split left",
-            action: CommandPaletteAction::ResizeLeft,
-        },
-        CommandPaletteEntry {
-            name: "resize-right",
-            description: "resize split right",
-            action: CommandPaletteAction::ResizeRight,
-        },
-        CommandPaletteEntry {
-            name: "resize-up",
-            description: "resize split up",
-            action: CommandPaletteAction::ResizeUp,
-        },
-        CommandPaletteEntry {
-            name: "resize-down",
-            description: "resize split down",
-            action: CommandPaletteAction::ResizeDown,
-        },
-    ]
+fn command_palette_section_header(
+    section: CommandPaletteSection,
+    width: usize,
+    palette: ThemePalette,
+) -> Line<'static> {
+    let accent = section.color(palette);
+    let label = format!(" {} {} ", section.icon(), section.title());
+    let label_w = UnicodeWidthStr::width(label.as_str());
+    let rule = "─".repeat(width.saturating_sub(label_w).saturating_sub(2).max(2));
+    Line::from(vec![
+        Span::styled(" ", Style::default().fg(accent)),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(accent)
+                .bg(palette.surface_alt)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {rule}"), Style::default().fg(accent)),
+    ])
 }
 
 fn command_palette_lines(
@@ -8268,46 +8510,95 @@ fn command_palette_lines(
 ) -> Vec<Line<'static>> {
     let palette = theme.palette();
     if entries.is_empty() {
-        return vec![Line::from(vec![Span::styled(
-            "  (no matches)".to_string(),
-            Style::default().fg(palette.muted),
-        )])];
+        return vec![
+            Line::from(Span::styled(
+                "  (no matches)".to_string(),
+                Style::default().fg(palette.muted),
+            )),
+            Line::from(Span::styled(
+                "  try a shorter filter · Esc clears".to_string(),
+                Style::default().fg(palette.muted),
+            )),
+        ];
     }
     let width = width as usize;
-    entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let active = index == selected;
-            let marker = if active { "> " } else { "  " };
-            let left = format!(
-                "{marker}{:<18} {}",
-                trim_label(entry.name, 18),
-                trim_label(entry.description, 80)
-            );
-            let shortcut = palette_shortcut(entry.action)
-                .map(|key| format!("{prefix_label} {key}"))
-                .unwrap_or_default();
-            // Right-align the shortcut column within the panel width.
-            let used =
-                UnicodeWidthStr::width(left.as_str()) + UnicodeWidthStr::width(shortcut.as_str());
-            let pad = width.saturating_sub(used).max(1);
-            let (text_style, shortcut_style) = if active {
-                let base = selected_row_style(palette);
-                (base, base)
-            } else {
-                (
-                    Style::default().fg(palette.text),
-                    Style::default().fg(palette.muted),
-                )
-            };
-            Line::from(vec![
-                Span::styled(left, text_style),
-                Span::styled(" ".repeat(pad), text_style),
-                Span::styled(shortcut, shortcut_style),
-            ])
-        })
-        .collect()
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut command_index = 0usize;
+    let mut last_section: Option<CommandPaletteSection> = None;
+
+    for entry in entries {
+        if last_section != Some(entry.section) {
+            if last_section.is_some() {
+                // Breathing room between sections.
+                lines.push(Line::from(Span::raw("")));
+            }
+            lines.push(command_palette_section_header(
+                entry.section,
+                width,
+                palette,
+            ));
+            last_section = Some(entry.section);
+        }
+
+        let active = command_index == selected;
+        let section_color = entry.section.color(palette);
+        let shortcut = palette_shortcut(entry.action)
+            .map(|key| format!("{prefix_label} {key}"))
+            .unwrap_or_else(|| "·".to_string());
+
+        let marker = if active { "›" } else { " " };
+        let icon = entry.icon;
+        let name = trim_label(entry.name, 18);
+        // Pad name to a fixed column so descriptions line up.
+        let name_pad = 18usize.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+        let name_col = format!("{name}{}", " ".repeat(name_pad));
+        let desc = trim_label(entry.description, 48);
+
+        // Build left content for width accounting (marker + spaces + icon + name + desc).
+        let left_plain = format!("{marker} {icon} {name_col} {desc}");
+        let used =
+            UnicodeWidthStr::width(left_plain.as_str()) + UnicodeWidthStr::width(shortcut.as_str());
+        let pad = width.saturating_sub(used).max(1);
+
+        if active {
+            let base = selected_row_style(palette);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("▌{marker} {icon} "),
+                    Style::default()
+                        .fg(section_color)
+                        .bg(palette.hover)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(name_col.clone(), base.add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {desc}"), base),
+                Span::styled(" ".repeat(pad), base),
+                Span::styled(
+                    shortcut,
+                    Style::default()
+                        .fg(palette.on_bright)
+                        .bg(palette.hover)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {marker} "), Style::default().fg(palette.muted)),
+                Span::styled(format!("{icon} "), Style::default().fg(section_color)),
+                Span::styled(
+                    name_col,
+                    Style::default()
+                        .fg(section_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {desc}"), Style::default().fg(palette.text)),
+                Span::styled(" ".repeat(pad), Style::default()),
+                Span::styled(shortcut, Style::default().fg(palette.muted)),
+            ]));
+        }
+        command_index += 1;
+    }
+    lines
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
