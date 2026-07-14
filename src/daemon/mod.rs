@@ -171,6 +171,7 @@ pub fn serve_foreground(session: &str) -> Result<()> {
         );
     }
     let server = Arc::new(Server::load(session)?);
+    server.reap_orphan_panes()?;
     server.restore_saved_panes()?;
     server.ensure_initial_pane()?;
     server.save()?;
@@ -1212,6 +1213,43 @@ impl Server {
             .is_empty();
         if needs_pane {
             self.new_pane(SplitDirection::Right, default_shell(), None, None, None)?;
+        }
+        Ok(())
+    }
+
+    /// Drop saved panes that no workspace tab references. They can appear
+    /// when a save races a tab close, and once loaded they are pure zombies:
+    /// nothing on screen can ever show them, but the status bar counts them
+    /// ("panes:8" with four visible) and their stale agent statuses pollute
+    /// the busy/done/error tallies.
+    fn reap_orphan_panes(self: &Arc<Self>) -> Result<()> {
+        let removed = {
+            let mut session = self.session.lock_or_recover();
+            let referenced: std::collections::HashSet<String> = session
+                .workspaces
+                .iter()
+                .flat_map(|w| w.all_pane_ids().into_iter().map(|p| p.to_string()))
+                .collect();
+            let orphans: Vec<String> = session
+                .panes
+                .keys()
+                .filter(|id| !referenced.contains(*id))
+                .cloned()
+                .collect();
+            for id in &orphans {
+                session.panes.remove(id);
+            }
+            orphans
+        };
+        if !removed.is_empty() {
+            self.log(&format!(
+                "reaped {} orphan pane(s) not referenced by any tab: {}",
+                removed.len(),
+                removed.join(", ")
+            ))
+            .ok();
+            // save() touches the generation, so attached UIs repaint.
+            self.save()?;
         }
         Ok(())
     }
@@ -2388,11 +2426,14 @@ impl Server {
             ws.add_tab(title)
         };
         // Optional first pane in the new tab.
+        // No explicit pane title: let it auto-title from its process, like any
+        // other pane. Passing the tab's title froze a copy of the default
+        // ("tab") on the pane forever, even after the tab auto-renamed.
         let pane = if let Some(command) = command.filter(|c| !c.trim().is_empty()) {
             Some(self.new_pane(
                 SplitDirection::Right,
                 command,
-                Some(tab.title.clone()),
+                None,
                 Some(workspace_id.clone()),
                 None,
             )?)
@@ -2401,7 +2442,7 @@ impl Server {
             Some(self.new_pane(
                 SplitDirection::Right,
                 String::new(),
-                Some(tab.title.clone()),
+                None,
                 Some(workspace_id.clone()),
                 None,
             )?)
@@ -5546,6 +5587,59 @@ mod tests {
         assert_eq!(actions[0].title.as_deref(), Some("tests"));
         assert_eq!(actions[0].direction, Some(SplitDirection::Down));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reap_orphan_panes_drops_panes_no_tab_references() {
+        let _guard = TestSession::new("orphans");
+        let session_name = _guard.as_str().to_string();
+        let state_path = paths::state_path(&session_name).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::new(&session_name);
+        session.workspaces[0].cwd = cwd.display().to_string();
+        session.workspaces[0].panes = vec!["pane-1".to_string()];
+        session.workspaces[0].active_pane = Some("pane-1".to_string());
+        session.workspaces[0].layout = Some(crate::model::LayoutNode::Pane {
+            pane: "pane-1".to_string(),
+        });
+        let pane = Pane::new("pane-1".to_string(), String::new(), SplitDirection::Right);
+        session.panes.insert("pane-1".to_string(), pane);
+        // The zombie: saved in the map, referenced by no workspace or tab.
+        let orphan = Pane::new("pane-9".to_string(), String::new(), SplitDirection::Right);
+        session.panes.insert("pane-9".to_string(), orphan);
+        fs::write(&state_path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
+
+        let server = Arc::new(Server::load(&session_name).unwrap());
+        server.reap_orphan_panes().unwrap();
+
+        let loaded = server.session.lock_or_recover();
+        assert!(
+            loaded.panes.contains_key("pane-1"),
+            "referenced pane must stay"
+        );
+        assert!(
+            !loaded.panes.contains_key("pane-9"),
+            "orphan pane must be reaped — it is invisible but pollutes the status counts"
+        );
+    }
+
+    #[test]
+    fn new_tab_pane_does_not_freeze_the_tab_title() {
+        let _guard = TestSession::new("tabtitle");
+        let server = Arc::new(Server::load(_guard.as_str()).unwrap());
+        let data = server.new_tab(None, None, None).unwrap();
+        let pane_id = data
+            .get("pane")
+            .and_then(|p| p.get("id"))
+            .and_then(|v| v.as_str())
+            .expect("new tab should open a pane")
+            .to_string();
+        let session = server.session.lock_or_recover();
+        let title = &session.panes.get(&pane_id).unwrap().title;
+        assert_ne!(
+            title, "tab",
+            "a tab's first pane must auto-title from its process, not freeze the default tab title"
+        );
     }
 
     #[test]
