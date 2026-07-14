@@ -57,10 +57,10 @@ The daemon writes non-session files into that same state dir (`update-check.json
 
 ## Workflow
 
-**Each new feature gets its own git worktree and branch.** Do not develop on `main` and do not stack unrelated features in one checkout:
+**Each new feature gets its own git worktree and branch.** Do not develop on `main` and do not stack unrelated features in one checkout. Worktrees live under `.worktrees/` inside the repo (gitignored) so they don't clutter `~/code`:
 
 ```sh
-git worktree add ../lmux-<feature> -b <feature>
+git worktree add .worktrees/<feature> -b <feature>
 ```
 
 Work in that worktree, and pair it with a matching scratch daemon session (`cargo run -- --session <feature> attach`) so two in-flight features never share a daemon.
@@ -70,3 +70,4 @@ Work in that worktree, and pair it with a matching scratch daemon session (`carg
 - **Tests live inline** in `#[cfg(test)] mod tests` at the bottom of each source file. There is no `tests/` directory. Daemon tests touch real XDG paths, so they build a unique session name and clean up their own state/lock files at the end — follow that pattern or tests will collide.
 - **Config keys have four places to stay in sync**: the struct in `config.rs`, `set_value`, the `supported_*`/`*_choices` lists that feed the UI pickers and shell completion, and `docs/config.md`.
 - The protocol is spoken by shipped binaries and the phone relay, so treat `protocol.rs` as a versioned surface: new fields get `#[serde(default)]`, and existing responses keep their legacy shape.
+- **Touching `src/relay/` or `protocol.rs`? Run the phone app's contract suite too**: `cd ~/code/vmux-remote && npm run test:e2e`. It spawns a fresh daemon + relay from `target/debug/vmux` and drives everything the vmux Remote app depends on (pairing, tabs, screen streaming with `ansi: true` colour rows, send-key spellings, focus across tabs, attention promotion, reconnect). `cargo test` alone does not cover this wire contract — a green build here can still be a broken phone.
