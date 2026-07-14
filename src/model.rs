@@ -986,6 +986,11 @@ pub struct Pane {
     pub mouse_protocol_mode: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mouse_protocol_encoding: String,
+    /// The child enabled xterm alternate-scroll mode (DECSET 1007) while its
+    /// alternate screen is active. Terminals translate wheel events into
+    /// cursor-up/down input in this mode instead of scrolling host history.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alternate_scroll_mode: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_row: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1047,6 +1052,7 @@ impl Pane {
             output_formatted: String::new(),
             mouse_protocol_mode: String::new(),
             mouse_protocol_encoding: String::new(),
+            alternate_scroll_mode: false,
             cursor_row: None,
             cursor_col: None,
             screen_rows: None,
@@ -1057,6 +1063,10 @@ impl Pane {
             scrollback_lines: None,
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Cols/rows a remote viewer asked a pane to fit (`Pane::view_size`).

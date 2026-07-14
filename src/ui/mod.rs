@@ -3616,12 +3616,11 @@ impl Ui {
         if !point_in_rect(content, column, row) {
             return Ok(false);
         }
-        if pane.mouse_protocol_mode.is_empty() {
-            return Ok(false);
-        }
         let x = column.saturating_sub(content.x).saturating_add(1);
         let y = row.saturating_sub(content.y).saturating_add(1);
-        let data = sgr_mouse_sequence(button, x, y, pressed);
+        let Some(data) = pane_mouse_input(pane, button, x, y, pressed) else {
+            return Ok(false);
+        };
         self.rpc(&Request::Input {
             pane: Some(pane_id),
             data,
@@ -7613,6 +7612,26 @@ fn sgr_mouse_sequence(button: MouseButtonCode, x: u16, y: u16, pressed: bool) ->
     format!("\x1b[<{code};{x};{y}{suffix}")
 }
 
+fn pane_mouse_input(
+    pane: &crate::model::Pane,
+    button: MouseButtonCode,
+    x: u16,
+    y: u16,
+    pressed: bool,
+) -> Option<String> {
+    if !pane.mouse_protocol_mode.is_empty() {
+        return Some(sgr_mouse_sequence(button, x, y, pressed));
+    }
+    if pane.alternate_scroll_mode {
+        return match button {
+            MouseButtonCode::WheelUp => Some("\x1b[A".to_string()),
+            MouseButtonCode::WheelDown => Some("\x1b[B".to_string()),
+            MouseButtonCode::Left | MouseButtonCode::LeftDrag => None,
+        };
+    }
+    None
+}
+
 fn split_axis_at(
     node: Option<&LayoutNode>,
     area: Rect,
@@ -9502,6 +9521,36 @@ mod tests {
         assert_eq!(
             sgr_mouse_sequence(MouseButtonCode::WheelDown, 1, 1, true),
             "\x1b[<65;1;1M"
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_translates_only_wheel_events_to_cursor_keys() {
+        let mut pane = crate::model::Pane::new(
+            "pane-1".to_string(),
+            "codex".to_string(),
+            SplitDirection::Right,
+        );
+        pane.alternate_scroll_mode = true;
+
+        assert_eq!(
+            pane_mouse_input(&pane, MouseButtonCode::WheelUp, 4, 2, true).as_deref(),
+            Some("\x1b[A")
+        );
+        assert_eq!(
+            pane_mouse_input(&pane, MouseButtonCode::WheelDown, 4, 2, true).as_deref(),
+            Some("\x1b[B")
+        );
+        assert_eq!(
+            pane_mouse_input(&pane, MouseButtonCode::Left, 4, 2, true),
+            None
+        );
+
+        // Explicit app mouse tracking takes precedence over alternate-scroll.
+        pane.mouse_protocol_mode = "press-release".to_string();
+        assert_eq!(
+            pane_mouse_input(&pane, MouseButtonCode::WheelUp, 4, 2, true).as_deref(),
+            Some("\x1b[<64;4;2M")
         );
     }
 
