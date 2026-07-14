@@ -1129,8 +1129,9 @@ impl Server {
                 scrollback,
                 limit_bytes,
                 ansi,
+                history_lines,
             } => {
-                let data = self.read_screen(pane, scrollback, limit_bytes, ansi)?;
+                let data = self.read_screen(pane, scrollback, limit_bytes, ansi, history_lines)?;
                 Ok(Response::ok(data))
             }
             Request::Search { pane, query } => {
@@ -2988,6 +2989,7 @@ impl Server {
         include_scrollback: bool,
         limit_bytes: Option<usize>,
         ansi: bool,
+        history_lines: usize,
     ) -> Result<serde_json::Value> {
         let pane_id = self.resolve_pane(pane)?;
         let runtime_key = self
@@ -2995,33 +2997,44 @@ impl Server {
             .unwrap_or_else(|_| pane_id.clone());
         let limit = scrollback_limit(limit_bytes);
         let output = {
-            let panes = self.panes.lock_or_recover();
-            panes
-                .get(&runtime_key)
-                .or_else(|| panes.get(&pane_id))
-                .map(|runtime| {
-                    let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
-                    let screen_text = if ansi {
-                        screen_contents_ansi(runtime.parser.screen())
-                    } else {
-                        runtime.parser.screen().contents()
-                    };
-                    let mut value = serde_json::json!({
-                        "pane": pane_id,
-                        "screen": screen_text,
-                        "rows": runtime.size.rows,
-                        "cols": runtime.size.cols,
-                        "cursor_row": cursor_row,
-                        "cursor_col": cursor_col,
-                    });
-                    if include_scrollback {
-                        // joined_output() concatenates the whole ring (~16KB); only
-                        // pay for it when the caller actually wants scrollback.
-                        let raw = runtime.joined_output();
-                        value["scrollback"] = serde_json::json!(trim_output(raw, limit));
-                    }
-                    value
-                })
+            let mut panes = self.panes.lock_or_recover();
+            let key = if panes.contains_key(&runtime_key) {
+                Some(runtime_key.clone())
+            } else if panes.contains_key(&pane_id) {
+                Some(pane_id.clone())
+            } else {
+                None
+            };
+            key.and_then(|k| panes.get_mut(&k)).map(|runtime| {
+                let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
+                let screen_text = if ansi {
+                    screen_contents_ansi(runtime.parser.screen())
+                } else {
+                    runtime.parser.screen().contents()
+                };
+                let mut value = serde_json::json!({
+                    "pane": pane_id,
+                    "screen": screen_text,
+                    "rows": runtime.size.rows,
+                    "cols": runtime.size.cols,
+                    "cursor_row": cursor_row,
+                    "cursor_col": cursor_col,
+                });
+                if include_scrollback {
+                    // joined_output() concatenates the whole ring (~16KB); only
+                    // pay for it when the caller actually wants scrollback.
+                    let raw = runtime.joined_output();
+                    value["scrollback"] = serde_json::json!(trim_output(raw, limit));
+                }
+                if history_lines > 0 {
+                    value["history"] = serde_json::json!(parser_history_rows(
+                        &mut runtime.parser,
+                        history_lines,
+                        ansi
+                    ));
+                }
+                value
+            })
         };
         if let Some(output) = output {
             return Ok(output);
@@ -5166,6 +5179,46 @@ pub(crate) fn row_contents_ansi(screen: &vt100::Screen, row: u16) -> String {
     out
 }
 
+/// The pane's true history: the live parser's scrollback rows, oldest first.
+///
+/// Loss-free where raw-ring replay is not — diff-drawing TUIs skip cells that
+/// have not changed, so a replay elsewhere reconstructs fragments, but this
+/// grid has been fed every byte since the pane started. Walks scrollback
+/// offsets (each puts one older row at visible row 0) and restores the view.
+fn parser_history_rows(parser: &mut vt100::Parser, lines: usize, ansi: bool) -> Vec<String> {
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let available = parser.screen().scrollback().min(lines);
+    let mut rows = Vec::with_capacity(available);
+    for offset in (1..=available).rev() {
+        parser.screen_mut().set_scrollback(offset);
+        let row = if ansi {
+            row_contents_ansi(parser.screen(), 0)
+        } else {
+            let screen = parser.screen();
+            let (_, cols) = screen.size();
+            let mut plain = String::new();
+            for col in 0..cols {
+                let Some(cell) = screen.cell(0, col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    plain.push(' ');
+                } else {
+                    plain.push_str(contents);
+                }
+            }
+            plain
+        };
+        rows.push(row.trim_end().to_string());
+    }
+    parser.screen_mut().set_scrollback(0);
+    rows
+}
+
 /// Serialize a vt100 screen to text with SGR colour codes, one line per row.
 /// Only SGR is emitted — no cursor movement, no OSC — so a client needs
 /// nothing beyond a small colour-code parser.
@@ -5189,6 +5242,40 @@ fn scrollback_limit(limit_bytes: Option<usize>) -> usize {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn parser_history_rows_returns_complete_lines() {
+        let mut parser = vt100::Parser::new(4, 30, 100);
+        for i in 1..=20 {
+            parser.process(format!("full-line-{i}\r\n").as_bytes());
+        }
+        let history = parser_history_rows(&mut parser, 50, false);
+        assert!(history.iter().any(|r| r == "full-line-1"), "{history:?}");
+        // Complete rows — never a suffix fragment.
+        assert!(history
+            .iter()
+            .all(|r| r.is_empty() || r.starts_with("full-line-")));
+        // The view offset is restored so live reads are unaffected.
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn parser_history_rows_caps_and_orders() {
+        let mut parser = vt100::Parser::new(4, 30, 100);
+        for i in 1..=60 {
+            parser.process(format!("l{i}\r\n").as_bytes());
+        }
+        let history = parser_history_rows(&mut parser, 10, false);
+        assert_eq!(history.len(), 10);
+        // Newest window of history, oldest first within it.
+        let nums: Vec<i32> = history
+            .iter()
+            .map(|r| r.trim_start_matches('l').parse().unwrap())
+            .collect();
+        let mut sorted = nums.clone();
+        sorted.sort_unstable();
+        assert_eq!(nums, sorted);
+    }
 
     #[test]
     fn screen_contents_ansi_preserves_colors_and_resets_per_row() {

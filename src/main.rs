@@ -206,6 +206,7 @@ fn main() -> Result<()> {
                     scrollback: !no_scrollback,
                     limit_bytes: non_default_limit(limit_bytes),
                     ansi: false,
+                    history_lines: 0,
                 },
             )?;
             print_response(response)
@@ -1299,6 +1300,7 @@ fn surface_command(session: &str, command: SurfaceCommand) -> Result<()> {
                     scrollback: !no_scrollback,
                     limit_bytes: non_default_limit(limit_bytes),
                     ansi: false,
+                    history_lines: 0,
                 },
             )?;
             print_response(response)
@@ -1622,6 +1624,7 @@ fn agent_command(session: &str, command: AgentCommand) -> Result<()> {
                     scrollback: !no_scrollback,
                     limit_bytes: non_default_limit(limit_bytes),
                     ansi: false,
+                    history_lines: 0,
                 },
             )?;
             print_response(response)
@@ -2098,6 +2101,7 @@ fn run_pane(
             scrollback: true,
             limit_bytes: None,
             ansi: false,
+            history_lines: 0,
         },
     )?;
     if !output_response.ok {
@@ -2480,6 +2484,7 @@ fn smoke(keep: bool) -> Result<()> {
                 scrollback: true,
                 limit_bytes: Some(16_000),
                 ansi: false,
+                history_lines: 0,
             },
         )?;
         let output_contains_smoke = read
@@ -2833,6 +2838,7 @@ fn read_screen_contains(
                 scrollback: true,
                 limit_bytes: Some(16_000),
                 ansi: false,
+                history_lines: 0,
             },
         )?;
         let contains = read

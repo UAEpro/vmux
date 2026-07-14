@@ -307,6 +307,14 @@ pub enum Request {
         /// callers get the plain text they always did.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ansi: bool,
+        /// Also return up to this many lines of true pane history (the live
+        /// parser's scrollback, complete rows) as a `history` array, oldest
+        /// first. 0 (the default) returns none. Unlike the raw `scrollback`
+        /// ring this is loss-free: diff-drawing TUIs skip unchanged cells
+        /// when repainting, so replaying the ring elsewhere reconstructs
+        /// fragments; the live grid never forgot them.
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        history_lines: usize,
     },
     Search {
         pane: Option<String>,
@@ -491,6 +499,10 @@ fn is_false(value: &bool) -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 fn default_true() -> bool {
@@ -969,6 +981,7 @@ mod tests {
             scrollback: true,
             limit_bytes: None,
             ansi: false,
+            history_lines: 0,
         })
         .unwrap();
         assert_eq!(encoded, r#"{"action":"read-screen","pane":"pane-1"}"#);
@@ -981,6 +994,7 @@ mod tests {
             scrollback: false,
             limit_bytes: Some(4096),
             ansi: false,
+            history_lines: 0,
         })
         .unwrap();
         assert_eq!(

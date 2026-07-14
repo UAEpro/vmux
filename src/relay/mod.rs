@@ -1785,6 +1785,7 @@ fn read_surface_screen(
             scrollback: false,
             limit_bytes: Some(256_000),
             ansi,
+            history_lines: 0,
         },
     )?;
     if !resp.ok {
@@ -1866,6 +1867,11 @@ fn replay_scrollback(raw: &str, rows: u16, cols: u16, lines: usize, ansi: bool) 
 }
 
 /// `surface.scrollback` — the pane history above the live screen.
+///
+/// Preferred source is the daemon's live parser (`history_lines`): complete
+/// rows, loss-free. Daemons that predate it return no `history` field, and we
+/// fall back to replaying the raw ring — best-effort, and visibly lossy for
+/// diff-drawing TUIs that skip unchanged cells when they repaint.
 fn surface_scrollback(socket: &Path, surface: &str, lines: usize, ansi: bool) -> Result<Value> {
     let resp = call(
         socket,
@@ -1873,10 +1879,26 @@ fn surface_scrollback(socket: &Path, surface: &str, lines: usize, ansi: bool) ->
             pane: Some(surface.to_string()),
             scrollback: true,
             limit_bytes: Some(512_000),
-            ansi: false,
+            ansi,
+            history_lines: lines,
         },
     )?;
     let data = resp.data.unwrap_or(Value::Null);
+
+    if let Some(history) = data.get("history").and_then(|v| v.as_array()) {
+        let rows: Vec<String> = history
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect();
+        return Ok(json!({
+            "surface_id": surface,
+            "count": rows.len(),
+            "source": "live",
+            "rows": rows,
+        }));
+    }
+
     let raw = data
         .get("scrollback")
         .and_then(|v| v.as_str())
@@ -1887,6 +1909,7 @@ fn surface_scrollback(socket: &Path, surface: &str, lines: usize, ansi: bool) ->
     Ok(json!({
         "surface_id": surface,
         "count": history.len(),
+        "source": "replay",
         "rows": history,
     }))
 }
