@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.4.0 — 2026-07-14
+
+Feature release, built around the phone (vmux Remote) workflow.
+
+### Added
+
+- **Phone-fit pane sizing.** A phone viewing a pane can shrink its PTY to fit
+  the phone screen; the pane returns to its desktop size when the phone stops
+  watching (leased overrides — a phone that loses signal restores within
+  seconds). Off by default: `vmux config set relay.allow_view_resize true`.
+  The desktop UI dims the pane's unused margin with a "sized by phone" note
+  while active. Also exposed as `vmux view-size` for scripts and agents.
+- **Scrollback on the phone.** `surface.scrollback` replays pane history with
+  colour to remote viewers.
+- **Tab and pane management from the phone.** Create/switch/rename/close tabs,
+  rename and restart panes over the relay.
+
+### Changed
+
+- **The sidebar is local-only now.** vmux no longer queries GitHub for PR
+  state — the background `gh pr view` polling silently exhausted the
+  anonymous API quota (breaking `gh auth login` on the host) and, once
+  logged in, the account's 5,000/hour quota. Branch, cwd, ports, and agent
+  status remain; PR state belongs to `gh` and the browser. Old clients and
+  state files still decode.
+
+### Fixed
+
+- Duplicate notifications are deduped.
+- Two agent-hooks tests raced each other under CI's shared XDG environment.
+
 ## v0.3.1 — 2026-07-13
 
 Bug-fix release. Upgrade with the install one-liner, `cargo install vmux-tui`,
