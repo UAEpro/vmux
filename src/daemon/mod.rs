@@ -268,6 +268,11 @@ struct PaneRuntime {
     pending: Vec<u8>,
     // Accumulated decoded text used to detect OSC sequences that straddle reads.
     osc_tail: String,
+    // vt100 does not expose DEC private mode 1007 (alternate scroll), so keep
+    // the one unsupported input mode the attach UI needs in a tiny sidecar
+    // scanner. This lets fullscreen TUIs such as Codex receive wheel-as-arrow
+    // input just as they do in xterm-compatible terminal emulators.
+    terminal_modes: TerminalModeTracker,
     parser: vt100::Parser,
     /// Effective PTY size actually applied to the master and vt100 parser:
     /// `min(layout_size, view_override)` per axis while an override is live,
@@ -303,6 +308,102 @@ struct PaneRuntime {
     // cached, because that walk must not run on every chunk of output.
     agent_inside: bool,
     agent_inside_at: u64,
+}
+
+#[derive(Debug, Default)]
+struct TerminalModeTracker {
+    alternate_scroll: bool,
+    state: TerminalModeScanState,
+    csi: Vec<u8>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TerminalModeScanState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+}
+
+impl TerminalModeTracker {
+    fn process(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.state {
+                TerminalModeScanState::Ground => {
+                    if byte == b'\x1b' {
+                        self.state = TerminalModeScanState::Escape;
+                    }
+                }
+                TerminalModeScanState::Escape => match byte {
+                    b'[' => {
+                        self.csi.clear();
+                        self.state = TerminalModeScanState::Csi;
+                    }
+                    b'\x1b' => {}
+                    _ => self.state = TerminalModeScanState::Ground,
+                },
+                TerminalModeScanState::Csi => {
+                    if (0x40..=0x7e).contains(&byte) {
+                        self.apply_csi(byte);
+                        self.csi.clear();
+                        self.state = TerminalModeScanState::Ground;
+                    } else if byte == b'\x1b' {
+                        self.csi.clear();
+                        self.state = TerminalModeScanState::Escape;
+                    } else if self.csi.len() < 64 {
+                        self.csi.push(byte);
+                    } else {
+                        self.csi.clear();
+                        self.state = TerminalModeScanState::Ground;
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_csi(&mut self, final_byte: u8) {
+        if !matches!(final_byte, b'h' | b'l') || !self.csi.starts_with(b"?") {
+            return;
+        }
+        let has_alternate_scroll = self.csi[1..]
+            .split(|byte| *byte == b';')
+            .any(|param| param == b"1007");
+        if has_alternate_scroll {
+            self.alternate_scroll = final_byte == b'h';
+        }
+    }
+}
+
+fn alternate_scroll_active(
+    status: &PaneStatus,
+    modes: &TerminalModeTracker,
+    screen: &vt100::Screen,
+) -> bool {
+    matches!(status, PaneStatus::Running) && modes.alternate_scroll && screen.alternate_screen()
+}
+
+/// Start with an empty screen/history while retaining the live child's input
+/// contract. Fullscreen TUIs negotiate these modes once at startup and do not
+/// resend them after `ClearPane`, because that RPC is invisible to the child.
+fn cleared_parser_preserving_terminal_modes(
+    parser: &vt100::Parser,
+    rows: u16,
+    cols: u16,
+) -> vt100::Parser {
+    let screen = parser.screen();
+    let alternate_screen = screen.alternate_screen();
+    let hide_cursor = screen.hide_cursor();
+    let input_modes = screen.input_mode_formatted();
+
+    let mut cleared = vt100::Parser::new(rows, cols, 2000);
+    if alternate_screen {
+        cleared.process(b"\x1b[?1049h");
+    }
+    cleared.process(&input_modes);
+    if hide_cursor {
+        cleared.process(b"\x1b[?25l");
+    }
+    cleared
 }
 
 /// How long a pane's "is an agent running in here" answer is trusted before the
@@ -491,6 +592,10 @@ impl Server {
                         // viewer survives a daemon restart. (save() also strips
                         // them — this is the belt to that brace.)
                         pane.view_size = None;
+                        // DECSET 1007 belongs to the old child terminal. A
+                        // restored pane starts a new PTY and must negotiate it
+                        // again before the UI forwards wheel events.
+                        pane.alternate_scroll_mode = false;
                     }
                     session.ensure_workspace();
                     // Workspace → Tab → Pane hierarchy (and collapse legacy
@@ -1660,6 +1765,7 @@ impl Server {
         pane.output.clear();
         pane.scrollback.clear();
         pane.scrollback_formatted.clear();
+        pane.alternate_scroll_mode = false;
         pane.updated_at = unix_time();
 
         let pane_id = pane.id.clone();
@@ -1681,6 +1787,7 @@ impl Server {
                 output_bytes: 0,
                 pending: Vec::new(),
                 osc_tail: String::new(),
+                terminal_modes: TerminalModeTracker::default(),
                 parser: vt100::Parser::new(24, 80, 2000),
                 size: PaneSize { rows: 24, cols: 80 },
                 layout_size: PaneSize { rows: 24, cols: 80 },
@@ -3291,23 +3398,32 @@ impl Server {
         let runtime_key = self
             .active_runtime_key(&pane_id)
             .unwrap_or_else(|_| pane_id.clone());
-        let size = {
+        let runtime_state = {
             let mut panes = self.panes.lock_or_recover();
             if let Some(runtime) = panes.get_mut(&runtime_key) {
                 runtime.output.clear();
                 runtime.output_bytes = 0;
                 runtime.pending.clear();
                 runtime.osc_tail.clear();
-                runtime.parser = vt100::Parser::new(runtime.size.rows, runtime.size.cols, 2000);
+                runtime.parser = cleared_parser_preserving_terminal_modes(
+                    &runtime.parser,
+                    runtime.size.rows,
+                    runtime.size.cols,
+                );
                 runtime.pane.output.clear();
                 runtime.pane.output_formatted.clear();
                 runtime.pane.scrollback.clear();
                 runtime.pane.scrollback_formatted.clear();
+                runtime.pane.alternate_scroll_mode = alternate_scroll_active(
+                    &runtime.pane.status,
+                    &runtime.terminal_modes,
+                    runtime.parser.screen(),
+                );
                 // Force the styled-scrollback cache to rebuild from the fresh
                 // parser on the next snapshot.
                 runtime.scrollback_formatted_cache.clear();
                 runtime.scrollback_formatted_generation = u64::MAX;
-                Some(runtime.size)
+                Some((runtime.size, runtime.pane.alternate_scroll_mode))
             } else {
                 None
             }
@@ -3324,10 +3440,13 @@ impl Server {
         // cleared state into the active tab's captured record.
         pane.scrollback.clear();
         pane.scrollback_formatted.clear();
+        pane.alternate_scroll_mode = runtime_state
+            .map(|(_, alternate_scroll_mode)| alternate_scroll_mode)
+            .unwrap_or(false);
         pane.updated_at = unix_time();
         sync_active_pane_tab(pane);
         let mut pane = pane.clone();
-        if let Some(size) = size {
+        if let Some((size, _)) = runtime_state {
             pane.output = format!("cleared capture at {}x{}", size.rows, size.cols);
         }
         drop(session);
@@ -3418,6 +3537,7 @@ impl Server {
                     return None;
                 }
                 runtime.parser.process(bytes);
+                runtime.terminal_modes.process(bytes);
                 runtime.output_generation = runtime.output_generation.wrapping_add(1);
                 let text = decode_utf8_stream(&mut runtime.pending, bytes);
                 runtime.osc_tail.push_str(&text);
@@ -3459,6 +3579,11 @@ impl Server {
                 runtime.pane.screen_rows = Some(screen_rows);
                 runtime.pane.screen_cols = Some(screen_cols);
                 update_pane_terminal_modes(&mut runtime.pane, runtime.parser.screen());
+                runtime.pane.alternate_scroll_mode = alternate_scroll_active(
+                    &runtime.pane.status,
+                    &runtime.terminal_modes,
+                    runtime.parser.screen(),
+                );
                 // Clone light metadata for session merge (empty heavy strings).
                 // The last snapshot may have cached the heavy screen strings on
                 // runtime.pane; lift them out before cloning so we don't copy
@@ -3505,6 +3630,8 @@ impl Server {
                     pane.screen_rows = light.screen_rows;
                     pane.screen_cols = light.screen_cols;
                     pane.mouse_protocol_mode = light.mouse_protocol_mode.clone();
+                    pane.mouse_protocol_encoding = light.mouse_protocol_encoding.clone();
+                    pane.alternate_scroll_mode = light.alternate_scroll_mode;
                     pane.status = light.status.clone();
                     pane.pid = light.pid;
                     pane.progress = light.progress;
@@ -3726,6 +3853,8 @@ impl Server {
                 runtime.pane.progress = Some(100);
                 runtime.pane.notification_message = None;
                 runtime.pane.notification_color = None;
+                runtime.terminal_modes = TerminalModeTracker::default();
+                runtime.pane.alternate_scroll_mode = false;
                 runtime.pane.updated_at = unix_time();
                 // Materialize final screen/scrollback into the pane record so
                 // save/restart keep history even when no full snapshot runs.
@@ -3836,6 +3965,11 @@ impl Server {
                 .iter_mut()
                 .map(|(runtime_key, runtime)| {
                     let mut pane = runtime.pane.clone();
+                    pane.alternate_scroll_mode = alternate_scroll_active(
+                        &runtime.pane.status,
+                        &runtime.terminal_modes,
+                        runtime.parser.screen(),
+                    );
                     let output = if include_output {
                         let contents = runtime.parser.screen().contents();
                         let formatted = screen_contents_formatted(runtime.parser.screen());
@@ -4173,6 +4307,7 @@ impl Server {
         // attached. Strip them; load() clears any that slip through.
         for pane in snapshot.panes.values_mut() {
             pane.view_size = None;
+            pane.alternate_scroll_mode = false;
         }
         let payload = serde_json::to_vec_pretty(&snapshot)?;
         *counter = counter.wrapping_add(1);
@@ -5317,6 +5452,89 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
+    fn terminal_mode_tracker_handles_split_alternate_scroll_sequences() {
+        let mut modes = TerminalModeTracker::default();
+
+        modes.process(b"plain\x1b[?100");
+        assert!(!modes.alternate_scroll);
+        modes.process(b"7h");
+        assert!(modes.alternate_scroll);
+
+        // DECSET/DECRST may carry more than one private mode parameter.
+        modes.process(b"\x1b[?25;1007l");
+        assert!(!modes.alternate_scroll);
+        modes.process(b"\x1b[?1000;1007h");
+        assert!(modes.alternate_scroll);
+
+        // Similar text and unrelated CSI sequences must not change the mode.
+        modes.process(b"?1007l\x1b[31m\x1b[?1006l");
+        assert!(modes.alternate_scroll);
+    }
+
+    #[test]
+    fn alternate_scroll_is_effective_only_on_the_alternate_screen() {
+        let mut modes = TerminalModeTracker::default();
+        let mut parser = vt100::Parser::new(24, 80, 100);
+
+        modes.process(b"\x1b[?1007h");
+        assert!(!alternate_scroll_active(
+            &PaneStatus::Running,
+            &modes,
+            parser.screen()
+        ));
+
+        parser.process(b"\x1b[?1049h");
+        assert!(alternate_scroll_active(
+            &PaneStatus::Running,
+            &modes,
+            parser.screen()
+        ));
+        // A retained parser may still report the alternate screen after a
+        // forced exit; pane status must prevent snapshots re-enabling input.
+        assert!(!alternate_scroll_active(
+            &PaneStatus::Exited,
+            &modes,
+            parser.screen()
+        ));
+
+        parser.process(b"\x1b[?1049l");
+        assert!(!alternate_scroll_active(
+            &PaneStatus::Running,
+            &modes,
+            parser.screen()
+        ));
+    }
+
+    #[test]
+    fn clearing_parser_preserves_fullscreen_input_modes() {
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        parser.process(b"\x1b[?1049h\x1b[?1h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?25lvisible");
+        let mut modes = TerminalModeTracker::default();
+        modes.process(b"\x1b[?1007h");
+
+        let cleared = cleared_parser_preserving_terminal_modes(&parser, 24, 80);
+        let screen = cleared.screen();
+        assert!(screen.contents().is_empty());
+        assert!(screen.alternate_screen());
+        assert!(screen.application_cursor());
+        assert!(screen.bracketed_paste());
+        assert!(screen.hide_cursor());
+        assert_eq!(
+            screen.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::PressRelease
+        );
+        assert_eq!(
+            screen.mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+        assert!(alternate_scroll_active(
+            &PaneStatus::Running,
+            &modes,
+            screen
+        ));
+    }
+
+    #[test]
     fn parser_history_rows_returns_complete_lines() {
         let mut parser = vt100::Parser::new(4, 30, 100);
         for i in 1..=20 {
@@ -5821,6 +6039,7 @@ mod tests {
                     scrollback_cap: crate::config::default_scrollback_bytes(),
                     pending: Vec::new(),
                     osc_tail: String::new(),
+                    terminal_modes: TerminalModeTracker::default(),
                     parser: vt100::Parser::new(24, 80, 1000),
                     size: PaneSize { cols: 80, rows: 24 },
                     layout_size: PaneSize { cols: 80, rows: 24 },
@@ -6772,6 +6991,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 scrollback_cap: crate::config::default_scrollback_bytes(),
                 pending: Vec::new(),
                 osc_tail: String::new(),
+                terminal_modes: TerminalModeTracker::default(),
                 parser: vt100::Parser::new(24, 80, 1000),
                 size: PaneSize { cols: 80, rows: 24 },
                 layout_size: PaneSize { cols: 80, rows: 24 },
@@ -6862,6 +7082,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                     scrollback_cap: crate::config::default_scrollback_bytes(),
                     pending: Vec::new(),
                     osc_tail: String::new(),
+                    terminal_modes: TerminalModeTracker::default(),
                     parser: vt100::Parser::new(24, 80, 1000),
                     size: PaneSize { cols: 80, rows: 24 },
                     layout_size: PaneSize { cols: 80, rows: 24 },
