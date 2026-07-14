@@ -2070,6 +2070,7 @@ impl Ui {
             color: Some(color.to_string()),
             clear: false,
             message: message.to_string(),
+            title: None,
         })
     }
 

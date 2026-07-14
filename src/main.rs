@@ -523,6 +523,7 @@ fn main() -> Result<()> {
                     color,
                     clear: false,
                     message,
+                    title: None,
                 },
             )?;
             print_response(response)
@@ -545,6 +546,7 @@ fn main() -> Result<()> {
                     color,
                     clear,
                     message,
+                    title: None,
                 },
             )?;
             print_response(response)
@@ -787,6 +789,10 @@ fn hook_event_request(
             })
         })
         .unwrap_or_else(|| default_message.to_string());
+    // Any agent with a UserPromptSubmit-style hook: name the tab from the
+    // raw user prompt (Claude, Codex, Grok, Cursor, custom harnesses, …).
+    // Daemon condenses and respects title_locked; OSC titles still override later.
+    let title = hook_prompt_title(&event, payload.as_ref());
     // Blank `--pane ""` (legacy empty LMUX_PANE_ID) must not become "unknown pane ".
     Ok(protocol::Request::Notify {
         pane: non_empty(pane),
@@ -795,7 +801,42 @@ fn hook_event_request(
         color: non_empty(color).or_else(|| Some(default_color.to_string())),
         clear: false,
         message,
+        title,
     })
+}
+
+/// Extract a tab title from a UserPromptSubmit-style hook payload.
+///
+/// Only fires for the lifecycle events that actually carry the user's prompt —
+/// other events may have a `content`/`text` field that is not a task name.
+fn hook_prompt_title(event: &str, payload: Option<&serde_json::Value>) -> Option<String> {
+    if !is_user_prompt_hook_event(event) {
+        return None;
+    }
+    let value = payload?;
+    let prompt = hook_payload_string(
+        value,
+        &[
+            "prompt",
+            "user_prompt",
+            "userPrompt",
+            "prompt_text",
+            "promptText",
+        ],
+    )?;
+    crate::model::condense_agent_title(&prompt)
+}
+
+fn is_user_prompt_hook_event(event: &str) -> bool {
+    let key: String = event
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        key.as_str(),
+        "userpromptsubmit" | "beforesubmitprompt" | "userpromptexpansion"
+    )
 }
 
 fn hook_payload(payload: &str) -> Option<serde_json::Value> {
@@ -1070,13 +1111,15 @@ vmux shows workspace sidebar markers from pane agent status:
 | done | ✅ | Task finished successfully |
 | error | ❌ | Task failed |
 
-- Mark work with `vmux set-status busy --message "working"` (shows 🔄).
+- Mark work with `vmux set-status busy --message "fixing auth"` (shows 🔄 and may rename the tab).
 - Request input with `vmux set-status attention --message "needs review"` (shows 🙋).
 - Finish with `vmux set-status done --message "complete"` and `vmux set-progress 100` (shows ✅).
 - Fail with `vmux set-status error --message "failed"` (shows ❌).
 - Send notifications with `vmux notify --message "needs input"` (also 🙋).
 - Prefer shell helpers: `eval "$(vmux hooks shell)"` then `vmux_hook_busy`, `vmux_hook_attention`, `vmux_hook_done`.
-- Wire Claude Code / Codex / Grok Stop hooks to `vmux hooks event` with JSON on stdin.
+- Wire agent lifecycle hooks (Claude / Codex / Grok / any harness) to `vmux hooks event` with JSON on stdin.
+- **Auto tab titles (any agent):** terminal OSC title, or UserPromptSubmit prompt via hooks event,
+  or a meaningful `set-status busy --message "…"`. Manual tab rename pins the title.
 - Attach custom pane context with `vmux metadata set task auth-api --pane PANE`.
 - Watch agent activity with `vmux events --limit 50` or `vmux events --follow`.
 
@@ -1644,6 +1687,7 @@ fn agent_command(session: &str, command: AgentCommand) -> Result<()> {
                     color,
                     clear: false,
                     message,
+                    title: None,
                 },
             )?;
             print_response(response)
@@ -2508,6 +2552,7 @@ fn smoke(keep: bool) -> Result<()> {
                 color: Some("blue".to_string()),
                 clear: false,
                 message: "smoke notification".to_string(),
+                title: None,
             },
         )?;
         checks.push(smoke_check("notify", notify.ok));
@@ -2943,6 +2988,7 @@ fn events_follow_contains(session: &str, socket: &std::path::Path, pane_id: &str
             color: Some("blue".to_string()),
             clear: false,
             message: "smoke follow event".to_string(),
+            title: None,
         },
     )?;
     if !response.ok {
@@ -3332,6 +3378,7 @@ mod tests {
                 color,
                 clear,
                 message,
+                title,
             } => {
                 assert_eq!(pane.as_deref(), Some("pane-1"));
                 assert_eq!(workspace, None);
@@ -3339,6 +3386,7 @@ mod tests {
                 assert_eq!(color.as_deref(), Some("blue"));
                 assert!(!clear);
                 assert_eq!(message, "waiting for review");
+                assert_eq!(title, None);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -3363,6 +3411,7 @@ mod tests {
                 status,
                 color,
                 message,
+                title,
                 ..
             } => {
                 assert_eq!(pane, None);
@@ -3370,7 +3419,52 @@ mod tests {
                 assert_eq!(status.as_deref(), Some("done"));
                 assert_eq!(color.as_deref(), Some("green"));
                 assert_eq!(message, "finished tests");
+                assert_eq!(title, None);
             }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_event_request_titles_tab_from_user_prompt() {
+        let request = hook_event_request(
+            Some("pane-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"Fix the parser bug in auth middleware"}"#,
+        )
+        .unwrap();
+        match request {
+            protocol::Request::Notify {
+                status,
+                title,
+                message,
+                ..
+            } => {
+                assert_eq!(status.as_deref(), Some("busy"));
+                assert_eq!(message, "agent working");
+                // "Fix the parser bug in auth middleware" → first two meaningful words.
+                assert_eq!(title.as_deref(), Some("fix parser"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        // Non-prompt events must not steal a random text field as a title.
+        let stop = hook_event_request(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            r#"{"event":"Stop","prompt":"should not become a title"}"#,
+        )
+        .unwrap();
+        match stop {
+            protocol::Request::Notify { title, .. } => assert_eq!(title, None),
             other => panic!("unexpected request: {other:?}"),
         }
     }

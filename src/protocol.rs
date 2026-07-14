@@ -283,6 +283,11 @@ pub enum Request {
         color: Option<String>,
         clear: bool,
         message: String,
+        /// Optional auto tab title for **any** coding agent (condensed user
+        /// prompt from `UserPromptSubmit` hooks, or a short task label). Free
+        /// alternative to OSC terminal titles and the LLM fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     Notifications {
         limit: usize,
@@ -1155,11 +1160,27 @@ mod tests {
             color: Some("yellow".to_string()),
             clear: false,
             message: "agents running".to_string(),
+            title: None,
         })
         .unwrap();
         assert_eq!(
             encoded,
             r#"{"action":"notify","pane":null,"workspace":"ws-2","status":"busy","color":"yellow","clear":false,"message":"agents running"}"#
+        );
+
+        let with_title = serde_json::to_string(&Request::Notify {
+            pane: Some("pane-1".to_string()),
+            workspace: None,
+            status: Some("busy".to_string()),
+            color: Some("yellow".to_string()),
+            clear: false,
+            message: "agent working".to_string(),
+            title: Some("fixing parser".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            with_title,
+            r#"{"action":"notify","pane":"pane-1","status":"busy","color":"yellow","clear":false,"message":"agent working","title":"fixing parser"}"#
         );
     }
 

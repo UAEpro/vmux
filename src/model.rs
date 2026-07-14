@@ -1454,21 +1454,53 @@ const TITLE_NOISE_WORDS: &[&str] = &[
     "amp",
     "assistant",
     "bash",
+    "busy",
     "claude",
     "code",
     "codex",
+    "complete",
+    "completed",
     "copilot",
     "cursor",
     "devin",
+    "done",
+    "error",
+    "failed",
     "gemini",
     "goose",
     "grok",
+    "idle",
     "opencode",
+    "ready",
+    "running",
     "session",
     "sh",
     "shell",
     "terminal",
+    "working",
     "zsh",
+];
+
+/// Lifecycle / set-status boilerplate that must never rename a tab.
+/// Matched case-insensitively against the whole message (after trim).
+const TITLE_STATUS_BOILERPLATE: &[&str] = &[
+    "agent hook completed",
+    "agent hook event",
+    "agent hook failed",
+    "agent needs input",
+    "agent working",
+    "busy",
+    "complete",
+    "completed",
+    "done",
+    "error",
+    "failed",
+    "needs input",
+    "needs review",
+    "running",
+    "waiting for approval",
+    "waiting for input",
+    "working",
 ];
 
 /// Condense a terminal title an agent set (OSC 0/2) into a one-or-two word tab
@@ -1477,6 +1509,10 @@ const TITLE_NOISE_WORDS: &[&str] = &[
 /// Returns `None` for titles that describe the shell rather than a task
 /// (`user@host`, a bare path) or that hold nothing but the agent's own name —
 /// the caller then leaves the tab title alone (or asks an LLM instead).
+///
+/// Used for **every** coding agent: Claude, Codex, Grok, Aider, Cursor, and
+/// anything else that shows up in a pane — the source of the string does not
+/// matter (OSC title, UserPromptSubmit prompt, or a meaningful status message).
 pub fn condense_agent_title(raw: &str) -> Option<String> {
     let cleaned = raw.replace(|c: char| c.is_control(), " ");
     let cleaned = cleaned.trim();
@@ -1525,6 +1561,34 @@ pub fn condense_agent_title(raw: &str) -> Option<String> {
         title = title.chars().take(AUTO_TITLE_MAX_CHARS).collect();
     }
     Some(title)
+}
+
+/// Turn a busy-status message into a tab title when it names real work.
+///
+/// Agent-agnostic: any tool that reports `vmux set-status busy --message "…"`
+/// (or a Notify with status busy) can name its tab. Boilerplate like
+/// `"agent working"` / `"done"` is rejected so hooks do not thrash titles.
+pub fn title_from_status_message(message: &str) -> Option<String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let lower: String = message.chars().map(|c| c.to_ascii_lowercase()).collect();
+    if is_boilerplate_status_message(&lower) {
+        return None;
+    }
+    // Idle / "waiting for your input" notices from Claude-style Notification
+    // hooks are not tasks.
+    if lower.contains("waiting for your input") || lower.contains("waiting for input") {
+        return None;
+    }
+    condense_agent_title(message)
+}
+
+fn is_boilerplate_status_message(lower: &str) -> bool {
+    // Exact match only — "working on the parser" is a real task message and
+    // must not be treated as the bare lifecycle word "working".
+    TITLE_STATUS_BOILERPLATE.contains(&lower)
 }
 
 pub fn direction_axis(direction: SplitDirection) -> SplitAxis {
@@ -2191,7 +2255,31 @@ mod tests {
         // Nothing but the agent's own name, spinner frames, or stopwords.
         assert_eq!(condense_agent_title("claude"), None);
         assert_eq!(condense_agent_title("codex 3/7"), None);
+        assert_eq!(condense_agent_title("grok"), None);
+        assert_eq!(condense_agent_title("working"), None);
         assert_eq!(condense_agent_title("  "), None);
+    }
+
+    #[test]
+    fn title_from_status_message_accepts_real_work_for_any_agent() {
+        // Any agent: set-status busy --message "…"
+        assert_eq!(
+            title_from_status_message("fixing the parser bug").as_deref(),
+            Some("fixing parser")
+        );
+        assert_eq!(
+            title_from_status_message("auth middleware").as_deref(),
+            Some("auth middleware")
+        );
+        // Hook / lifecycle boilerplate never renames tabs.
+        assert_eq!(title_from_status_message("agent working"), None);
+        assert_eq!(title_from_status_message("working"), None);
+        assert_eq!(title_from_status_message("done"), None);
+        assert_eq!(title_from_status_message("agent hook completed"), None);
+        assert_eq!(
+            title_from_status_message("Claude is waiting for your input"),
+            None
+        );
     }
 
     #[test]

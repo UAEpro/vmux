@@ -2175,6 +2175,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                     color: None,
                     clear: false,
                     message,
+                    title: None,
                 },
             )?;
             Ok(json!({}))

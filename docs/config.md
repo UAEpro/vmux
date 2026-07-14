@@ -32,18 +32,29 @@ Relay keys (`relay.enabled`, `relay.bind`, `relay.allow_localhost`,
 
 ## Automatic tab names
 
-A tab holding a coding agent names itself after the work in it — `fixing parser`,
-`auth middleware` — so a row of tabs reads as a list of what is in flight.
+A tab holding **any** coding agent names itself after the work in it —
+`fixing parser`, `auth middleware` — so a row of tabs reads as a list of what
+is in flight. The same pipeline runs for Claude Code, Codex, Grok Build, Aider,
+Cursor, Gemini, and anything else detected as a coding-agent process.
 
-Agents that set a terminal title (Claude Code, Codex) are simply read: vmux takes
-the title, condenses it to one or two words, and keeps it current as the agent
-moves between tasks. Agents that set no title get named by `agent_titles.llm_command`,
-which is shown the pane's screen once the agent has been working for
-`agent_titles.llm_delay_ms` and asked for a label — one short call per pane, and
-only for a pane that is actually on a task. Set `agent_titles.llm_fallback` to
-`false` to keep tab naming entirely free.
+Sources, in order (first usable label wins for that update):
 
-Renaming a tab yourself pins it: vmux will not rename it again.
+1. **Terminal title (OSC 0/2)** — free. Agents that retitle the terminal
+   (Claude Code, Codex, …) are read directly; the title is condensed to one or
+   two words and kept current as the agent moves between tasks.
+2. **Hook prompt** — free. A `UserPromptSubmit` (or compatible) hook that pipes
+   JSON into `vmux hooks event` carries the user prompt; vmux condenses it the
+   same way. Install with `vmux hooks install` (Claude, Codex, Grok, shell).
+3. **Busy status message** — free. Any agent or script can name its tab with
+   `vmux set-status busy --message "fixing auth"` (boilerplate like
+   `"agent working"` is ignored).
+4. **LLM fallback** — one short call via `agent_titles.llm_command` after
+   `agent_titles.llm_delay_ms`, only when the pane is actually on a task and
+   no free source produced a title. Disable with
+   `agent_titles.llm_fallback false`.
+
+Shells never rename tabs (`user@host`, paths). Renaming a tab yourself pins it:
+vmux will not rename it again.
 
     vmux config set agent_titles.enabled false     # off entirely
 

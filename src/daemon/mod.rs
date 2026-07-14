@@ -15,9 +15,9 @@ use crate::cli::{BroadcastScope, SplitDirection};
 use crate::model::{
     acknowledge_done_status, condense_agent_title, decay_stale_busy, direction_axis,
     infer_agent_status, insert_pane_in_layout, is_coding_agent_command, merge_agent_status,
-    next_pane_in_layout, resize_layout, touch_agent_status, unix_time, AgentStatus, ClipboardItem,
-    DaemonInfo, EventRecord, ListeningPort, Notification, Pane, PaneStatus, PaneTab, Session,
-    SurfaceKind,
+    next_pane_in_layout, resize_layout, title_from_status_message, touch_agent_status, unix_time,
+    AgentStatus, ClipboardItem, DaemonInfo, EventRecord, ListeningPort, Notification, Pane,
+    PaneStatus, PaneTab, Session, SurfaceKind,
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
@@ -1101,8 +1101,9 @@ impl Server {
                 color,
                 clear,
                 message,
+                title,
             } => {
-                let note = self.notify(pane, workspace, status, color, clear, message)?;
+                let note = self.notify(pane, workspace, status, color, clear, message, title)?;
                 Ok(Response::ok(note))
             }
             Request::Notifications { limit } => {
@@ -2709,6 +2710,8 @@ impl Server {
         Ok(vec![self.resolve_pane(pane)?])
     }
 
+    // Mirrors the Notify request fields; grouping would obscure the 1:1 map.
+    #[allow(clippy::too_many_arguments)]
     fn notify(
         &self,
         pane: Option<String>,
@@ -2717,6 +2720,7 @@ impl Server {
         color: Option<String>,
         clear: bool,
         mut message: String,
+        title: Option<String>,
     ) -> Result<Notification> {
         // Bound the stored message like events are (see push_event); the raw
         // request body can be up to the 16 MB request cap otherwise.
@@ -2727,6 +2731,25 @@ impl Server {
             pane
         } else {
             Some(self.resolve_pane(pane.clone())?)
+        };
+        // Agent-agnostic free title path (any coding agent, not just Grok):
+        //   1. explicit `title` from hooks (UserPromptSubmit prompt condensed)
+        //   2. a meaningful busy message (`set-status busy --message "fix auth"`)
+        // OSC titles are handled on the PTY reader path; LLM is last-resort.
+        let auto_title = if self.agent_titles.enabled && !clear {
+            title.as_deref().and_then(condense_agent_title).or_else(|| {
+                let busy = status
+                    .as_deref()
+                    .map(|s| matches!(parse_agent_status(s), AgentStatus::Busy))
+                    .unwrap_or(false);
+                if busy {
+                    title_from_status_message(&message)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
         };
         let note = Notification {
             time: unix_time(),
@@ -2828,8 +2851,17 @@ impl Server {
                         color.clone().or_else(|| Some("blue".to_string()));
                     runtime.pane.notification_message = Some(message.clone());
                 }
+                if let Some(title) = auto_title.as_ref() {
+                    // Same bookkeeping as OSC titles: skip the LLM fallback and
+                    // remember what we already put on the tab.
+                    runtime.llm_title_state = LlmTitleState::Done;
+                    runtime.auto_title = Some(title.clone());
+                }
                 runtime.pane.updated_at = unix_time();
             }
+        }
+        if let (Some(pane_id), Some(title)) = (target_pane.as_deref(), auto_title.as_deref()) {
+            self.apply_auto_tab_title(pane_id, title);
         }
         self.save()?;
         Ok(note)
@@ -5462,6 +5494,7 @@ mod tests {
                 None,
                 false,
                 "Claude is waiting for your input".to_string(),
+                None,
             )
             .unwrap();
         {
@@ -5480,6 +5513,7 @@ mod tests {
                 None,
                 false,
                 "Claude needs your permission to use Bash".to_string(),
+                None,
             )
             .unwrap();
         {
@@ -5513,6 +5547,7 @@ mod tests {
                     Some(color.to_string()),
                     false,
                     message.to_string(),
+                    None,
                 )
                 .unwrap();
         };

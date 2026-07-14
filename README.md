@@ -115,8 +115,13 @@ split, and clear.
 ## Agent hooks
 
 `vmux hooks install` writes the integration for whichever agents it finds:
-Claude (`~/.claude/settings.json`), Codex, Grok, and a shell hook. Once
-installed, an agent's state lands in the sidebar without you doing anything.
+Claude (`~/.claude/settings.json`), Codex (`~/.codex/hooks.json`), Grok Build
+(`~/.grok/hooks/vmux.json`), and a shell hook. Once installed, agent state lands
+in the sidebar without you doing anything.
+
+**Automatic tab names** work for every coding agent: OSC terminal titles when
+the agent sets them, hook prompts / `set-status` messages when it does not, and
+an optional LLM label as last resort (see [docs/config.md](docs/config.md)).
 
 Done (✅) is sticky. It stays until you actually look at the pane, so an agent
 finishing while you were in another workspace is still there when you get back.
