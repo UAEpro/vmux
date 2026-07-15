@@ -9,20 +9,24 @@ drive vmux workspaces and panes from your phone.
 iPhone (Cmux Remote)  ── Tailscale ──►  vmux relay :4399  ── Unix socket ──►  vmux daemon
 ```
 
-The relay is opt-in. Starting it does not change how attach, the CLI, or the
-daemon behave, and if you never run it, nothing listens on the network.
+The relay is **on by default**. On `vmux attach`, a managed relay starts if it is
+not already running (bind: Tailscale IP when available, otherwise localhost).
+Turn it off if you do not want anything listening for the phone app.
+
+Starting or stopping the relay does not change how attach, the CLI, or the
+daemon behave beyond that process.
 
 > This is a compatibility layer, not an official Manaflow product. Official cmux
 > Mobile Connect is a different stack and will not work with it. Protocol drift
 > in the App Store app may require relay updates.
 
-## Turning it on
+## Settings
 
 In `vmux attach`, open **⚙ set** and find the **mobile relay** section:
 
 | Setting | Meaning |
 |---------|---------|
-| mobile relay | `on` / `off`. When on, attach auto-starts the relay. |
+| mobile relay | `on` / `off` (default **on**). When on, attach auto-starts the relay. |
 | relay bind | `auto` (Tailscale IP if online, else localhost), `tailscale`, or `local` |
 | relay localhost | Allow device registration from `127.0.0.1`, for dev |
 
@@ -33,13 +37,14 @@ over Tailscale or localhost.
 The same settings from the CLI:
 
 ```sh
-vmux config set relay.enabled true
+vmux config set relay.enabled true       # default
+vmux config set relay.enabled false      # disable auto-start
 vmux config set relay.bind auto          # auto | tailscale | local
 vmux config set relay.allow_localhost false
 ```
 
-With `relay.enabled` set, the next `vmux attach` starts a managed relay process.
-Turning it off stops it.
+With `relay.enabled` set (the default), the next `vmux attach` starts a managed
+relay process. Turning it off stops it.
 
 ## Running it by hand
 

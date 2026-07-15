@@ -39,7 +39,7 @@ pub fn attach(session: &str) -> Result<()> {
     // Load config before entering raw mode / the alternate screen so a config
     // error returns cleanly without leaving the user's shell in a broken state.
     let config = crate::config::load()?;
-    // Opt-in mobile relay: only when Settings → mobile relay is enabled.
+    // Mobile relay: on by default; Settings → mobile relay can turn it off.
     // Failures are non-fatal so attach still works offline / without Tailscale.
     if config.relay.enabled {
         match crate::relay::ensure_from_config(session, &config) {
