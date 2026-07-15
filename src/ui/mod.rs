@@ -8365,6 +8365,7 @@ fn notification_card_lines(
 }
 
 /// Plain-text summary lines for tests (mirrors the card's content, no styles).
+#[cfg(test)]
 fn notification_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> {
     visible_notifications(snapshot)
         .into_iter()
