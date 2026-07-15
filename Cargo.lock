@@ -1368,7 +1368,7 @@ dependencies = [
  "sha2",
  "shell-words",
  "tungstenite",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
  "ureq",
  "vt100",
 ]
