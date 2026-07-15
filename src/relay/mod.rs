@@ -38,6 +38,7 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:4399";
 const DEFAULT_FPS: u32 = 15;
 const DEFAULT_IDLE_FPS: u32 = 5;
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+const DEFAULT_PUSH_GATEWAY: &str = "https://push.vmux.sh";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -72,6 +73,9 @@ pub struct RelayConfig {
     /// Whois/localhost/CGNAT identity still applies after the secret check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_secret: Option<String>,
+    /// Authenticated bridge to Expo/APNs. The relay contacts it only after a
+    /// paired phone opts in and stores a per-device push token and secret.
+    pub push_gateway: String,
     #[serde(default)]
     pub snippets: Vec<Snippet>,
 }
@@ -89,6 +93,7 @@ impl Default for RelayConfig {
             idle_fps: DEFAULT_IDLE_FPS,
             session: "default".to_string(),
             bootstrap_secret: None,
+            push_gateway: DEFAULT_PUSH_GATEWAY.to_string(),
             snippets: Vec::new(),
         }
     }
@@ -158,6 +163,10 @@ struct DeviceRecord {
     apns_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     apns_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_secret: Option<String>,
     created_at: u64,
 }
 
@@ -233,6 +242,8 @@ impl DeviceStore {
                 hostname: hostname.to_string(),
                 apns_token: None,
                 apns_env: None,
+                push_token: None,
+                push_secret: None,
                 created_at: now_secs(),
             },
         );
@@ -271,13 +282,34 @@ impl DeviceStore {
         Self::persist_locked(&self.path, &guard)
     }
 
-    fn list(&self) -> Vec<DeviceRecord> {
+    fn set_push(&self, device_id: &str, token: &str, secret: &str) -> Result<()> {
+        if !is_expo_push_token(token) || !is_hex_secret(secret) {
+            bail!("invalid push credentials");
+        }
+        let mut guard = self.devices.lock_or_recover();
+        let Some(dev) = guard.get_mut(device_id) else {
+            bail!("unknown device");
+        };
+        dev.push_token = Some(token.to_string());
+        dev.push_secret = Some(secret.to_string());
+        Self::persist_locked(&self.path, &guard)
+    }
+
+    fn push_devices(&self) -> Vec<(String, String)> {
         self.devices
-            .lock()
-            .expect("device store lock")
+            .lock_or_recover()
             .values()
-            .cloned()
+            .filter_map(|device| {
+                Some((
+                    device.push_token.as_ref()?.clone(),
+                    device.push_secret.as_ref()?.clone(),
+                ))
+            })
             .collect()
+    }
+
+    fn list(&self) -> Vec<DeviceRecord> {
+        self.devices.lock_or_recover().values().cloned().collect()
     }
 }
 
@@ -363,6 +395,7 @@ pub fn serve(
     eprintln!("  config:  {}", path.display());
     eprintln!("  devices: {}", devices_path()?.display());
     eprintln!("  max conns: {MAX_RELAY_CONNECTIONS}");
+    eprintln!("  push:     {}", config.push_gateway);
     if config.allow_localhost {
         eprintln!("  auth:    localhost registration allowed");
     }
@@ -377,6 +410,8 @@ pub fn serve(
     {
         eprintln!("  auth:    bootstrap secret REQUIRED for all registration");
     }
+
+    spawn_push_event_poller(Arc::clone(&state));
 
     for stream in listener.incoming() {
         if !state.running.load(Ordering::Relaxed) {
@@ -433,10 +468,11 @@ pub fn status(config_path: Option<PathBuf>) -> Result<()> {
     println!("devices:  {}", devices.len());
     for d in &devices {
         println!(
-            "  - {}  login={} host={} created={}",
+            "  - {}  login={} host={} push={} created={}",
             &d.device_id[..d.device_id.len().min(12)],
             d.login_name,
             d.hostname,
+            if d.push_token.is_some() { "on" } else { "off" },
             d.created_at
         );
     }
@@ -452,8 +488,12 @@ pub fn devices_list() -> Result<()> {
     }
     for d in devices {
         println!(
-            "{}\tlogin={}\thost={}\tcreated={}",
-            d.device_id, d.login_name, d.hostname, d.created_at
+            "{}\tlogin={}\thost={}\tpush={}\tcreated={}",
+            d.device_id,
+            d.login_name,
+            d.hostname,
+            if d.push_token.is_some() { "on" } else { "off" },
+            d.created_at
         );
     }
     Ok(())
@@ -768,13 +808,134 @@ fn ureq_get_health(url: &str) -> Result<String> {
     Ok(body.to_string())
 }
 
+// ─── Remote push notifications ─────────────────────────────────────────────
+
+fn spawn_push_event_poller(state: Arc<RelayState>) {
+    let _ = thread::Builder::new()
+        .name("vmux-relay-push".into())
+        .spawn(move || {
+            let mut seen_ids = HashSet::new();
+            let mut initialized = false;
+            while state.running.load(Ordering::Relaxed) {
+                let devices = state.devices.push_devices();
+                if let Ok(response) =
+                    protocol::request(&state.socket, &Request::Events { limit: 100 })
+                {
+                    if let Some(events) = response.data.as_ref().and_then(event_array) {
+                        if !initialized {
+                            seen_ids.extend(events.iter().map(event_id));
+                            initialized = true;
+                        } else {
+                            // The daemon returns newest-first. Walk oldest-first
+                            // so a burst is forwarded in its original order.
+                            for event in events.iter().rev() {
+                                let id = event_id(event);
+                                if !seen_ids.insert(id.clone())
+                                    || devices.is_empty()
+                                    || !is_attention_event(event)
+                                {
+                                    continue;
+                                }
+                                for (push_token, push_secret) in &devices {
+                                    if let Err(error) = send_push_notification(
+                                        &state.config.push_gateway,
+                                        push_token,
+                                        push_secret,
+                                        &id,
+                                        event,
+                                    ) {
+                                        eprintln!("relay push delivery failed: {error}");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Event history is bounded to 100 here. Keeping only the
+                        // current window avoids unbounded memory without making
+                        // an old event look new on the next poll.
+                        if seen_ids.len() > 500 {
+                            seen_ids = events.iter().map(event_id).collect();
+                        }
+                    }
+                }
+                // Keep a low-frequency cursor even without devices. If a phone
+                // opts in and an event happens immediately afterwards, the
+                // first device-enabled poll can then deliver it instead of
+                // mistaking it for historical state.
+                thread::sleep(if devices.is_empty() {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(500)
+                });
+            }
+        });
+}
+
+fn event_array(data: &Value) -> Option<&Vec<Value>> {
+    data.get("events")
+        .and_then(Value::as_array)
+        .or_else(|| data.as_array())
+}
+
+fn event_id(event: &Value) -> String {
+    event
+        .get("id")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .map(|number| number.to_string())
+                .or_else(|| value.as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}:{}",
+                event.get("time").and_then(Value::as_u64).unwrap_or(0),
+                event.get("kind").and_then(Value::as_str).unwrap_or(""),
+                event.get("message").and_then(Value::as_str).unwrap_or("")
+            )
+        })
+}
+
+fn is_attention_event(event: &Value) -> bool {
+    matches!(
+        event.get("status").and_then(Value::as_str),
+        Some("attention" | "needs-input" | "needs_input")
+    )
+}
+
+fn send_push_notification(
+    gateway: &str,
+    push_token: &str,
+    push_secret: &str,
+    event_id: &str,
+    event: &Value,
+) -> Result<()> {
+    if gateway.is_empty() {
+        bail!("push gateway disabled");
+    }
+    let url = format!("{}/v1/notifications", gateway.trim_end_matches('/'));
+    let payload = json!({
+        "push_token": push_token,
+        "event_id": event_id,
+        "workspace": event.get("workspace").and_then(Value::as_str).unwrap_or(""),
+        "pane": event.get("pane").and_then(Value::as_str).unwrap_or(""),
+    });
+    ureq::post(&url)
+        .set("Authorization", &format!("Bearer {push_secret}"))
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(8))
+        .send_json(payload)
+        .with_context(|| format!("POST {gateway}"))?;
+    Ok(())
+}
+
 // ─── HTTP connection handling ───────────────────────────────────────────────
 
 /// Request-line / header limits for unauthenticated peers.
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-/// HTTP request bodies are only small JSON payloads (register/apns); file
+/// HTTP request bodies are only small JSON payloads (register/push); file
 /// uploads go over the WebSocket channel, not here. Cap well below MAX_WS_MSG so
 /// an unauthenticated peer can't force a 24 MiB allocation per connection.
 /// Exception: POST /v1/paste carries raw screenshot bytes and is allowed
@@ -952,6 +1113,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
                 "backend": "vmux",
                 "session": state.config.session,
                 "boot_id": state.boot_id,
+                "push_notifications": true,
             });
             write_http(
                 &mut stream,
@@ -975,6 +1137,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
                 "session": state.config.session,
                 "boot_id": state.boot_id,
                 "started_at": state.started_at,
+                "push_notifications": true,
             });
             write_http(
                 &mut stream,
@@ -1032,6 +1195,25 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
             } else {
                 let _ = state.devices.set_apns(&did, token, env);
                 write_http(&mut stream, 204, "text/plain", b"")?;
+            }
+        }
+        ("POST", "/v1/devices/me/push") => {
+            let Some(did) = device_id else {
+                write_http(&mut stream, 401, "text/plain", b"unauthorized")?;
+                return Ok(());
+            };
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let token = payload
+                .get("push_token")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let secret = payload
+                .get("secret")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            match state.devices.set_push(&did, token, secret) {
+                Ok(()) => write_http(&mut stream, 204, "text/plain", b"")?,
+                Err(_) => write_http(&mut stream, 400, "text/plain", b"bad request")?,
             }
         }
         ("DELETE", "/v1/devices/me") => {
@@ -2647,6 +2829,26 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
         == 0
 }
 
+fn is_expo_push_token(token: &str) -> bool {
+    let inner = token
+        .strip_prefix("ExponentPushToken[")
+        .or_else(|| token.strip_prefix("ExpoPushToken["))
+        .and_then(|value| value.strip_suffix(']'));
+    inner.is_some_and(|value| {
+        value.len() >= 10
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    })
+}
+
+fn is_hex_secret(secret: &str) -> bool {
+    secret.len() == 64
+        && secret
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn random_hex(bytes: usize) -> String {
     // These bytes back device tokens and boot_id, so they MUST be
     // cryptographically random. getrandom draws from the OS CSPRNG
@@ -2926,9 +3128,132 @@ mod tests {
         // (serde default), and an explicit false must stick.
         let old: RelayConfig = serde_json::from_str(r#"{"listen":"127.0.0.1:4399"}"#).unwrap();
         assert!(old.allow_paste);
+        assert_eq!(old.push_gateway, DEFAULT_PUSH_GATEWAY);
         let off: RelayConfig =
             serde_json::from_str(r#"{"listen":"127.0.0.1:4399","allow_paste":false}"#).unwrap();
         assert!(!off.allow_paste);
+    }
+
+    #[test]
+    fn push_credentials_are_validated_and_persisted_for_the_paired_device() {
+        let path = std::env::temp_dir().join(format!(
+            "vmux-pushtest-{}-{}.json",
+            std::process::id(),
+            random_hex(8)
+        ));
+        let store = DeviceStore::load(path.clone()).unwrap();
+        store
+            .register("phone-1", "owner@example.com", "iphone", "relay-token")
+            .unwrap();
+
+        let push_token = "ExponentPushToken[0123456789abcdefghijkl]";
+        let push_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(store.set_push("phone-1", push_token, push_secret).is_ok());
+        assert!(store
+            .set_push("phone-1", "not-an-expo-token", push_secret)
+            .is_err());
+        assert!(store.set_push("phone-1", push_token, "ABC123").is_err());
+        assert_eq!(
+            store.push_devices(),
+            vec![(push_token.to_string(), push_secret.to_string())]
+        );
+
+        let reloaded = DeviceStore::load(path.clone()).unwrap();
+        assert_eq!(
+            reloaded.push_devices(),
+            vec![(push_token.to_string(), push_secret.to_string())]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn only_attention_statuses_are_push_worthy() {
+        for status in ["attention", "needs-input", "needs_input"] {
+            assert!(is_attention_event(&json!({ "status": status })));
+        }
+        for status in ["running", "completed", "failed", ""] {
+            assert!(!is_attention_event(&json!({ "status": status })));
+        }
+        assert!(!is_attention_event(&json!({})));
+    }
+
+    #[test]
+    fn push_delivery_authenticates_and_forwards_only_opaque_navigation_ids() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                let Some(header_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        send_push_notification(
+            &format!("http://{address}"),
+            "ExponentPushToken[0123456789abcdefghijkl]",
+            secret,
+            "event-42",
+            &json!({
+                "workspace": "workspace-1",
+                "pane": "pane-7",
+                "title": "attacker-controlled title",
+                "message": "attacker-controlled body"
+            }),
+        )
+        .unwrap();
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /v1/notifications HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {secret}")));
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["event_id"], "event-42");
+        assert_eq!(body["workspace"], "workspace-1");
+        assert_eq!(body["pane"], "pane-7");
+        assert!(body.get("title").is_none());
+        assert!(body.get("message").is_none());
     }
 
     #[test]

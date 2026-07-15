@@ -43,6 +43,7 @@ sha2 = "0.10"
 shell-words = "1"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 unicode-width = "0.1"
+ureq = { version = "2.12", features = ["json"] }
 vt100 = "0.16.2"
 
 # Dev builds: optimize dependencies (vt100 parsing, serde_json, ratatui are the
