@@ -1173,9 +1173,7 @@ impl Server {
                     let workspace = session.active_workspace_mut();
                     if let Some(tab_id) = location.tab_id.as_deref() {
                         if workspace.active_tab.as_deref() != Some(tab_id) {
-                            workspace
-                                .switch_tab(tab_id)
-                                .map_err(anyhow::Error::msg)?;
+                            workspace.switch_tab(tab_id).map_err(anyhow::Error::msg)?;
                         }
                     }
                     if !workspace.panes.iter().any(|item| item == &pane) {
@@ -3129,9 +3127,9 @@ impl Server {
 
         let mut session = self.session.lock_or_recover();
         let (workspace_id, tab_id, pane_id) = if let Some(pane_id) = target.pane.clone() {
-            let location = session.find_pane_location(&pane_id).ok_or_else(|| {
-                anyhow!("notification pane {pane_id} is no longer attached")
-            })?;
+            let location = session
+                .find_pane_location(&pane_id)
+                .ok_or_else(|| anyhow!("notification pane {pane_id} is no longer attached"))?;
             (
                 location.workspace_id,
                 location.tab_id,
@@ -3159,9 +3157,7 @@ impl Server {
             let workspace = session.active_workspace_mut();
             if let Some(tab_id) = tab_id.as_deref() {
                 if workspace.active_tab.as_deref() != Some(tab_id) {
-                    workspace
-                        .switch_tab(tab_id)
-                        .map_err(anyhow::Error::msg)?;
+                    workspace.switch_tab(tab_id).map_err(anyhow::Error::msg)?;
                 }
             }
             if let Some(pane_id) = pane_id.clone() {
@@ -4763,7 +4759,10 @@ fn should_record_in_notification_feed(note: &Notification) -> bool {
         return false;
     }
     // Leftover progress-misparse strings from older daemons / partial OSC.
-    if note.message.chars().all(|c| c.is_ascii_digit() || c == ':' || c.is_whitespace())
+    if note
+        .message
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == ':' || c.is_whitespace())
         && note.message.contains(':')
     {
         return false;
@@ -6060,11 +6059,7 @@ mod tests {
             session.workspaces.push(ws2);
             session.panes.insert(
                 "pane-9".into(),
-                Pane::new(
-                    "pane-9".into(),
-                    "claude".into(),
-                    SplitDirection::Right,
-                ),
+                Pane::new("pane-9".into(), "claude".into(), SplitDirection::Right),
             );
             // Active workspace stays ws-1.
             session.active_workspace = "ws-1".into();
