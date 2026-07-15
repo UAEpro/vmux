@@ -2655,7 +2655,7 @@ impl Ui {
     fn notification_count(&self) -> usize {
         self.snapshot
             .as_ref()
-            .map(|snapshot| snapshot.notifications.len().min(20))
+            .map(|snapshot| visible_notifications(snapshot).len())
             .unwrap_or(0)
     }
 
@@ -2966,24 +2966,23 @@ impl Ui {
         let Some(snapshot) = &self.snapshot else {
             return Ok(());
         };
-        let Some(note) = snapshot
-            .notifications
-            .iter()
-            .rev()
-            .take(20)
+        let Some(note) = visible_notifications(snapshot)
+            .into_iter()
             .nth(self.notification_selected)
+            .cloned()
         else {
             return Ok(());
         };
-        let Some(workspace_id) = notification_workspace(snapshot, note).map(|item| item.id.clone())
-        else {
-            return Ok(());
-        };
-        self.rpc(&Request::SwitchWorkspace {
-            workspace: workspace_id,
-        })?;
+        // FocusPane is tab-aware: it switches workspace + tab so a notification
+        // from a background tab actually becomes visible.
         if let Some(pane) = note.pane.clone() {
             self.rpc(&Request::FocusPane { pane })?;
+        } else if let Some(workspace_id) =
+            notification_workspace(snapshot, &note).map(|item| item.id.clone())
+        {
+            self.rpc(&Request::SwitchWorkspace {
+                workspace: workspace_id,
+            })?;
         }
         self.mode = UiMode::Panes;
         Ok(())
@@ -5729,7 +5728,7 @@ fn control_buttons(compact: bool) -> Vec<ControlButton> {
             },
             ControlButton {
                 icon: "🔔",
-                label: "note",
+                label: "notif",
                 action: ControlAction::Notifications,
             },
             ControlButton {
@@ -5777,7 +5776,7 @@ fn control_buttons(compact: bool) -> Vec<ControlButton> {
             },
             ControlButton {
                 icon: "🔔",
-                label: "notes",
+                label: "notif",
                 action: ControlAction::Notifications,
             },
             ControlButton {
@@ -7946,23 +7945,32 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
             _ => {}
         }
     }
-    let notes = snapshot
+    // Hierarchy is Workspace → Tab → Pane; the footer counts tabs (agent
+    // contexts), not split panes inside a tab.
+    let tabs = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.tabs.len().max(1))
+        .sum::<usize>();
+    // Notification feed length, excluding clears and empty messages. Busy
+    // status repeats are already tallied under busy:N.
+    let notif = snapshot
         .notifications
         .iter()
-        .rev()
         .filter(|note| !note.clear && !note.message.is_empty())
+        .filter(|note| !matches!(note.status.as_deref(), Some("busy")))
         .count();
     let mut base = format!(
-        " session:{} workspaces:{} panes:{} running:{} busy:{} attention:{} done:{} error:{} notes:{} ",
+        " session:{} workspaces:{} tabs:{} running:{} busy:{} attention:{} done:{} error:{} notif:{} ",
         snapshot.name,
         snapshot.workspaces.len(),
-        snapshot.panes.len(),
+        tabs,
         running,
         busy,
         attention,
         done,
         error,
-        notes
+        notif
     );
     if let Some(zoomed) = snapshot
         .workspaces
@@ -7982,7 +7990,7 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
     match mode {
         UiMode::Panes => base,
         UiMode::Notifications => {
-            let visible = snapshot.notifications.len().min(20);
+            let visible = visible_notifications(snapshot).len();
             let selected = if visible == 0 {
                 0
             } else {
@@ -8053,12 +8061,21 @@ fn workspace_notification(
         })
 }
 
-fn notification_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> {
+/// Visible notification feed rows (newest first). Clears and empty messages are
+/// history noise — the panel only lists actionable / status-bearing entries.
+fn visible_notifications(snapshot: &Session) -> Vec<&crate::model::Notification> {
     snapshot
         .notifications
         .iter()
         .rev()
+        .filter(|note| !note.clear && !note.message.is_empty())
         .take(20)
+        .collect()
+}
+
+fn notification_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> {
+    visible_notifications(snapshot)
+        .into_iter()
         .enumerate()
         .map(|(index, note)| {
             let workspace = notification_workspace(snapshot, note);
@@ -8066,23 +8083,40 @@ fn notification_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> 
                 .as_ref()
                 .map(|workspace| workspace.name.as_str())
                 .unwrap_or("-");
+            let tab_title = note
+                .pane
+                .as_ref()
+                .and_then(|pane_id| snapshot.find_pane_location(pane_id))
+                .and_then(|loc| {
+                    loc.tab_id.and_then(|tab_id| {
+                        workspace.and_then(|ws| {
+                            ws.tabs
+                                .iter()
+                                .find(|tab| tab.id == tab_id)
+                                .map(|tab| tab.title.clone())
+                        })
+                    })
+                });
             let pane_title = note
                 .pane
                 .as_ref()
                 .and_then(|pane_id| snapshot.panes.get(pane_id))
                 .map(|pane| pane.title.as_str())
                 .unwrap_or("-");
+            // Prefer the workspace tab title (agent context); fall back to pane title.
+            let target = tab_title
+                .as_deref()
+                .filter(|title| !title.is_empty())
+                .unwrap_or(pane_title);
             let status = note.status.as_deref().unwrap_or("-");
-            let clear = if note.clear { " clear" } else { "" };
             let marker = if index == selected { "> " } else { "  " };
             format!(
-                "{marker}{} [{}] ws:{} pane:{} status:{}{} {}",
+                "{marker}{} [{}] ws:{} tab:{} status:{} {}",
                 note.time,
                 note.color.as_deref().unwrap_or("-"),
                 trim_label(workspace_name, 14),
-                trim_label(pane_title, 14),
+                trim_label(target, 14),
                 status,
-                clear,
                 trim_label(&note.message, 80)
             )
         })
@@ -10503,6 +10537,10 @@ mod tests {
             SplitDirection::Right,
         );
         session.workspaces[0].panes.push("pane-1".to_string());
+        if let Some(tab) = session.workspaces[0].tabs.first_mut() {
+            tab.panes.push("pane-1".to_string());
+            tab.title = "claude".to_string();
+        }
         session.panes.insert("pane-1".to_string(), pane);
         session.notifications.push(crate::model::Notification {
             time: 1,
@@ -10522,10 +10560,20 @@ mod tests {
             clear: false,
             message: "pane note".to_string(),
         });
+        // Cleared / empty entries must not appear in the panel.
+        session.notifications.push(crate::model::Notification {
+            time: 3,
+            pane: Some("pane-1".to_string()),
+            workspace: None,
+            status: None,
+            color: None,
+            clear: true,
+            message: String::new(),
+        });
 
         let lines = notification_panel_lines(&session, 1);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("pane:claude"));
+        assert!(lines[0].contains("tab:claude"));
         assert!(lines[0].contains("pane note"));
         assert!(lines[0].starts_with("  "));
         assert!(lines[1].contains("ws:main"));
@@ -10812,36 +10860,47 @@ mod tests {
         session.panes.insert("pane-1".to_string(), pane_1);
         session.panes.insert("pane-2".to_string(), pane_2);
         session.panes.insert("pane-3".to_string(), pane_3);
+        // One default tab (tabs:1); agent counts still come from the pane map.
+        // Bare notify (no status) counts toward notif; pure busy status does not.
         session.notifications.push(crate::model::Notification {
             time: 1,
             pane: Some("pane-1".to_string()),
             workspace: None,
-            status: None,
-            color: None,
+            status: Some("busy".to_string()),
+            color: Some("yellow".to_string()),
             clear: false,
-            message: "working".to_string(),
+            message: "agent working".to_string(),
+        });
+        session.notifications.push(crate::model::Notification {
+            time: 2,
+            pane: Some("pane-3".to_string()),
+            workspace: None,
+            status: Some("attention".to_string()),
+            color: Some("blue".to_string()),
+            clear: false,
+            message: "needs input".to_string(),
         });
 
         assert_eq!(
             session_footer(&session, UiMode::Panes, 0),
-            " session:test workspaces:1 panes:3 running:2 busy:1 attention:1 done:1 error:0 notes:1 "
+            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1 "
         );
         assert_eq!(
             session_footer(&session, UiMode::Notifications, 0),
-            " session:test workspaces:1 panes:3 running:2 busy:1 attention:1 done:1 error:0 notes:1  notifications:1/1 j/k select Enter jump Esc close "
+            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  notifications:1/2 j/k select Enter jump Esc close "
         );
         assert_eq!(
             session_footer(&session, UiMode::Actions, 0),
-            " session:test workspaces:1 panes:3 running:2 busy:1 attention:1 done:1 error:0 notes:1  actions j/k select Enter run Esc close "
+            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  actions j/k select Enter run Esc close "
         );
         assert_eq!(
             session_footer(&session, UiMode::Commands, 0),
-            " session:test workspaces:1 panes:3 running:2 busy:1 attention:1 done:1 error:0 notes:1  commands type to filter ↑/↓ select Enter run Esc clear/close "
+            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  commands type to filter ↑/↓ select Enter run Esc clear/close "
         );
         session.workspaces[0].zoomed_pane = Some("pane-1".to_string());
         assert_eq!(
             session_footer(&session, UiMode::Panes, 0),
-            " session:test workspaces:1 panes:3 running:2 busy:1 attention:1 done:1 error:0 notes:1  zoom:pane-1 "
+            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  zoom:pane-1 "
         );
     }
 }

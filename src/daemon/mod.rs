@@ -1161,13 +1161,27 @@ impl Server {
                 Ok(Response::ok(target))
             }
             Request::FocusPane { pane } => {
-                let mut session = self.session.lock_or_recover();
-                let workspace = session.active_workspace_mut();
-                if !workspace.panes.iter().any(|item| item == &pane) {
-                    return Err(anyhow!("pane {pane} is not in active workspace"));
+                // Tab-aware: a pane may live on a background tab (or even another
+                // workspace). Switch there first so "focus this pane" always means
+                // "show me this pane" — same semantics as the phone relay path.
+                {
+                    let mut session = self.session.lock_or_recover();
+                    let Some(location) = session.find_pane_location(&pane) else {
+                        return Err(anyhow!("pane {pane} is not attached to any workspace"));
+                    };
+                    session.active_workspace = location.workspace_id.clone();
+                    let workspace = session.active_workspace_mut();
+                    if let Some(tab_id) = location.tab_id.as_deref() {
+                        if workspace.active_tab.as_deref() != Some(tab_id) {
+                            workspace.switch_tab(tab_id).map_err(anyhow::Error::msg)?;
+                        }
+                    }
+                    if !workspace.panes.iter().any(|item| item == &pane) {
+                        return Err(anyhow!("pane {pane} is not in active workspace"));
+                    }
+                    workspace.active_pane = Some(pane.clone());
+                    workspace.flush_active_tab();
                 }
-                workspace.active_pane = Some(pane.clone());
-                drop(session);
                 // Clicking a pane acknowledges its finished ✅.
                 self.acknowledge_done_panes(&[pane]);
                 self.save()?;
@@ -2858,6 +2872,19 @@ impl Server {
         } else {
             None
         };
+        // Reclassify completion-flavoured "attention" messages (e.g. Grok
+        // Notification "Turn complete") as done so they don't raise 🙋.
+        let (status, color) = if !clear
+            && status
+                .as_deref()
+                .map(|s| matches!(parse_agent_status(s), AgentStatus::Attention))
+                .unwrap_or(false)
+            && is_completion_noise_notification(&message)
+        {
+            (Some("done".to_string()), Some("green".to_string()))
+        } else {
+            (status, color)
+        };
         let note = Notification {
             time: unix_time(),
             pane: target_pane.clone(),
@@ -2869,9 +2896,9 @@ impl Server {
         };
         // Claude Code's Notification hook fires ~60s after every finished turn
         // with "Claude is waiting for your input". That idle notice carries no
-        // new request, so it must not overwrite the Stop hook's ✅ with 🙋 —
-        // record it in the feed, but leave agent_status and the banner alone.
-        let idle_notice = is_idle_prompt_notification(&message)
+        // new request, so it must not overwrite the Stop hook's ✅ with 🙋.
+        // Same for completion noise that we didn't reclassify above.
+        let skip_status = is_non_actionable_attention(&message)
             && status
                 .as_deref()
                 .map(|status| matches!(parse_agent_status(status), AgentStatus::Attention))
@@ -2884,7 +2911,7 @@ impl Server {
                 if clear {
                     target.notification_color = None;
                     target.notification_message = None;
-                } else if idle_notice {
+                } else if skip_status {
                     // keep current status/banner
                 } else if let Some(status) = &status {
                     apply_explicit_agent_status(target, status, color.as_deref(), &message);
@@ -2902,8 +2929,8 @@ impl Server {
         // notify that matches the latest recorded state for the same target is
         // not news — keep the live pane status fresh (above/below) but don't
         // append another feed entry, which the relay would forward as yet
-        // another push notification. The next feed entry is the next state
-        // transition: done, needs input, error, or a different message.
+        // another push notification. Routine busy/done boilerplate is also
+        // skipped entirely: the sidebar already shows 🔄/✅.
         let duplicate = !clear
             && session
                 .notifications
@@ -2916,7 +2943,7 @@ impl Server {
                         && prev.color == note.color
                         && prev.message == note.message
                 });
-        if !duplicate {
+        if !duplicate && should_record_in_notification_feed(&note) {
             session.notifications.push(note.clone());
             let len = session.notifications.len();
             if len > 100 {
@@ -2943,7 +2970,7 @@ impl Server {
                 if clear {
                     runtime.pane.notification_color = None;
                     runtime.pane.notification_message = None;
-                } else if idle_notice {
+                } else if skip_status {
                     // keep current status/banner
                 } else if let Some(status) = &status {
                     apply_explicit_agent_status(
@@ -3076,24 +3103,38 @@ impl Server {
     fn jump_notification(&self) -> Result<serde_json::Value> {
         let target = {
             let session = self.session.lock_or_recover();
-            session
+            // Prefer attention / bare "needs you" notes over routine busy/done
+            // feed noise so Ctrl-b u lands on something that wants input.
+            let visible: Vec<_> = session
                 .notifications
                 .iter()
                 .rev()
-                .find(|note| !note.clear && (!note.message.is_empty() || note.status.is_some()))
+                .filter(|note| !note.clear && !note.message.is_empty())
+                .collect();
+            visible
+                .iter()
+                .find(|note| {
+                    matches!(
+                        note.status.as_deref(),
+                        Some("attention") | Some("error") | None
+                    )
+                })
+                .or_else(|| visible.first())
+                .copied()
                 .cloned()
                 .ok_or_else(|| anyhow!("no notifications"))?
         };
 
         let mut session = self.session.lock_or_recover();
-        let (workspace_id, pane_id) = if let Some(pane_id) = target.pane.clone() {
-            let workspace_id = session
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.contains_pane(&pane_id))
-                .map(|workspace| workspace.id.clone())
+        let (workspace_id, tab_id, pane_id) = if let Some(pane_id) = target.pane.clone() {
+            let location = session
+                .find_pane_location(&pane_id)
                 .ok_or_else(|| anyhow!("notification pane {pane_id} is no longer attached"))?;
-            (workspace_id, Some(pane_id))
+            (
+                location.workspace_id,
+                location.tab_id,
+                Some(location.pane_id),
+            )
         } else {
             let workspace_id = target
                 .workspace
@@ -3108,19 +3149,31 @@ impl Server {
                     "notification workspace {workspace_id} no longer exists"
                 ));
             }
-            (workspace_id, None)
+            (workspace_id, None, None)
         };
 
         session.active_workspace = workspace_id.clone();
-        if let Some(pane_id) = pane_id.clone() {
+        {
             let workspace = session.active_workspace_mut();
-            workspace.active_pane = Some(pane_id.clone());
+            if let Some(tab_id) = tab_id.as_deref() {
+                if workspace.active_tab.as_deref() != Some(tab_id) {
+                    workspace.switch_tab(tab_id).map_err(anyhow::Error::msg)?;
+                }
+            }
+            if let Some(pane_id) = pane_id.clone() {
+                workspace.active_pane = Some(pane_id);
+                workspace.flush_active_tab();
+            }
         }
         drop(session);
+        if let Some(ref pane_id) = pane_id {
+            self.acknowledge_done_panes(std::slice::from_ref(pane_id));
+        }
         self.save()?;
 
         Ok(serde_json::json!({
             "workspace": workspace_id,
+            "tab": tab_id,
             "pane": pane_id,
             "notification": target,
         }))
@@ -3543,6 +3596,9 @@ impl Server {
                 runtime.osc_tail.push_str(&text);
                 let (osc, retain_from) = scan_osc_events(&runtime.osc_tail);
                 let notifications = osc.notifications;
+                if let Some(progress) = osc.progress {
+                    runtime.pane.progress = progress;
+                }
                 if retain_from > 0 {
                     runtime.osc_tail.drain(..retain_from);
                 }
@@ -3565,7 +3621,7 @@ impl Server {
                     touch_agent_status(&mut runtime.pane, next, pinned);
                 }
                 if let Some(message) = notifications.last() {
-                    if !is_idle_prompt_notification(message) {
+                    if !is_non_actionable_attention(message) {
                         touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
                         runtime.pane.notification_color = Some("blue".to_string());
                         runtime.pane.notification_message = Some(message.clone());
@@ -3640,16 +3696,23 @@ impl Server {
                 }
             }
             for message in notifications {
-                let event_message = message.clone();
-                session.notifications.push(Notification {
+                if is_non_actionable_attention(&message) {
+                    continue;
+                }
+                let note = Notification {
                     time: unix_time(),
                     pane: Some(pane_id.to_string()),
                     workspace: None,
                     status: Some("attention".to_string()),
                     color: Some("blue".to_string()),
                     clear: false,
-                    message,
-                });
+                    message: message.clone(),
+                };
+                if !should_record_in_notification_feed(&note) {
+                    continue;
+                }
+                let event_message = message;
+                session.notifications.push(note);
                 push_event(
                     &mut session,
                     EventRecord {
@@ -4655,7 +4718,67 @@ fn parse_agent_status(status: &str) -> AgentStatus {
 /// nothing new of the user, so it must not flip a finished-turn ✅ into 🙋.
 fn is_idle_prompt_notification(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("waiting for your input") || message.contains("waiting for input")
+    message.contains("waiting for your input")
+        || message.contains("waiting for input")
+        || message.contains("finished responding")
+}
+
+/// Completion-flavoured Notification messages (Grok "Turn complete", etc.) that
+/// must not raise 🙋 — they are done-turn noise, not a request for input.
+fn is_completion_noise_notification(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message == "turn complete"
+        || message == "end_turn"
+        || message == "end turn"
+        || message.starts_with("turn complete")
+        || message.contains("response complete")
+}
+
+/// Attention-class messages that must not change agent_status / banner.
+fn is_non_actionable_attention(message: &str) -> bool {
+    is_idle_prompt_notification(message) || is_completion_noise_notification(message)
+}
+
+/// Default lifecycle messages from `hooks event` — sidebar already shows 🔄/✅.
+fn is_boilerplate_lifecycle_message(message: &str) -> bool {
+    matches!(
+        message.trim().to_ascii_lowercase().as_str(),
+        "agent working"
+            | "agent hook completed"
+            | "agent hook event"
+            | "agent hook failed"
+            | "end_turn"
+            | "turn complete"
+    )
+}
+
+/// Whether a notify should appear in the session notification feed / panel.
+/// Routine busy↔done hook chatter is status, not a notification the user jumps to.
+fn should_record_in_notification_feed(note: &Notification) -> bool {
+    if note.clear || note.message.is_empty() {
+        return false;
+    }
+    // Leftover progress-misparse strings from older daemons / partial OSC.
+    if note
+        .message
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == ':' || c.is_whitespace())
+        && note.message.contains(':')
+    {
+        return false;
+    }
+    match note
+        .status
+        .as_deref()
+        .map(parse_agent_status)
+        .unwrap_or(AgentStatus::Unknown)
+    {
+        AgentStatus::Busy | AgentStatus::Done | AgentStatus::Idle => {
+            !is_boilerplate_lifecycle_message(&note.message)
+        }
+        AgentStatus::Attention if is_non_actionable_attention(&note.message) => false,
+        _ => true,
+    }
 }
 
 /// Apply a hook/CLI status so it sticks in the sidebar (pinned).
@@ -5085,6 +5208,9 @@ struct OscEvents {
     /// The window title the program last set (OSC 0 / 2). Only the final one in
     /// a read matters — agents rewrite the title as they work.
     title: Option<String>,
+    /// ConEmu / Windows Terminal / Ghostty progress bar (OSC 9;4;…).
+    /// `Some(None)` clears the bar; `Some(Some(n))` sets 0–100.
+    progress: Option<Option<u8>>,
 }
 
 /// Scan `buf` for the OSC sequences vmux acts on. Returns the events and the
@@ -5113,7 +5239,11 @@ fn scan_osc_events(buf: &str) -> (OscEvents, usize) {
             return (events, start);
         };
         let payload = &buf[after..after + end];
-        if let Some(message) = osc_notification_message(payload) {
+        // Progress first: OSC 9;4 is *not* a notification. Misparsing it as one
+        // produced feed spam ("4: 1" / "4: 0") and flipped panes to 🙋.
+        if let Some(progress) = osc_progress_update(payload) {
+            events.progress = Some(progress);
+        } else if let Some(message) = osc_notification_message(payload) {
             events.notifications.push(message);
         } else if let Some(title) = osc_window_title(payload) {
             events.title = Some(title);
@@ -5123,6 +5253,38 @@ fn scan_osc_events(buf: &str) -> (OscEvents, usize) {
         } else {
             after + end + 1
         };
+    }
+}
+
+/// OSC 9;4 progress report (ConEmu / Windows Terminal / Ghostty / many CLIs).
+///
+/// `OSC 9 ; 4 ; <state> [; <progress>] ST`
+/// - state 0 → remove progress bar
+/// - state 1 → set progress 0–100
+/// - states 2/3/4 → error / indeterminate / paused (we clear the numeric bar)
+fn osc_progress_update(payload: &str) -> Option<Option<u8>> {
+    let rest = payload.strip_prefix("9;4")?;
+    // Accept bare "9;4" / "9;4;" as clear.
+    let rest = rest.strip_prefix(';').unwrap_or(rest).trim();
+    if rest.is_empty() {
+        return Some(None);
+    }
+    let mut parts = rest.split(';').map(str::trim).filter(|p| !p.is_empty());
+    let state = parts.next()?;
+    match state {
+        "0" => Some(None),
+        "1" => {
+            let pct = parts
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .map(|n| n.min(100) as u8)
+                .unwrap_or(0);
+            Some(Some(pct))
+        }
+        // Error / indeterminate / paused: drop the numeric bar rather than
+        // inventing a fake percentage.
+        "2" | "3" | "4" => Some(None),
+        _ => None,
     }
 }
 
@@ -5244,6 +5406,10 @@ fn osc_title(text: &str) -> Option<String> {
 }
 
 fn osc_notification_message(payload: &str) -> Option<String> {
+    // OSC 9;4 is progress (handled separately) — never a desktop notification.
+    if payload.starts_with("9;4") {
+        return None;
+    }
     for prefix in ["9;", "99;", "777;"] {
         if let Some(rest) = payload.strip_prefix(prefix) {
             return format_osc_notification(rest);
@@ -5268,7 +5434,17 @@ fn format_osc_notification(payload: &str) -> Option<String> {
     };
     match parts {
         [] => None,
+        // Lone numeric "4" would be a partial progress sequence we didn't
+        // recognize; never surface it as a user-visible notification.
+        [message] if message.chars().all(|c| c.is_ascii_digit()) => None,
         [message] => Some((*message).to_string()),
+        // "4: 1" / "4: 0" was the classic misparse of OSC 9;4 progress.
+        [title, body, ..]
+            if title.chars().all(|c| c.is_ascii_digit())
+                && body.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            None
+        }
         [title, body, ..] => Some(format!("{title}: {body}")),
     }
 }
@@ -5770,24 +5946,25 @@ mod tests {
                 .unwrap();
         };
 
-        // Hook events repeat "busy / agent working" on every tool call — only
-        // the first lands in the feed, even with another pane interleaved.
+        // Routine busy/done boilerplate must NOT enter the notification feed —
+        // the sidebar already shows 🔄/✅. Live status still updates.
         notify("pane-1", "busy", "yellow", "agent working");
         notify("pane-2", "busy", "yellow", "agent working");
         notify("pane-1", "busy", "yellow", "agent working");
-        notify("pane-1", "busy", "yellow", "agent working");
+        notify("pane-1", "done", "green", "agent hook completed");
         {
             let session = server.session.lock_or_recover();
-            assert_eq!(session.notifications.len(), 2);
-            assert_eq!(session.events.len(), 2);
-            // The live sidebar status still updates on suppressed notifies.
-            assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Busy);
+            assert!(
+                session.notifications.is_empty(),
+                "boilerplate lifecycle must not spam the feed: {:?}",
+                session.notifications
+            );
+            assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Done);
+            assert_eq!(session.panes["pane-2"].agent_status, AgentStatus::Busy);
         }
 
-        // State transitions are news again: done, then back to busy.
-        notify("pane-1", "done", "green", "agent hook completed");
-        notify("pane-1", "busy", "yellow", "agent working");
-        // Same status but a different message is a new request, not a repeat.
+        // Attention / permission requests *do* land in the feed (and dedupe).
+        notify("pane-1", "attention", "blue", "approve edit to foo.rs");
         notify("pane-1", "attention", "blue", "approve edit to foo.rs");
         notify("pane-1", "attention", "blue", "approve edit to bar.rs");
         {
@@ -5800,14 +5977,110 @@ mod tests {
                 .collect();
             assert_eq!(
                 messages,
-                [
-                    "agent working",
-                    "agent hook completed",
-                    "agent working",
-                    "approve edit to foo.rs",
-                    "approve edit to bar.rs",
-                ]
+                ["approve edit to foo.rs", "approve edit to bar.rs"]
             );
+            assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Attention);
+        }
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn jump_notification_switches_to_background_tab() {
+        // A notify on a pane living only on a background tab must switch that
+        // tab into the live view; setting active_pane alone leaves the pane
+        // invisible (workspace.panes is the active tab's layout).
+        let session = TestSession::new("jump-bg-tab");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            let ws = &mut session.workspaces[0];
+            // Active tab-1 holds pane-1; background tab-2 holds pane-2.
+            ws.tabs = vec![
+                {
+                    let mut tab = crate::model::WorkspaceTab::new("tab-1", "front");
+                    tab.panes = vec!["pane-1".into()];
+                    tab.active_pane = Some("pane-1".into());
+                    tab
+                },
+                {
+                    let mut tab = crate::model::WorkspaceTab::new("tab-2", "back");
+                    tab.panes = vec!["pane-2".into()];
+                    tab.active_pane = Some("pane-2".into());
+                    tab
+                },
+            ];
+            ws.active_tab = Some("tab-1".into());
+            ws.panes = vec!["pane-1".into()];
+            ws.active_pane = Some("pane-1".into());
+            for id in ["pane-1", "pane-2"] {
+                session.panes.insert(
+                    id.to_string(),
+                    Pane::new(id.to_string(), "claude".to_string(), SplitDirection::Right),
+                );
+            }
+            session.notifications.push(Notification {
+                time: 1,
+                pane: Some("pane-2".into()),
+                workspace: None,
+                status: Some("attention".into()),
+                color: Some("blue".into()),
+                clear: false,
+                message: "needs input on background tab".into(),
+            });
+        }
+
+        let result = server.jump_notification().unwrap();
+        assert_eq!(result["pane"], "pane-2");
+        assert_eq!(result["tab"], "tab-2");
+        {
+            let session = server.session.lock_or_recover();
+            let ws = &session.workspaces[0];
+            assert_eq!(ws.active_tab.as_deref(), Some("tab-2"));
+            assert_eq!(ws.active_pane.as_deref(), Some("pane-2"));
+            assert_eq!(ws.panes, vec!["pane-2".to_string()]);
+        }
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn focus_pane_switches_workspace_and_tab() {
+        let session = TestSession::new("focus-tab");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            // Second workspace with a single tab holding pane-9.
+            let mut ws2 = crate::model::Workspace::new("ws-2", "other");
+            ws2.tabs[0].panes = vec!["pane-9".into()];
+            ws2.tabs[0].active_pane = Some("pane-9".into());
+            ws2.panes = vec!["pane-9".into()];
+            ws2.active_pane = Some("pane-9".into());
+            session.workspaces.push(ws2);
+            session.panes.insert(
+                "pane-9".into(),
+                Pane::new("pane-9".into(), "claude".into(), SplitDirection::Right),
+            );
+            // Active workspace stays ws-1.
+            session.active_workspace = "ws-1".into();
+        }
+
+        // Drive through the same Request path the UI uses.
+        let response = server
+            .dispatch(Request::FocusPane {
+                pane: "pane-9".into(),
+            })
+            .unwrap();
+        assert!(response.ok, "{response:?}");
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(session.active_workspace, "ws-2");
+            let ws = session
+                .workspaces
+                .iter()
+                .find(|w| w.id == "ws-2")
+                .expect("ws-2");
+            assert_eq!(ws.active_pane.as_deref(), Some("pane-9"));
         }
 
         fs::remove_file(server.state_path.clone()).ok();
@@ -6704,6 +6977,70 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
     }
 
     #[test]
+    fn osc_progress_is_not_a_notification() {
+        // ConEmu / Windows Terminal / Ghostty progress: OSC 9;4;state;pct
+        // Used to be misparsed as notification message "4: 1" / "4: 0" and
+        // flipped the pane to 🙋 attention.
+        let set = "\x1b]9;4;1;50\x07";
+        let clear = "\x1b]9;4;0\x07";
+        let err = "\x1b]9;4;2\x07";
+        assert!(
+            osc_notifications(set).is_empty(),
+            "progress set must not become a notification"
+        );
+        assert!(osc_notifications(clear).is_empty());
+        assert!(osc_notifications(err).is_empty());
+
+        let (events, _) = scan_osc_events(set);
+        assert_eq!(events.progress, Some(Some(50)));
+        let (events, _) = scan_osc_events(clear);
+        assert_eq!(events.progress, Some(None));
+        // Real notifications still work next to progress.
+        let mixed = "\x1b]9;4;1;10\x07\x1b]9;needs review\x07";
+        let (events, _) = scan_osc_events(mixed);
+        assert_eq!(events.progress, Some(Some(10)));
+        assert_eq!(events.notifications, vec!["needs review".to_string()]);
+    }
+
+    #[test]
+    fn turn_complete_notification_does_not_raise_attention() {
+        let session = TestSession::new("turn-complete");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            let mut pane = Pane::new(
+                "pane-1".to_string(),
+                "grok".to_string(),
+                SplitDirection::Right,
+            );
+            touch_agent_status(&mut pane, AgentStatus::Busy, true);
+            session.panes.insert("pane-1".to_string(), pane);
+        }
+        // Grok's Notification hook fires "Turn complete" as attention — that
+        // must become done, not 🙋, and must not spam the feed.
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("attention".to_string()),
+                Some("blue".to_string()),
+                false,
+                "Turn complete".to_string(),
+                None,
+            )
+            .unwrap();
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Done);
+            assert!(
+                session.notifications.is_empty(),
+                "turn-complete noise must not land in the feed"
+            );
+        }
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
     fn parse_agent_status_supports_attention_aliases() {
         assert_eq!(parse_agent_status("attention"), AgentStatus::Attention);
         assert_eq!(parse_agent_status("needs-input"), AgentStatus::Attention);
@@ -6726,6 +7063,9 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
     #[test]
     fn ignores_non_notification_osc_sequences() {
         assert!(osc_notifications("\x1b]0;terminal title\x07").is_empty());
+        // Numeric-only OSC 9 payloads are never user notifications.
+        assert!(osc_notifications("\x1b]9;4\x07").is_empty());
+        assert!(osc_notifications("\x1b]9;4;1\x07").is_empty());
     }
 
     #[test]
