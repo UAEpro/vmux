@@ -2903,6 +2903,13 @@ impl Server {
                 .as_deref()
                 .map(|status| matches!(parse_agent_status(status), AgentStatus::Attention))
                 .unwrap_or(true);
+        // UserPromptSubmit condenses the prompt into `title` / auto_title — that
+        // is the signal a *new* turn started, vs late PreToolUse after Stop.
+        let has_new_turn_title = auto_title.is_some()
+            || title
+                .as_deref()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
         let mut session = self.session.lock_or_recover();
         let mut runtime_target = None;
         if let Some(pane_id) = &target_pane {
@@ -2914,7 +2921,10 @@ impl Server {
                 } else if skip_status {
                     // keep current status/banner
                 } else if let Some(status) = &status {
-                    apply_explicit_agent_status(target, status, color.as_deref(), &message);
+                    if !should_skip_busy_after_settled(target, status, &message, has_new_turn_title)
+                    {
+                        apply_explicit_agent_status(target, status, color.as_deref(), &message);
+                    }
                 } else if !message.is_empty() {
                     // Bare notify without status = needs attention.
                     touch_agent_status(target, AgentStatus::Attention, true);
@@ -2973,12 +2983,19 @@ impl Server {
                 } else if skip_status {
                     // keep current status/banner
                 } else if let Some(status) = &status {
-                    apply_explicit_agent_status(
-                        &mut runtime.pane,
+                    if !should_skip_busy_after_settled(
+                        &runtime.pane,
                         status,
-                        color.as_deref(),
                         &message,
-                    );
+                        has_new_turn_title,
+                    ) {
+                        apply_explicit_agent_status(
+                            &mut runtime.pane,
+                            status,
+                            color.as_deref(),
+                            &message,
+                        );
+                    }
                 } else if !message.is_empty() {
                     touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
                     runtime.pane.notification_color =
@@ -4781,6 +4798,36 @@ fn should_record_in_notification_feed(note: &Notification) -> bool {
     }
 }
 
+/// Pane is finished (✅) or user-acknowledged idle — late tool hooks must not
+/// flip it back to 🔄 without a real new-turn signal.
+fn is_settled_after_turn(pane: &Pane) -> bool {
+    matches!(pane.agent_status, AgentStatus::Done)
+        || (matches!(pane.agent_status, AgentStatus::Idle | AgentStatus::Unknown)
+            && pane.agent_status_pinned)
+}
+
+/// Grok (and others) often fire PreToolUse/PostToolUse with "agent working"
+/// after Stop has already set ✅. That late boilerplate must not demote a
+/// finished turn. A real new turn carries a UserPromptSubmit title and/or a
+/// custom busy message (`set-status busy --message "fix auth"`).
+fn should_skip_busy_after_settled(
+    pane: &Pane,
+    status: &str,
+    message: &str,
+    has_new_turn_title: bool,
+) -> bool {
+    if !matches!(parse_agent_status(status), AgentStatus::Busy) {
+        return false;
+    }
+    if !is_settled_after_turn(pane) {
+        return false;
+    }
+    if has_new_turn_title {
+        return false;
+    }
+    is_boilerplate_lifecycle_message(message)
+}
+
 /// Apply a hook/CLI status so it sticks in the sidebar (pinned).
 ///
 /// Done/busy/error clear the pane notification banner so workspace_status shows
@@ -5914,6 +5961,92 @@ mod tests {
             let session = server.session.lock_or_recover();
             let pane = &session.panes["pane-1"];
             assert_eq!(pane.agent_status, AgentStatus::Attention);
+        }
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn late_busy_after_done_does_not_resurrect_spinner() {
+        // Repro: Grok Stop → ✅, then a late PreToolUse/PostToolUse with
+        // "agent working" (no UserPromptSubmit title) was flipping ✅ → 🔄.
+        let session = TestSession::new("late-busy");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            let mut pane = Pane::new(
+                "pane-1".to_string(),
+                "grok".to_string(),
+                SplitDirection::Right,
+            );
+            touch_agent_status(&mut pane, AgentStatus::Done, true);
+            session.panes.insert("pane-1".to_string(), pane);
+        }
+
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("busy".to_string()),
+                Some("yellow".to_string()),
+                false,
+                "agent working".to_string(),
+                None, // no new-turn title
+            )
+            .unwrap();
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(
+                session.panes["pane-1"].agent_status,
+                AgentStatus::Done,
+                "boilerplate busy after Stop must not demote ✅"
+            );
+        }
+
+        // User dismissed ✅ (click away) → settled Idle; late busy still ignored.
+        {
+            let mut session = server.session.lock_or_recover();
+            assert!(acknowledge_done_status(
+                session.panes.get_mut("pane-1").unwrap()
+            ));
+            assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Idle);
+            assert!(session.panes["pane-1"].agent_status_pinned);
+        }
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("busy".to_string()),
+                Some("yellow".to_string()),
+                false,
+                "agent working".to_string(),
+                None,
+            )
+            .unwrap();
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(
+                session.panes["pane-1"].agent_status,
+                AgentStatus::Idle,
+                "boilerplate busy after acknowledge must not re-raise 🔄"
+            );
+        }
+
+        // A real new turn (UserPromptSubmit title) still wins.
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("busy".to_string()),
+                Some("yellow".to_string()),
+                false,
+                "agent working".to_string(),
+                Some("fix parser".to_string()),
+            )
+            .unwrap();
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Busy);
         }
 
         fs::remove_file(server.state_path.clone()).ok();

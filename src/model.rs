@@ -1269,6 +1269,11 @@ pub fn infer_agent_status(output: &str, command: &str) -> AgentStatus {
 /// Stays on the sidebar until the user selects the workspace, its tab, or the
 /// pane — so if you were away, the checkmark is still there when you return.
 /// Busy (🔄) and Attention (🙋) are not cleared here.
+///
+/// The resulting Idle/Unknown stays **pinned** so a late PreToolUse/PostToolUse
+/// "agent working" hook (common with Grok after Stop) cannot re-raise 🔄 after
+/// the user has already dismissed the checkmark. A real new turn still wins via
+/// UserPromptSubmit (title), a custom busy message, or keystrokes.
 pub fn acknowledge_done_status(pane: &mut Pane) -> bool {
     if !matches!(pane.agent_status, AgentStatus::Done) {
         return false;
@@ -1278,7 +1283,8 @@ pub fn acknowledge_done_status(pane: &mut Pane) -> bool {
     } else {
         AgentStatus::Unknown
     };
-    pane.agent_status_pinned = false;
+    // Pinned settled-idle: ignore boilerplate busy until a strong new-turn signal.
+    pane.agent_status_pinned = true;
     pane.agent_status_at = unix_time();
     pane.notification_message = None;
     pane.notification_color = None;
@@ -1342,11 +1348,15 @@ pub fn merge_agent_status(
     }
 
     match (current, inferred) {
-        // New turn / new work after a settled state.
-        (
-            AgentStatus::Done | AgentStatus::Error | AgentStatus::Idle | AgentStatus::Unknown,
-            AgentStatus::Busy,
-        ) => (AgentStatus::Busy, true),
+        // Finished turn holds against PTY keyword "busy" — late screen redraws
+        // after Stop must not resurrect 🔄. Real new work arrives via hooks
+        // (`notify` / UserPromptSubmit) or keystrokes (`mark_coding_agent_busy`).
+        (AgentStatus::Done, AgentStatus::Busy) => (AgentStatus::Done, true),
+        // Settled idle (user acknowledged ✅): same protection.
+        (AgentStatus::Idle, AgentStatus::Busy) => (AgentStatus::Idle, true),
+        (AgentStatus::Unknown, AgentStatus::Busy) => (AgentStatus::Unknown, true),
+        // Error can recover into busy when the agent retries.
+        (AgentStatus::Error, AgentStatus::Busy) => (AgentStatus::Busy, true),
         (
             AgentStatus::Done | AgentStatus::Idle | AgentStatus::Unknown | AgentStatus::Error,
             AgentStatus::Attention,
@@ -1361,7 +1371,9 @@ pub fn merge_agent_status(
         (AgentStatus::Busy, AgentStatus::Done) => (AgentStatus::Done, true),
         (AgentStatus::Busy, AgentStatus::Error) => (AgentStatus::Error, true),
         (AgentStatus::Busy, _) => (AgentStatus::Busy, true),
-        (other, _) => (other, true),
+        // Settled idle/unknown pin holds through quiet redraws.
+        (AgentStatus::Idle, _) => (AgentStatus::Idle, true),
+        (AgentStatus::Unknown, _) => (AgentStatus::Unknown, true),
     }
 }
 
@@ -2162,9 +2174,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_agent_status_pinned_done_allows_new_busy() {
+    fn merge_agent_status_pinned_done_holds_against_pty_busy() {
+        // PTY keyword inference must not resurrect 🔄 after Stop. Hooks and
+        // keystrokes set Busy through notify / mark_coding_agent_busy instead.
         let (status, pinned) = merge_agent_status(AgentStatus::Done, true, AgentStatus::Busy);
-        assert_eq!(status, AgentStatus::Busy);
+        assert_eq!(status, AgentStatus::Done);
+        assert!(pinned);
+        let (status, pinned) = merge_agent_status(AgentStatus::Idle, true, AgentStatus::Busy);
+        assert_eq!(status, AgentStatus::Idle);
         assert!(pinned);
     }
 
@@ -2175,7 +2192,8 @@ mod tests {
         pane.agent_status_pinned = true;
         assert!(acknowledge_done_status(&mut pane));
         assert_eq!(pane.agent_status, AgentStatus::Idle);
-        assert!(!pane.agent_status_pinned);
+        // Stays pinned so late "agent working" hooks cannot re-raise 🔄.
+        assert!(pane.agent_status_pinned);
         assert!(!acknowledge_done_status(&mut pane));
     }
 
