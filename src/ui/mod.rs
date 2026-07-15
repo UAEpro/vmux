@@ -4345,9 +4345,14 @@ fn draw_commands(
 ) {
     let palette = theme.palette();
     let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2) as usize;
     let entries = filter_command_entries(filter);
     let match_count = entries.len();
     let total_count = command_palette_entries().len();
+
+    // Chrome: title + search + blank + blank before footer + footer = 5 lines.
+    const CHROME: usize = 5;
+    let list_budget = inner_height.saturating_sub(CHROME).max(3);
 
     let mut lines = Vec::new();
 
@@ -4403,6 +4408,7 @@ fn draw_commands(
         prefix_label,
         inner_width,
         theme,
+        list_budget,
     ));
 
     // Footer with key hints.
@@ -4438,11 +4444,12 @@ fn draw_commands(
         Span::styled(" shortcut", Style::default().fg(palette.muted)),
     ]));
 
+    // No wrap: each command is one row (width-clamped). Wrap would split
+    // name/desc/shortcut across lines and hide later entries.
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel_block(" commands ", palette))
-            .style(Style::default().bg(palette.surface))
-            .wrap(Wrap { trim: false }),
+            .style(Style::default().bg(palette.surface)),
         area,
     );
 }
@@ -8859,8 +8866,14 @@ fn command_palette_section_header(
     let accent = section.color(palette);
     let label = format!(" {} {} ", section.icon(), section.title());
     let label_w = UnicodeWidthStr::width(label.as_str());
-    let rule = "─".repeat(width.saturating_sub(label_w).saturating_sub(2).max(2));
-    Line::from(vec![
+    let rule_cols = width.saturating_sub(1 + label_w + 1);
+    let rule = if rule_cols == 0 {
+        String::new()
+    } else {
+        format!(" {}", "─".repeat(rule_cols.saturating_sub(1).max(1)))
+    };
+    // Keep header on one row: clamp total display width.
+    let mut line = Line::from(vec![
         Span::styled(" ", Style::default().fg(accent)),
         Span::styled(
             label,
@@ -8869,8 +8882,125 @@ fn command_palette_section_header(
                 .bg(palette.surface_alt)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" {rule}"), Style::default().fg(accent)),
-    ])
+        Span::styled(rule, Style::default().fg(accent)),
+    ]);
+    clamp_line_to_width(&mut line, width, Style::default().fg(accent));
+    line
+}
+
+/// One command row, forced to a single line of exactly `width` columns.
+fn command_palette_entry_line(
+    entry: &CommandPaletteEntry,
+    active: bool,
+    prefix_label: &str,
+    width: usize,
+    palette: ThemePalette,
+) -> Line<'static> {
+    let section_color = entry.section.color(palette);
+    let shortcut = palette_shortcut(entry.action)
+        .map(|key| format!("{prefix_label} {key}"))
+        .unwrap_or_else(|| "·".to_string());
+    let shortcut_w = UnicodeWidthStr::width(shortcut.as_str());
+
+    // Layout: [2 prefix][icon+1][name 16][1][desc flex][pad][shortcut]
+    // Prefix is always width 2 so active/inactive columns align.
+    let prefix = if active { "› " } else { "  " };
+    let icon = entry.icon;
+    let icon_w = UnicodeWidthStr::width(icon).max(1);
+    const NAME_COLS: usize = 16;
+    let name = pad_to_width(&truncate_to_width(entry.name, NAME_COLS), NAME_COLS);
+
+    // Budget for description: everything left after fixed columns + shortcut.
+    // prefix(2) + icon + space(1) + name + space(1) + shortcut
+    let fixed = 2 + icon_w + 1 + NAME_COLS + 1 + shortcut_w;
+    let desc_budget = width.saturating_sub(fixed);
+    let desc = if desc_budget == 0 {
+        String::new()
+    } else {
+        truncate_to_width(entry.description, desc_budget)
+    };
+    let desc_w = UnicodeWidthStr::width(desc.as_str());
+    let used = 2 + icon_w + 1 + NAME_COLS + 1 + desc_w + shortcut_w;
+    let pad = width.saturating_sub(used);
+
+    if active {
+        let base = selected_row_style(palette);
+        let mut line = Line::from(vec![
+            Span::styled(
+                prefix.to_string(),
+                Style::default()
+                    .fg(section_color)
+                    .bg(palette.hover)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{icon} "),
+                Style::default()
+                    .fg(section_color)
+                    .bg(palette.hover)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(name, base.add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {desc}"), base),
+            Span::styled(" ".repeat(pad), base),
+            Span::styled(
+                shortcut,
+                Style::default()
+                    .fg(palette.on_bright)
+                    .bg(palette.hover)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        clamp_line_to_width(&mut line, width, base);
+        line
+    } else {
+        let mut line = Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(palette.muted)),
+            Span::styled(format!("{icon} "), Style::default().fg(section_color)),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(section_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {desc}"), Style::default().fg(palette.text)),
+            Span::styled(" ".repeat(pad), Style::default()),
+            Span::styled(shortcut, Style::default().fg(palette.muted)),
+        ]);
+        clamp_line_to_width(&mut line, width, Style::default());
+        line
+    }
+}
+
+/// Ensure a multi-span line does not exceed `width` display columns.
+fn clamp_line_to_width(line: &mut Line<'static>, width: usize, pad_style: Style) {
+    let mut used = 0usize;
+    let mut keep = 0usize;
+    for (i, span) in line.spans.iter().enumerate() {
+        let w = UnicodeWidthStr::width(span.content.as_ref());
+        if used + w > width {
+            // Truncate this span to the remaining budget.
+            let remain = width.saturating_sub(used);
+            let content = truncate_to_width(span.content.as_ref(), remain);
+            let style = span.style;
+            line.spans.truncate(i);
+            if remain > 0 {
+                line.spans.push(Span::styled(content, style));
+            }
+            keep = line.spans.len();
+            used = width;
+            break;
+        }
+        used += w;
+        keep = i + 1;
+    }
+    if keep < line.spans.len() {
+        line.spans.truncate(keep);
+    }
+    if used < width {
+        line.spans
+            .push(Span::styled(" ".repeat(width - used), pad_style));
+    }
 }
 
 fn command_palette_lines(
@@ -8879,6 +9009,7 @@ fn command_palette_lines(
     prefix_label: &str,
     width: u16,
     theme: UiTheme,
+    max_lines: usize,
 ) -> Vec<Line<'static>> {
     let palette = theme.palette();
     if entries.is_empty() {
@@ -8893,82 +9024,107 @@ fn command_palette_lines(
             )),
         ];
     }
-    let width = width as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut last_section: Option<CommandPaletteSection> = None;
+    let width = (width as usize).max(20);
+    let max_lines = max_lines.max(1);
+    let selected = selected.min(entries.len() - 1);
 
+    // Build the full list (each command is exactly one row), then take a
+    // viewport window that keeps the selection visible.
+    let mut all: Vec<Line<'static>> = Vec::new();
+    let mut selected_line = 0usize;
+    let mut last_section: Option<CommandPaletteSection> = None;
     for (command_index, entry) in entries.iter().enumerate() {
         if last_section != Some(entry.section) {
             if last_section.is_some() {
-                // Breathing room between sections.
-                lines.push(Line::from(Span::raw("")));
+                all.push(Line::from(Span::raw("")));
             }
-            lines.push(command_palette_section_header(
+            all.push(command_palette_section_header(
                 entry.section,
                 width,
                 palette,
             ));
             last_section = Some(entry.section);
         }
+        if command_index == selected {
+            selected_line = all.len();
+        }
+        all.push(command_palette_entry_line(
+            entry,
+            command_index == selected,
+            prefix_label,
+            width,
+            palette,
+        ));
+    }
 
-        let active = command_index == selected;
-        let section_color = entry.section.color(palette);
-        let shortcut = palette_shortcut(entry.action)
-            .map(|key| format!("{prefix_label} {key}"))
-            .unwrap_or_else(|| "·".to_string());
+    if all.len() <= max_lines {
+        return all;
+    }
 
-        let marker = if active { "›" } else { " " };
-        let icon = entry.icon;
-        let name = trim_label(entry.name, 18);
-        // Pad name to a fixed column so descriptions line up.
-        let name_pad = 18usize.saturating_sub(UnicodeWidthStr::width(name.as_str()));
-        let name_col = format!("{name}{}", " ".repeat(name_pad));
-        let desc = trim_label(entry.description, 48);
+    // Reserve rows for scroll hints when content is clipped.
+    // First assume both hints, then shrink if one side is flush.
+    let mut start = selected_line.saturating_sub((max_lines.saturating_sub(2)) / 3);
+    let mut end = start + max_lines.saturating_sub(2);
+    if end > all.len() {
+        end = all.len();
+        start = end.saturating_sub(max_lines.saturating_sub(2));
+    }
+    // Pull window so selected is inside [start, end).
+    if selected_line < start {
+        start = selected_line;
+        end = (start + max_lines.saturating_sub(2)).min(all.len());
+    } else if selected_line >= end {
+        end = selected_line + 1;
+        start = end.saturating_sub(max_lines.saturating_sub(2));
+    }
 
-        // Build left content for width accounting (marker + spaces + icon + name + desc).
-        let left_plain = format!("{marker} {icon} {name_col} {desc}");
-        let used =
-            UnicodeWidthStr::width(left_plain.as_str()) + UnicodeWidthStr::width(shortcut.as_str());
-        let pad = width.saturating_sub(used).max(1);
-
-        if active {
-            let base = selected_row_style(palette);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("▌{marker} {icon} "),
-                    Style::default()
-                        .fg(section_color)
-                        .bg(palette.hover)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(name_col.clone(), base.add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {desc}"), base),
-                Span::styled(" ".repeat(pad), base),
-                Span::styled(
-                    shortcut,
-                    Style::default()
-                        .fg(palette.on_bright)
-                        .bg(palette.hover)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
+    let show_above = start > 0;
+    let show_below = end < all.len();
+    // Grow the body if a hint slot is unused.
+    let hints = usize::from(show_above) + usize::from(show_below);
+    let body = max_lines.saturating_sub(hints).max(1);
+    if end - start < body {
+        let extra = body - (end - start);
+        if !show_below {
+            start = start.saturating_sub(extra);
+        } else if !show_above {
+            end = (end + extra).min(all.len());
         } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {marker} "), Style::default().fg(palette.muted)),
-                Span::styled(format!("{icon} "), Style::default().fg(section_color)),
-                Span::styled(
-                    name_col,
-                    Style::default()
-                        .fg(section_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {desc}"), Style::default().fg(palette.text)),
-                Span::styled(" ".repeat(pad), Style::default()),
-                Span::styled(shortcut, Style::default().fg(palette.muted)),
-            ]));
+            // Prefer extending downward, then upward.
+            let down = extra.min(all.len() - end);
+            end += down;
+            start = start.saturating_sub(extra - down);
         }
     }
-    lines
+    // Re-check selected after growth.
+    if selected_line < start {
+        start = selected_line;
+    }
+    if selected_line >= end {
+        end = selected_line + 1;
+        start = end.saturating_sub(body);
+    }
+    end = end.min(all.len());
+    start = start.min(end.saturating_sub(1));
+
+    let mut out = Vec::with_capacity(max_lines);
+    if start > 0 {
+        out.push(Line::from(Span::styled(
+            "  ↑ more above".to_string(),
+            Style::default().fg(palette.muted),
+        )));
+    }
+    out.extend(all[start..end].iter().cloned());
+    if end < all.len() {
+        out.push(Line::from(Span::styled(
+            "  ↓ more below".to_string(),
+            Style::default().fg(palette.muted),
+        )));
+    }
+    if out.len() > max_lines {
+        out.truncate(max_lines);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11096,7 +11252,8 @@ mod tests {
     #[test]
     fn command_palette_lines_include_selection_and_descriptions() {
         let entries = filter_command_entries("");
-        let lines = command_palette_lines(&entries, 0, "Ctrl-b", 80, UiTheme::Midnight);
+        // Tall budget so the full list is visible.
+        let lines = command_palette_lines(&entries, 0, "Ctrl-b", 80, UiTheme::Midnight, 200);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert!(!texts.is_empty());
         // First line is the section header for the selected entry's group.
@@ -11124,8 +11281,57 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_rows_stay_on_one_line() {
+        let entries = filter_command_entries("");
+        let width = 60u16;
+        let lines = command_palette_lines(&entries, 0, "Ctrl-b", width, UiTheme::Midnight, 200);
+        for line in &lines {
+            let text = line_text(line);
+            let w = UnicodeWidthStr::width(text.as_str());
+            // Empty spacer rows between sections may be shorter; command rows
+            // and headers are padded/clamped to the panel width.
+            if text.trim().is_empty() {
+                continue;
+            }
+            assert!(
+                w <= width as usize,
+                "row wider than panel ({w} > {width}): {text:?}"
+            );
+            // Command rows (have › or leading spaces + icon) must be single-line
+            // and not contain raw newlines.
+            assert!(!text.contains('\n'), "wrapped row: {text:?}");
+        }
+        // Selected command row is exactly one line and contains its shortcut.
+        let selected = lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains('›') && t.contains("split-right"))
+            .expect("selected split-right");
+        assert_eq!(UnicodeWidthStr::width(selected.as_str()), width as usize);
+    }
+
+    #[test]
+    fn command_palette_windows_around_selection() {
+        let entries = filter_command_entries("");
+        assert!(entries.len() > 10);
+        // Tiny budget forces scrolling; last entry must still be reachable.
+        let last = entries.len() - 1;
+        let lines = command_palette_lines(&entries, last, "Ctrl-b", 80, UiTheme::Midnight, 8);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains(entries[last].name)),
+            "selected tail entry missing from window: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("more above")),
+            "expected scroll hint when windowed: {texts:?}"
+        );
+        assert!(lines.len() <= 8, "window exceeded budget: {}", lines.len());
+    }
+
+    #[test]
     fn command_palette_lines_report_no_matches_when_empty() {
-        let lines = command_palette_lines(&[], 0, "Ctrl-b", 80, UiTheme::Midnight);
+        let lines = command_palette_lines(&[], 0, "Ctrl-b", 80, UiTheme::Midnight, 20);
         assert_eq!(lines.len(), 2);
         assert!(line_text(&lines[0]).contains("(no matches)"));
         assert!(line_text(&lines[1]).contains("Esc clears"));
