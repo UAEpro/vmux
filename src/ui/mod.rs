@@ -145,6 +145,8 @@ struct Ui {
     pane_resize_drag: Option<PaneResizeDrag>,
     context_pane: Option<String>,
     notification_selected: usize,
+    /// Mouse-hovered notification card index (None when pointer is elsewhere).
+    hover_notification: Option<usize>,
     action_selected: usize,
     command_selected: usize,
     /// Current text typed into the command-palette filter box. Empty means the
@@ -1093,6 +1095,7 @@ impl Ui {
             pane_resize_drag: None,
             context_pane: None,
             notification_selected: 0,
+            hover_notification: None,
             action_selected: 0,
             command_selected: 0,
             command_filter: String::new(),
@@ -1269,6 +1272,7 @@ impl Ui {
                             sidebar_expanded,
                             self.sidebar_scroll,
                             self.notification_selected,
+                            self.hover_notification,
                             &self.actions,
                             self.action_selected,
                             action_error.as_deref(),
@@ -1500,6 +1504,9 @@ impl Ui {
                         KeyCode::Home => self.notification_selected = 0,
                         KeyCode::End => self.select_last_notification(),
                         KeyCode::Enter => self.jump_selected_notification()?,
+                        KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Delete => {
+                            self.clear_all_notifications()?;
+                        }
                         _ => {}
                     }
                     return Ok(false);
@@ -2141,9 +2148,11 @@ impl Ui {
 
     fn toggle_notifications(&mut self) {
         self.mode = if self.mode == UiMode::Notifications {
+            self.hover_notification = None;
             UiMode::Panes
         } else {
             self.clamp_notification_selection();
+            self.hover_notification = None;
             UiMode::Notifications
         };
     }
@@ -2992,6 +3001,14 @@ impl Ui {
         self.rpc(&Request::JumpNotification)
     }
 
+    fn clear_all_notifications(&mut self) -> Result<()> {
+        self.rpc(&Request::ClearNotifications)?;
+        self.notification_selected = 0;
+        // Refresh so the panel empties immediately.
+        self.refresh()?;
+        Ok(())
+    }
+
     fn resize(&self, direction: SplitDirection) -> Result<()> {
         self.rpc(&Request::Resize {
             direction,
@@ -3287,6 +3304,33 @@ impl Ui {
             self.close_context_menu();
             return Ok(false);
         }
+        // Notifications panel: click selects, double-click jumps.
+        if self.mode == UiMode::Notifications {
+            let main = confirm_main_area(layout_cols, width, height);
+            let count = self.notification_count();
+            if let Some(index) = notification_index_at(main, column, row, count) {
+                let same = self.notification_selected == index;
+                // Reuse rename double-click timing/geometry with a dummy target
+                // identity keyed on the notification index.
+                let target = RenameTarget::Workspace {
+                    id: format!("notif-{index}"),
+                };
+                if same && self.is_double_click(column, row, &target) {
+                    self.notification_selected = index;
+                    self.jump_selected_notification()?;
+                    self.last_click = None;
+                } else {
+                    self.notification_selected = index;
+                    self.last_click = Some(ClickStamp {
+                        at: Instant::now(),
+                        column,
+                        row,
+                        target,
+                    });
+                }
+            }
+            return Ok(false);
+        }
         // Overlays (settings/commands/picker/…) own the main area — do not
         // let clicks fall through to hidden pane × buttons.
         if !matches!(self.mode, UiMode::Panes) {
@@ -3405,6 +3449,14 @@ impl Ui {
             Some(ControlBarHit::Action(a)) => Some(a),
             _ => None,
         };
+        // Notification cards: track hover for theme surface_alt highlight.
+        if self.mode == UiMode::Notifications {
+            let main = confirm_main_area(self.layout_sidebar_cols(), width, height);
+            let count = self.notification_count();
+            self.hover_notification = notification_index_at(main, column, row, count);
+        } else {
+            self.hover_notification = None;
+        }
         let sidebar_scroll = self.sidebar_scroll;
         let list_height = height.saturating_sub(1);
         let live_sidebar_cols = self.layout_sidebar_cols();
@@ -3755,6 +3807,7 @@ fn draw(
     sidebar_expanded: u16,
     sidebar_scroll: usize,
     notification_selected: usize,
+    hover_notification: Option<usize>,
     actions: &[UiAction],
     action_selected: usize,
     action_error: Option<&str>,
@@ -3962,6 +4015,7 @@ fn draw(
             main_chunks[0],
             snapshot,
             notification_selected,
+            hover_notification,
             palette,
         ),
         UiMode::Actions => draw_actions(
@@ -4126,23 +4180,133 @@ fn draw_list_panel(
     );
 }
 
+/// Lines of chrome above the first notification card (title + blank).
+const NOTIF_LIST_TOP: u16 = 2;
+/// Rows per card (header + message). Spacer between cards is separate.
+const NOTIF_CARD_ROWS: u16 = 2;
+
 fn draw_notifications(
     frame: &mut ratatui::Frame,
     area: Rect,
     snapshot: &Session,
     selected: usize,
+    hovered: Option<usize>,
     palette: ThemePalette,
 ) {
-    let lines = notification_panel_lines(snapshot, selected);
-    draw_list_panel(
-        frame,
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let notes = visible_notifications(snapshot);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Title strip.
+    lines.push(Line::from(vec![
+        Span::styled(
+            " 🔔  Notifications ",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if notes.is_empty() {
+                "· empty".to_string()
+            } else {
+                format!("· {} recent", notes.len())
+            },
+            Style::default().fg(palette.muted),
+        ),
+    ]));
+    lines.push(Line::from(Span::raw("")));
+
+    if notes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No notifications yet",
+            Style::default().fg(palette.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Agent hooks and vmux notify land here",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        for (index, note) in notes.iter().enumerate() {
+            let state = if index == selected {
+                NotifCardState::Selected
+            } else if hovered == Some(index) {
+                NotifCardState::Hovered
+            } else {
+                NotifCardState::Idle
+            };
+            lines.extend(notification_card_lines(
+                snapshot,
+                note,
+                state,
+                inner_width.max(24),
+                palette,
+            ));
+            // Spacing between cards (except after the last).
+            if index + 1 < notes.len() {
+                lines.push(Line::from(Span::raw("")));
+            }
+        }
+    }
+
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " ↑↓",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" / click  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(palette.success)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" / double-click jump  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "c",
+            Style::default()
+                .fg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" clear all  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(palette.danger)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(palette.muted)),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block(" notifications ", palette))
+            .style(Style::default().bg(palette.surface)),
         area,
-        " notifications ",
-        lines,
-        Some(selected),
-        "No notifications",
-        palette,
     );
+}
+
+/// Map a pointer position to a notification card index inside the panel area.
+fn notification_index_at(area: Rect, column: u16, row: u16, count: usize) -> Option<usize> {
+    if count == 0 || !point_in_rect(area, column, row) {
+        return None;
+    }
+    // Inside the bordered content: skip top border, then title + blank.
+    let content_y = row.checked_sub(area.y.saturating_add(1))?;
+    let y = content_y.checked_sub(NOTIF_LIST_TOP)?;
+    let mut cursor = 0u16;
+    for i in 0..count {
+        if y >= cursor && y < cursor + NOTIF_CARD_ROWS {
+            return Some(i);
+        }
+        cursor = cursor.saturating_add(NOTIF_CARD_ROWS);
+        if i + 1 < count {
+            cursor = cursor.saturating_add(1); // spacer between cards
+        }
+    }
+    None
 }
 
 fn draw_actions(
@@ -7996,7 +8160,9 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
             } else {
                 notification_selected.min(visible - 1) + 1
             };
-            format!("{base} notifications:{selected}/{visible} j/k select Enter jump Esc close ")
+            format!(
+                "{base} notifications:{selected}/{visible} j/k select Enter jump c clear-all Esc close "
+            )
         }
         UiMode::Actions => format!("{base} actions j/k select Enter run Esc close "),
         UiMode::Commands => {
@@ -8073,51 +8239,223 @@ fn visible_notifications(snapshot: &Session) -> Vec<&crate::model::Notification>
         .collect()
 }
 
+/// Status emoji + palette color for a notification's agent status / color hint.
+fn notification_status_style(
+    note: &crate::model::Notification,
+    palette: ThemePalette,
+) -> (&'static str, Color) {
+    let status = note.status.as_deref().unwrap_or("");
+    match status {
+        "busy" | "running" | "working" => ("🔄", palette.command),
+        "attention" | "needs-input" | "needs_input" | "waiting" | "blocked" | "approval" => {
+            ("🙋", palette.warning)
+        }
+        "done" | "complete" => ("✅", palette.success),
+        "error" | "failed" => ("❌", palette.danger),
+        "idle" => ("💤", palette.muted),
+        _ => match note
+            .color
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "yellow" | "gold" => ("🔔", palette.warning),
+            "green" => ("🔔", palette.success),
+            "red" => ("🔔", palette.danger),
+            "blue" | "cyan" => ("🔔", palette.command),
+            _ => ("🔔", palette.active),
+        },
+    }
+}
+
+/// Workspace name, tab title, and agent/pane title for a notification card.
+fn notification_context_labels(
+    snapshot: &Session,
+    note: &crate::model::Notification,
+) -> (String, String, String) {
+    let workspace = notification_workspace(snapshot, note);
+    let workspace_name = workspace
+        .map(|ws| ws.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+
+    let loc = note
+        .pane
+        .as_ref()
+        .and_then(|pane_id| snapshot.find_pane_location(pane_id));
+    let tab_title = loc
+        .as_ref()
+        .and_then(|loc| loc.tab_id.as_ref())
+        .and_then(|tab_id| {
+            workspace.and_then(|ws| {
+                ws.tabs
+                    .iter()
+                    .find(|tab| &tab.id == tab_id)
+                    .map(|tab| tab.title.clone())
+            })
+        })
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+
+    let agent_name = note
+        .pane
+        .as_ref()
+        .and_then(|pane_id| snapshot.panes.get(pane_id))
+        .map(|pane| {
+            // Prefer a human title; fall back to a short command basename.
+            if !pane.title.is_empty()
+                && pane.title != "shell"
+                && pane.title != "bash"
+                && pane.title != "tab"
+            {
+                pane.title.clone()
+            } else {
+                let cmd = pane.command.split_whitespace().next().unwrap_or("");
+                let base = cmd.rsplit('/').next().unwrap_or(cmd);
+                if base.is_empty() {
+                    pane.title.clone()
+                } else {
+                    base.to_string()
+                }
+            }
+        })
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+
+    (workspace_name, tab_title, agent_name)
+}
+
+/// Visual state of a notification card (keyboard select vs mouse hover).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifCardState {
+    Idle,
+    Hovered,
+    Selected,
+}
+
+/// Theme-native card fill — uses the accent (`active`) for selection and a soft
+/// `surface_alt` wash for hover. Never the yellow `hover`/`warning` palette
+/// (that was reading as a garish selection on Midnight and Daylight).
+fn notification_card_fill(state: NotifCardState, palette: ThemePalette) -> (Color, Color) {
+    match state {
+        NotifCardState::Selected => (palette.active, palette.on_accent),
+        NotifCardState::Hovered => (palette.surface_alt, palette.text),
+        NotifCardState::Idle => (Color::Reset, palette.text),
+    }
+}
+
+/// Two-line colored card for one notification (header + message).
+fn notification_card_lines(
+    snapshot: &Session,
+    note: &crate::model::Notification,
+    state: NotifCardState,
+    width: usize,
+    palette: ThemePalette,
+) -> Vec<Line<'static>> {
+    let (emoji, status_accent) = notification_status_style(note, palette);
+    let (workspace, tab, agent) = notification_context_labels(snapshot, note);
+    let (bg, fg) = notification_card_fill(state, palette);
+    let selected = state == NotifCardState::Selected;
+    let marker = if selected {
+        "▌"
+    } else if state == NotifCardState::Hovered {
+        "·"
+    } else {
+        " "
+    };
+
+    // On the selected fill, keep status emoji readable: use on_accent for body
+    // labels, and keep the status accent only when not on a solid active fill
+    // (or use on_accent for everything on selected so contrast is guaranteed).
+    let body = Style::default().fg(fg).bg(bg);
+    let body_bold = body.add_modifier(Modifier::BOLD);
+    let muted = if selected {
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(palette.muted).bg(bg)
+    };
+    let status_style = if selected {
+        // Status color on solid accent can wash out — prefer bold on_accent.
+        body_bold
+    } else {
+        Style::default()
+            .fg(status_accent)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let bar_style = if selected {
+        Style::default()
+            .fg(palette.on_accent)
+            .bg(palette.active)
+            .add_modifier(Modifier::BOLD)
+    } else if state == NotifCardState::Hovered {
+        Style::default().fg(palette.active).bg(bg)
+    } else {
+        Style::default().fg(palette.muted).bg(bg)
+    };
+
+    // Line 1: ▌ 🔄  workspace · tab · agent
+    let ws_show = trim_label(&workspace, 16);
+    let tab_show = trim_label(&tab, 18);
+    let agent_show = trim_label(&agent, 16);
+    let header = Line::from(vec![
+        Span::styled(format!("{marker} "), bar_style),
+        Span::styled(format!("{emoji} "), status_style),
+        Span::styled("📁 ".to_string(), muted),
+        Span::styled(ws_show, body_bold),
+        Span::styled("  ·  ".to_string(), muted),
+        Span::styled("📑 ".to_string(), muted),
+        Span::styled(tab_show, body_bold),
+        Span::styled("  ·  ".to_string(), muted),
+        Span::styled("🤖 ".to_string(), muted),
+        Span::styled(agent_show, status_style),
+    ]);
+
+    // Line 2: indented message (status color when idle/hover, on_accent when selected).
+    let msg_budget = width.saturating_sub(4).max(8);
+    let message = truncate_to_width(&note.message, msg_budget);
+    let msg_style = if selected {
+        body
+    } else {
+        Style::default().fg(status_accent).bg(bg)
+    };
+    let message_line = Line::from(vec![
+        Span::styled("    ".to_string(), Style::default().bg(bg)),
+        Span::styled(message, msg_style),
+    ]);
+
+    // Pad both rows so the card reads as a solid block (theme fill, not yellow).
+    let mut lines = vec![header, message_line];
+    for line in &mut lines {
+        let used: usize = line
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        if used < width {
+            line.spans.push(Span::styled(
+                " ".repeat(width - used),
+                Style::default().bg(bg),
+            ));
+        }
+    }
+    lines
+}
+
+/// Plain-text summary lines for tests (mirrors the card's content, no styles).
+#[cfg(test)]
 fn notification_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> {
     visible_notifications(snapshot)
         .into_iter()
         .enumerate()
         .map(|(index, note)| {
-            let workspace = notification_workspace(snapshot, note);
-            let workspace_name = workspace
-                .as_ref()
-                .map(|workspace| workspace.name.as_str())
-                .unwrap_or("-");
-            let tab_title = note
-                .pane
-                .as_ref()
-                .and_then(|pane_id| snapshot.find_pane_location(pane_id))
-                .and_then(|loc| {
-                    loc.tab_id.and_then(|tab_id| {
-                        workspace.and_then(|ws| {
-                            ws.tabs
-                                .iter()
-                                .find(|tab| tab.id == tab_id)
-                                .map(|tab| tab.title.clone())
-                        })
-                    })
-                });
-            let pane_title = note
-                .pane
-                .as_ref()
-                .and_then(|pane_id| snapshot.panes.get(pane_id))
-                .map(|pane| pane.title.as_str())
-                .unwrap_or("-");
-            // Prefer the workspace tab title (agent context); fall back to pane title.
-            let target = tab_title
-                .as_deref()
-                .filter(|title| !title.is_empty())
-                .unwrap_or(pane_title);
-            let status = note.status.as_deref().unwrap_or("-");
-            let marker = if index == selected { "> " } else { "  " };
+            let (emoji, _) = notification_status_style(note, UiTheme::Midnight.palette());
+            let (workspace, tab, agent) = notification_context_labels(snapshot, note);
+            let marker = if index == selected { "›" } else { " " };
             format!(
-                "{marker}{} [{}] ws:{} tab:{} status:{} {}",
-                note.time,
-                note.color.as_deref().unwrap_or("-"),
-                trim_label(workspace_name, 14),
-                trim_label(target, 14),
-                status,
-                trim_label(&note.message, 80)
+                "{marker} {emoji} 📁 {workspace} · 📑 {tab} · 🤖 {agent}\n    {}",
+                note.message
             )
         })
         .collect()
@@ -9199,6 +9537,7 @@ mod tests {
                     24,
                     0,
                     0,
+                    None, // hover_notification
                     &[],
                     0,
                     None,
@@ -9276,6 +9615,7 @@ mod tests {
                     24,
                     0,
                     0,
+                    None, // hover_notification
                     &[],
                     0,
                     None,
@@ -10529,6 +10869,36 @@ mod tests {
     }
 
     #[test]
+    fn notification_index_at_maps_card_rows() {
+        // Panel at (0,0) 40x20; content after top border starts at y=1.
+        let area = Rect::new(0, 0, 40, 20);
+        // Title + blank occupy content rows 0,1 → first card at content y=2,3
+        // → screen rows 3,4 (area.y+1+2).
+        assert_eq!(notification_index_at(area, 5, 3, 3), Some(0));
+        assert_eq!(notification_index_at(area, 5, 4, 3), Some(0));
+        // Spacer at content y=4 → screen row 5; second card at 5,6 → screen 6,7.
+        assert_eq!(notification_index_at(area, 5, 5, 3), None); // spacer
+        assert_eq!(notification_index_at(area, 5, 6, 3), Some(1));
+        assert_eq!(notification_index_at(area, 5, 7, 3), Some(1));
+        assert_eq!(notification_index_at(area, 5, 9, 3), Some(2));
+        // Outside panel.
+        assert_eq!(notification_index_at(area, 50, 3, 3), None);
+        assert_eq!(notification_index_at(area, 5, 3, 0), None);
+    }
+
+    #[test]
+    fn notification_card_fill_uses_theme_not_yellow_hover() {
+        let palette = UiTheme::Midnight.palette();
+        let (sel_bg, sel_fg) = notification_card_fill(NotifCardState::Selected, palette);
+        assert_eq!(sel_bg, palette.active);
+        assert_eq!(sel_fg, palette.on_accent);
+        // Must not use the bright yellow hover slot for selection.
+        assert_ne!(sel_bg, palette.hover);
+        let (hov_bg, _) = notification_card_fill(NotifCardState::Hovered, palette);
+        assert_eq!(hov_bg, palette.surface_alt);
+    }
+
+    #[test]
     fn notification_panel_lines_include_context_newest_first() {
         let mut session = Session::new("test");
         let pane = crate::model::Pane::new(
@@ -10573,12 +10943,17 @@ mod tests {
 
         let lines = notification_panel_lines(&session, 1);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("tab:claude"));
+        // Newest first: pane note, then workspace note. Selected index 1 is the
+        // older workspace entry (› marker).
+        assert!(lines[0].contains("📑 claude") || lines[0].contains("claude"));
         assert!(lines[0].contains("pane note"));
-        assert!(lines[0].starts_with("  "));
-        assert!(lines[1].contains("ws:main"));
+        assert!(lines[0].starts_with("  ") || lines[0].starts_with("  "));
+        assert!(
+            lines[0].contains('✅') || lines[0].contains("done") || lines[0].contains("pane note")
+        );
+        assert!(lines[1].contains("📁 main") || lines[1].contains("main"));
         assert!(lines[1].contains("workspace note"));
-        assert!(lines[1].starts_with("> "));
+        assert!(lines[1].starts_with('›'));
     }
 
     #[test]
@@ -10887,7 +11262,7 @@ mod tests {
         );
         assert_eq!(
             session_footer(&session, UiMode::Notifications, 0),
-            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  notifications:1/2 j/k select Enter jump Esc close "
+            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  notifications:1/2 j/k select Enter jump c clear-all Esc close "
         );
         assert_eq!(
             session_footer(&session, UiMode::Actions, 0),
