@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vmux Support</title><meta name="description" content="Get help with vmux and vmux Remote, diagnose a connection, or report a problem." /><meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/support.html" /><link rel="icon" href="assets/favicon.png" /><link rel="manifest" href="site.webmanifest" /><link rel="stylesheet" href="assets/site.css" /><script src="assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header><div class="shell nav-wrap"><a class="brand" href="index.html" aria-label="vmux home"><img src="assets/logo.png" alt="" width="40" height="40" /><span>vmux</span></a><button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle><span></span><span></span><span class="sr-only">Open navigation</span></button><nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav><a href="index.html#features">Features</a><a href="remote.html">Remote</a><a href="install.html">Install</a><a href="https://github.com/UAEpro/vmux">Docs</a><a class="nav-github" href="https://github.com/UAEpro/vmux"><span>GitHub ↗</span></a></nav></div></header>
+    <main id="main" class="page-main">
+      <section class="page-hero shell reveal"><p class="eyebrow">Support</p><h1>Let’s get you <span>attached.</span></h1><p>Start with the diagnostics below. If vmux still misbehaves, send the output with a short description of what you expected.</p></section>
+      <section class="content-page">
+        <div class="support-grid">
+          <article class="support-card reveal"><span class="feature-number">Email</span><h2>Talk to a person</h2><p>For app, account-free pairing, or general help, email <a href="mailto:me@uaepro.me?subject=vmux%20support">me@uaepro.me</a>.</p></article>
+          <article class="support-card reveal"><span class="feature-number">GitHub</span><h2>Report a reproducible issue</h2><p>Open a <a href="https://github.com/UAEpro/vmux/issues/new">GitHub issue</a> for CLI bugs, feature requests, and relay compatibility.</p></article>
+        </div>
+        <h2>Run a quick health check</h2>
+        <div class="diagnostic-list">
+          <div><code>vmux doctor</code><span>checks the local environment and session state</span></div>
+          <div><code>vmux status</code><span>shows whether the vmux daemon is reachable</span></div>
+          <div><code>vmux relay status</code><span>checks the phone relay</span></div>
+          <div><code>tailscale status</code><span>confirms both devices are on the tailnet</span></div>
+        </div>
+        <h2>Remote cannot connect</h2><ol><li>Confirm Tailscale is connected on both the host and phone.</li><li>Run <code>vmux relay serve</code> on the host and keep it running.</li><li>Use the address returned by <code>tailscale ip -4</code> and port <code>4399</code>.</li><li>Check reachability with <code>curl -s http://$(tailscale ip -4):4399/v1/health</code>.</li></ol>
+        <h2>Include these details</h2><p>Tell us your vmux version, operating system, install method, the command you ran, and any relevant terminal output. Please remove secrets, device tokens, private hostnames, and terminal contents before sharing logs.</p>
+        <div class="info-card"><strong>Lost a paired phone?</strong><p>List paired devices with <code>vmux relay devices list</code>, then revoke it with <code>vmux relay devices revoke &lt;device_id&gt;</code>.</p></div>
+      </section>
+    </main>
+    <footer class="site-footer"><div class="shell footer-grid"><div><a class="brand" href="index.html"><img src="assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a><p>The agent-first terminal multiplexer.</p></div><div class="footer-links"><div><strong>Product</strong><a href="index.html#features">Features</a><a href="remote.html">Remote</a><a href="install.html">Install</a></div><div><strong>Resources</strong><a href="https://github.com/UAEpro/vmux">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="support.html">Support</a></div><div><strong>Legal</strong><a href="privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div></div></div><div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div></footer>
+  </body>
+</html>

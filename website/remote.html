@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vmux Remote — Your terminal in your pocket</title>
+    <meta name="description" content="Check vmux workspaces, answer agents, and drive live terminal panes from iPhone or iPad over your own Tailscale network." />
+    <meta name="theme-color" content="#070b09" />
+    <meta property="og:title" content="vmux Remote — Your terminal in your pocket" />
+    <meta property="og:description" content="A direct, private companion for your vmux workspaces." />
+    <meta property="og:image" content="https://vmux.sh/assets/og-card.png" />
+    <link rel="canonical" href="https://vmux.sh/remote.html" />
+    <link rel="icon" href="assets/favicon.png" />
+    <link rel="manifest" href="site.webmanifest" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script src="assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="index.html" aria-label="vmux home"><img src="assets/logo.png" alt="" width="40" height="40" /><span>vmux</span></a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle><span></span><span></span><span class="sr-only">Open navigation</span></button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="index.html#features">Features</a><a href="remote.html" aria-current="page">Remote</a><a href="install.html">Install</a><a href="https://github.com/UAEpro/vmux">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux"><span>GitHub ↗</span></a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main">
+      <section class="page-hero shell reveal">
+        <p class="eyebrow"><span class="live-dot"></span> vmux Remote</p>
+        <h1>Your terminal.<br /><span>In your pocket.</span></h1>
+        <p>Keep an eye on every agent, open a live pane, and send the answer from your iPhone or iPad—without routing terminal data through a vmux cloud.</p>
+        <div class="hero-actions hero-actions-centered"><a class="button button-primary" href="#setup">Set up the relay</a><span class="availability">iPhone &amp; iPad · coming soon</span></div>
+      </section>
+
+      <section class="shell reveal" aria-label="vmux Remote app previews">
+        <div class="remote-page-stage">
+          <figure class="phone-shot phone-back"><img src="assets/remote-workspaces.png" alt="Workspace list in vmux Remote with agent status" /></figure>
+          <figure class="phone-shot phone-front"><img src="assets/remote-terminal.png" alt="Live terminal pane in vmux Remote" /></figure>
+          <figure class="phone-shot phone-third"><img src="assets/remote-activity.png" alt="Recent agent activity in vmux Remote" /></figure>
+        </div>
+      </section>
+
+      <section class="content-page remote-content">
+        <div class="section-heading centered reveal">
+          <p class="eyebrow">Made for the handoff</p>
+          <h2>Know when an agent <span>needs you.</span></h2>
+          <p>Remote mirrors the workspace model you already use in vmux. Browse sessions, see live state, and interact with the exact pane that needs attention.</p>
+        </div>
+        <div class="remote-feature-grid">
+          <article class="info-card reveal"><span class="feature-number">01</span><h3>One glance, every workspace</h3><p>Busy, needs input, done, and failed states stay visible until you visit the pane.</p></article>
+          <article class="info-card reveal"><span class="feature-number">02</span><h3>A terminal made for touch</h3><p>Send input, use essential control keys, and switch panes without fighting a desktop-sized interface.</p></article>
+          <article class="info-card reveal"><span class="feature-number">03</span><h3>Direct by design</h3><p>Your phone connects to the relay on your host over Tailscale or a local network. There is no vmux account or hosted terminal service.</p></article>
+          <article class="info-card reveal"><span class="feature-number">04</span><h3>You control access</h3><p>The relay is opt-in, refuses public all-interface binds, and lets you list or revoke paired devices.</p></article>
+        </div>
+
+        <div id="setup" class="section-heading reveal remote-setup-heading">
+          <p class="eyebrow">Three steps</p>
+          <h2>Connect through <span>your tailnet.</span></h2>
+          <p>Run Tailscale on the host and phone, then start the relay. vmux listens on its Tailscale address when available.</p>
+        </div>
+        <div class="setup-flow">
+          <div class="reveal"><span>01</span><h3>Install vmux</h3><p><code>cargo install vmux-tui</code></p></div>
+          <div class="reveal"><span>02</span><h3>Start the relay</h3><p><code>vmux relay serve</code></p></div>
+          <div class="reveal"><span>03</span><h3>Pair the app</h3><p>Use <code>tailscale ip -4</code> and port <code>4399</code>.</p></div>
+        </div>
+        <div class="info-card relay-note reveal"><strong>Prefer automatic startup?</strong><p>Run <code>vmux config set relay.enabled true</code>. The next <code>vmux attach</code> starts the managed relay with your session.</p><a href="https://github.com/UAEpro/vmux/blob/main/docs/relay.md">Read the relay guide →</a></div>
+      </section>
+    </main>
+
+    <footer class="site-footer"><div class="shell footer-grid"><div><a class="brand" href="index.html"><img src="assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a><p>The agent-first terminal multiplexer.</p></div><div class="footer-links"><div><strong>Product</strong><a href="index.html#features">Features</a><a href="remote.html">Remote</a><a href="install.html">Install</a></div><div><strong>Resources</strong><a href="https://github.com/UAEpro/vmux">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="support.html">Support</a></div><div><strong>Legal</strong><a href="privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div></div></div><div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div></footer>
+  </body>
+</html>

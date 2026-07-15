@@ -1,0 +1,12 @@
+{
+  "name": "vmux",
+  "short_name": "vmux",
+  "description": "The agent-first terminal multiplexer.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#070b09",
+  "theme_color": "#070b09",
+  "icons": [
+    { "src": "/assets/logo.png", "sizes": "1024x1024", "type": "image/png" }
+  ]
+}

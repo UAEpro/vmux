@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vmux — The agent-first terminal multiplexer</title>
+    <meta
+      name="description"
+      content="vmux is a fast, persistent terminal multiplexer built for developers working with AI coding agents. Native Rust, agent-aware, and available from your phone."
+    />
+    <meta name="theme-color" content="#070b09" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://vmux.sh/" />
+    <meta property="og:title" content="vmux — The agent-first terminal multiplexer" />
+    <meta
+      property="og:description"
+      content="Persistent workspaces, agent status, native speed, and your terminal in your pocket."
+    />
+    <meta property="og:image" content="https://vmux.sh/assets/og-card.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="canonical" href="https://vmux.sh/" />
+    <link rel="icon" href="assets/favicon.png" />
+    <link rel="manifest" href="site.webmanifest" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script src="assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="index.html" aria-label="vmux home">
+          <img src="assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="#features">Features</a>
+          <a href="remote.html">Remote</a>
+          <a href="install.html">Install</a>
+          <a href="https://github.com/UAEpro/vmux">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero shell">
+        <div class="hero-copy reveal">
+          <p class="eyebrow"><span class="live-dot"></span> Built for Linux · written in Rust</p>
+          <h1>Your agents are working.<br /><span>You should know where.</span></h1>
+          <p class="hero-lede">
+            vmux is the terminal multiplexer for AI-assisted development. Persistent workspaces,
+            live agent status, and every pane one command away.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="install.html">Install vmux</a>
+            <a class="button button-secondary" href="https://github.com/UAEpro/vmux">View on GitHub</a>
+          </div>
+          <div class="quick-install" data-copy-wrap data-install-rotator>
+            <span class="prompt">$</span>
+            <code data-install-command title="cargo install vmux-tui">cargo install vmux-tui</code>
+            <button type="button" data-copy="cargo install vmux-tui" aria-label="Copy Cargo install command">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2m-9-9H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H8Z"/></svg>
+            </button>
+          </div>
+          <div class="hero-proof" aria-label="Project highlights">
+            <span>MIT licensed</span><i></i><span>No Electron</span><i></i><span>No cloud account</span>
+          </div>
+        </div>
+
+        <div class="product-stage reveal reveal-delay" aria-label="A representation of the vmux interface">
+          <div class="stage-glow"></div>
+          <div class="terminal-window">
+            <div class="window-bar">
+              <div class="traffic"><i></i><i></i><i></i></div>
+              <span>vmux · agents</span>
+              <span class="window-live"><b></b> daemon live</span>
+            </div>
+            <div class="vmux-ui">
+              <aside class="workspace-rail">
+                <div class="rail-title"><span>workspaces</span><b>3</b></div>
+                <div class="workspace active">
+                  <span class="folder">◇</span>
+                  <div><strong>agents</strong><small>main · 2 panes</small></div>
+                  <i class="status busy"></i>
+                </div>
+                <div class="workspace">
+                  <span class="folder">◇</span>
+                  <div><strong>backend</strong><small>auth · main</small></div>
+                  <i class="status waiting"></i>
+                </div>
+                <div class="workspace">
+                  <span class="folder">◇</span>
+                  <div><strong>docs</strong><small>site · main</small></div>
+                  <i class="status done"></i>
+                </div>
+                <div class="rail-footer"><span>3 agents</span><span>⌘ P</span></div>
+              </aside>
+              <div class="terminal-main">
+                <div class="tab-bar"><span class="tab active">main</span><span class="tab">tests</span><span class="new-tab">＋</span></div>
+                <div class="pane-grid">
+                  <article class="terminal-pane">
+                    <div class="pane-head"><strong>claude</strong><span class="pill pill-busy">● working</span></div>
+                    <div class="terminal-lines" aria-hidden="true">
+                      <p><span class="muted">claude-code v2.1</span></p>
+                      <p><span class="prompt-mark">›</span> Refactor the relay auth flow</p>
+                      <p class="dim">● Read src/relay/auth.rs</p>
+                      <p class="dim">● Edit token validation</p>
+                      <p><span class="minus">-</span> legacy_token: String</p>
+                      <p><span class="plus">+</span> device_token: Secret</p>
+                      <p class="dim">● Running cargo test relay…</p>
+                      <p class="success">test relay::pairing … ok</p>
+                      <p class="cursor-line">▸ dev@vmux:~/project$ <i></i></p>
+                    </div>
+                  </article>
+                  <article class="terminal-pane pane-codex">
+                    <div class="pane-head"><strong>codex</strong><span class="pill pill-waiting">● needs you</span></div>
+                    <div class="terminal-lines" aria-hidden="true">
+                      <p><span class="muted">OpenAI Codex</span></p>
+                      <p><span class="prompt-mark">›</span> Make the release reproducible</p>
+                      <p class="dim">✓ Inspected release workflow</p>
+                      <p class="dim">✓ Added checksum verification</p>
+                      <p class="dim">✓ Tests pass on Linux + macOS</p>
+                      <p>&nbsp;</p>
+                      <p>I can publish v0.4.1 now.</p>
+                      <p class="question">Proceed with the release?</p>
+                      <p><span class="choice">[y]</span> yes&nbsp;&nbsp; <span class="choice">[n]</span> no</p>
+                    </div>
+                  </article>
+                </div>
+                <div class="status-bar"><span>agents / main</span><span>branch main</span><span class="status-attention">1 needs input</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="floating-alert">
+            <span class="alert-icon">!</span>
+            <div><strong>codex needs your input</strong><small>release workflow · just now</small></div>
+            <kbd>jump ↗</kbd>
+          </div>
+        </div>
+      </section>
+
+      <section class="trust-strip" aria-label="Supported tools">
+        <div class="shell trust-inner">
+          <span>Works with the tools already in your terminal</span>
+          <div class="tool-list"><b>Claude Code</b><b>Codex</b><b>Gemini CLI</b><b>Grok</b><b>any shell</b></div>
+        </div>
+      </section>
+
+      <section id="features" class="section shell">
+        <div class="section-heading reveal">
+          <p class="eyebrow">Less terminal babysitting</p>
+          <h2>See the whole operation.<br /><span>Act on what matters.</span></h2>
+          <p>vmux turns a pile of terminal sessions into a workspace that understands agents.</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card feature-wide reveal">
+            <div class="feature-copy">
+              <span class="feature-number">01</span>
+              <h3>Agents report their own state.</h3>
+              <p>Busy, waiting, done, or failed. Status stays visible across workspaces until you actually look.</p>
+            </div>
+            <div class="status-demo" aria-hidden="true">
+              <div><i class="busy"></i><span><strong>claude</strong><small>working on relay auth</small></span><b>busy</b></div>
+              <div class="selected"><i class="waiting"></i><span><strong>codex</strong><small>asks to publish the release</small></span><b>needs you</b></div>
+              <div><i class="done"></i><span><strong>gemini</strong><small>documentation finished</small></span><b>done</b></div>
+            </div>
+          </article>
+          <article class="feature-card reveal">
+            <span class="feature-number">02</span>
+            <div class="daemon-orbit" aria-hidden="true"><i></i><b>vmuxd</b><span>PTYs stay live</span></div>
+            <h3>Detach without stopping.</h3>
+            <p>Panes live inside a small daemon. Close SSH, shut the laptop, reconnect tomorrow—your agents are still there.</p>
+          </article>
+          <article class="feature-card reveal">
+            <span class="feature-number">03</span>
+            <div class="hierarchy-demo" aria-hidden="true">
+              <span>session</span><i></i><span>workspace</span><i></i><span>tab</span><i></i><span>pane</span>
+            </div>
+            <h3>Organized like your work.</h3>
+            <p>Sessions contain workspaces, tabs, and panes. Every new shell opens in the directory you expect.</p>
+          </article>
+          <article class="feature-card feature-wide native-card reveal">
+            <div class="native-metrics" aria-hidden="true">
+              <div><strong>Rust</strong><small>native core</small></div>
+              <div><strong>0</strong><small>browser tabs</small></div>
+              <div><strong>1</strong><small>small daemon</small></div>
+            </div>
+            <div class="feature-copy">
+              <span class="feature-number">04</span>
+              <h3>A terminal, not a web app in disguise.</h3>
+              <p>Written in Rust and drawn with ratatui. No Electron, no browser runtime, no account required.</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="remote-section">
+        <div class="remote-noise"></div>
+        <div class="shell remote-grid">
+          <div class="remote-copy reveal">
+            <p class="eyebrow"><span class="live-dot"></span> vmux Remote</p>
+            <h2>Your terminal.<br /><span>In your pocket.</span></h2>
+            <p>
+              Check every workspace, catch agent handoffs, and send the answer without reopening your laptop.
+              vmux Remote connects directly to your relay over Tailscale or your local network.
+            </p>
+            <ul class="check-list">
+              <li>Live workspace and pane status</li>
+              <li>Terminal input and essential keys</li>
+              <li>Direct connection—no vmux cloud</li>
+            </ul>
+            <div class="remote-actions">
+              <a class="button button-primary" href="remote.html">Explore vmux Remote</a>
+              <span>iPhone &amp; iPad · coming soon</span>
+            </div>
+          </div>
+          <div class="phone-gallery reveal reveal-delay">
+            <figure class="phone-shot phone-back">
+              <img src="assets/remote-workspaces.png" alt="vmux Remote showing agent-aware workspaces" loading="lazy" />
+            </figure>
+            <figure class="phone-shot phone-front">
+              <img src="assets/remote-terminal.png" alt="vmux Remote showing a live terminal session" loading="lazy" />
+            </figure>
+            <div class="tailnet-chip"><span>↗</span><strong>Direct over Tailscale</strong><small>encrypted · peer to peer</small></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="workflow section shell">
+        <div class="section-heading centered reveal">
+          <p class="eyebrow">From zero to attached</p>
+          <h2>One command.<br /><span>Your workspace survives.</span></h2>
+        </div>
+        <ol class="steps">
+          <li class="reveal">
+            <span>01</span>
+            <h3>Install</h3>
+            <div class="mini-command"><code>cargo install vmux-tui</code></div>
+            <p>Or use the checksum-verified prebuilt binary for Linux and macOS.</p>
+          </li>
+          <li class="reveal">
+            <span>02</span>
+            <h3>Attach</h3>
+            <div class="mini-command"><code>vmux attach</code></div>
+            <p>The daemon starts automatically and keeps every pane alive.</p>
+          </li>
+          <li class="reveal">
+            <span>03</span>
+            <h3>Connect your agents</h3>
+            <div class="mini-command"><code>vmux hooks install</code></div>
+            <p>Agent status appears in vmux without changing your workflow.</p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="architecture shell reveal" aria-labelledby="architecture-title">
+        <div class="architecture-copy">
+          <p class="eyebrow">Local by architecture</p>
+          <h2 id="architecture-title">Your terminal data stays on your machines.</h2>
+          <p>The CLI and relay talk to your local vmux daemon. Remote access crosses your own tailnet—not ours.</p>
+          <a class="text-link" href="privacy.html">Read the privacy policy <span>→</span></a>
+        </div>
+        <div class="architecture-map" aria-label="Phone connects over Tailscale to the vmux relay and local daemon">
+          <div class="node"><b>phone</b><small>vmux Remote</small></div>
+          <div class="connection"><span>Tailscale / LAN</span><i></i></div>
+          <div class="node node-accent"><b>relay</b><small>:4399</small></div>
+          <div class="connection short"><span>Unix socket</span><i></i></div>
+          <div class="node"><b>vmuxd</b><small>your panes</small></div>
+        </div>
+      </section>
+
+      <section class="final-cta shell reveal">
+        <div>
+          <p class="eyebrow">Open source · MIT licensed</p>
+          <h2>Keep every agent in view.</h2>
+          <p>Install vmux and turn your terminal into an agent command center.</p>
+        </div>
+        <div class="cta-actions">
+          <a class="button button-primary" href="install.html">Install vmux</a>
+          <a class="button button-secondary" href="https://github.com/UAEpro/vmux">Star on GitHub</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="index.html"><img src="assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="#features">Features</a><a href="remote.html">Remote</a><a href="install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="https://github.com/UAEpro/vmux">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

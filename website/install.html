@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Install vmux</title>
+    <meta name="description" content="Install vmux on Linux or macOS and start a persistent, agent-aware terminal workspace." />
+    <meta name="theme-color" content="#070b09" />
+    <meta property="og:title" content="Install vmux" /><meta property="og:description" content="One command to an agent-first terminal workspace." /><meta property="og:image" content="https://vmux.sh/assets/og-card.png" />
+    <link rel="canonical" href="https://vmux.sh/install.html" /><link rel="icon" href="assets/favicon.png" /><link rel="manifest" href="site.webmanifest" /><link rel="stylesheet" href="assets/site.css" /><script src="assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header><div class="shell nav-wrap"><a class="brand" href="index.html" aria-label="vmux home"><img src="assets/logo.png" alt="" width="40" height="40" /><span>vmux</span></a><button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle><span></span><span></span><span class="sr-only">Open navigation</span></button><nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav><a href="index.html#features">Features</a><a href="remote.html">Remote</a><a href="install.html" aria-current="page">Install</a><a href="https://github.com/UAEpro/vmux">Docs</a><a class="nav-github" href="https://github.com/UAEpro/vmux"><span>GitHub ↗</span></a></nav></div></header>
+
+    <main id="main" class="page-main">
+      <section class="page-hero shell reveal"><p class="eyebrow">Linux · macOS · WSL</p><h1>Install once.<br /><span>Stay attached.</span></h1><p>Choose a checksum-verified prebuilt binary or install from crates.io. Both put the <code>vmux</code> command in your terminal.</p></section>
+      <section class="install-layout">
+        <article class="install-card reveal"><span class="feature-number">Recommended</span><h2>Prebuilt binary</h2><p>Automatically selects Linux or macOS and verifies the release checksum before installing.</p><div class="quick-install" data-copy-wrap><span class="prompt">$</span><code>curl -fsSL https://raw.githubusercontent.com/UAEpro/vmux/main/install.sh | sh</code><button type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/UAEpro/vmux/main/install.sh | sh" aria-label="Copy prebuilt install command">Copy</button></div></article>
+        <article class="install-card reveal"><span class="feature-number">From crates.io</span><h2>Build with Cargo</h2><p>Requires Rust 1.87 or newer. The package is <code>vmux-tui</code>; the command is still <code>vmux</code>.</p><div class="quick-install" data-copy-wrap><span class="prompt">$</span><code>cargo install vmux-tui</code><button type="button" data-copy="cargo install vmux-tui" aria-label="Copy Cargo install command">Copy</button></div></article>
+        <article class="install-card full reveal"><span class="feature-number">Quick start</span><h2>Attach and keep going</h2><div class="command-sequence"><div><span>1</span><code>vmux attach</code><small>starts the daemon and opens the UI</small></div><div><span>2</span><code>vmux hooks install</code><small>connects detected coding agents</small></div><div><span>3</span><code>vmux workspace new --name agents --command "claude"</code><small>creates your first agent workspace</small></div></div></article>
+        <article class="install-card full reveal"><span class="feature-number">Requirements</span><h2>Small footprint. Standard tools.</h2><ul class="requirement-list"><li><strong>Linux</strong><small>x86_64 / arm64</small></li><li><strong>macOS</strong><small>Apple silicon / Intel</small></li><li><strong>Windows</strong><small>supported through WSL</small></li><li><strong>Optional</strong><small>git, curl, ss, Tailscale</small></li></ul></article>
+      </section>
+      <section class="content-page install-notes reveal"><h2>What the installer does</h2><p>The prebuilt installer downloads the latest release for your platform, verifies its SHA-256 checksum, and places <code>vmux</code> in <code>~/.local/bin</code>. Set <code>VMUX_INSTALL_DIR</code> to choose another directory.</p><h2>Update or remove vmux</h2><p>Run the installer again to replace a prebuilt binary, or use <code>cargo install vmux-tui --force</code> for a Cargo installation. To uninstall, remove the installed binary; Cargo users can run <code>cargo uninstall vmux-tui</code>.</p><p><a href="https://github.com/UAEpro/vmux#quick-start">Continue with the full quick start →</a></p></section>
+    </main>
+    <footer class="site-footer"><div class="shell footer-grid"><div><a class="brand" href="index.html"><img src="assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a><p>The agent-first terminal multiplexer.</p></div><div class="footer-links"><div><strong>Product</strong><a href="index.html#features">Features</a><a href="remote.html">Remote</a><a href="install.html">Install</a></div><div><strong>Resources</strong><a href="https://github.com/UAEpro/vmux">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="support.html">Support</a></div><div><strong>Legal</strong><a href="privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div></div></div><div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div></footer>
+  </body>
+</html>
