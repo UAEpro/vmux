@@ -54,7 +54,7 @@ src/
   paths.rs          XDG runtime and state paths
   input.rs          key encoding into panes
   update.rs         daily release check
-  relay/mod.rs      opt-in Cmux Remote-compatible phone relay
+  relay/mod.rs      Cmux Remote-compatible phone relay (on by default)
   relay/auth.rs     device pairing and tokens
 ```
 

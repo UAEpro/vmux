@@ -55,6 +55,9 @@ impl Default for AgentTitleSettings {
 #[serde(default)]
 pub struct RelaySettings {
     /// When true, `vmux attach` starts the phone relay if it is not already up.
+    /// Defaults on so a fresh install pairs with the phone app without a config
+    /// trip; turn off with `vmux config set relay.enabled false`.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Where the relay listens: `auto` | `tailscale` | `local`.
     /// Never binds `0.0.0.0` (public/all interfaces) — phone access is
@@ -81,15 +84,14 @@ pub struct RelaySettings {
 impl Default for RelaySettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             bind: "auto".to_string(),
             port: 4399,
             allow_localhost: false,
             // Safer default: require Tailscale whois (or bootstrap) rather than
             // trusting any CGNAT peer.
             allow_tailnet_cgnat: false,
-            // On by default: uploads still require a paired device token, and
-            // the relay itself is opt-in.
+            // On by default: uploads still require a paired device token.
             allow_paste: true,
             allow_view_resize: false,
         }
@@ -706,6 +708,23 @@ mod tests {
         assert!(config.ui.mouse);
         assert!(config.ui.tab_close_button);
         assert!(!config.ui.bell_on_attention);
+        // Relay section omitted → full Default, which enables the phone relay.
+        assert!(config.relay.enabled);
+        assert_eq!(config.relay.bind, "auto");
+        assert_eq!(config.relay.port, 4399);
+    }
+
+    #[test]
+    fn relay_enabled_defaults_on_even_in_partial_relay_object() {
+        // A config that only tweaks bind must not reset enabled to false.
+        let dir = std::env::temp_dir().join(format!("vmux-relay-default-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"relay":{"bind":"local"}}"#).unwrap();
+        let config = load_from_path(&path).unwrap();
+        fs::remove_dir_all(dir).ok();
+        assert!(config.relay.enabled);
+        assert_eq!(config.relay.bind, "local");
     }
 
     #[test]
@@ -768,6 +787,10 @@ mod tests {
         set_value(&mut config, "ui.mouse", "false").unwrap();
         set_value(&mut config, "ui.tab_close_button", "0").unwrap();
         set_value(&mut config, "ui.bell_on_attention", "on").unwrap();
+        assert!(config.relay.enabled); // default on
+        set_value(&mut config, "relay.enabled", "false").unwrap();
+        assert!(!config.relay.enabled);
+        set_value(&mut config, "relay.enabled", "true").unwrap();
         assert!(config.relay.allow_paste); // default on
         set_value(&mut config, "relay.allow_paste", "false").unwrap();
         assert!(!config.relay.allow_paste);
