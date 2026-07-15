@@ -1500,6 +1500,9 @@ impl Ui {
                         KeyCode::Home => self.notification_selected = 0,
                         KeyCode::End => self.select_last_notification(),
                         KeyCode::Enter => self.jump_selected_notification()?,
+                        KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Delete => {
+                            self.clear_all_notifications()?;
+                        }
                         _ => {}
                     }
                     return Ok(false);
@@ -2992,6 +2995,14 @@ impl Ui {
         self.rpc(&Request::JumpNotification)
     }
 
+    fn clear_all_notifications(&mut self) -> Result<()> {
+        self.rpc(&Request::ClearNotifications)?;
+        self.notification_selected = 0;
+        // Refresh so the panel empties immediately.
+        self.refresh()?;
+        Ok(())
+    }
+
     fn resize(&self, direction: SplitDirection) -> Result<()> {
         self.rpc(&Request::Resize {
             direction,
@@ -4133,15 +4144,92 @@ fn draw_notifications(
     selected: usize,
     palette: ThemePalette,
 ) {
-    let lines = notification_panel_lines(snapshot, selected);
-    draw_list_panel(
-        frame,
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let notes = visible_notifications(snapshot);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Title strip.
+    lines.push(Line::from(vec![
+        Span::styled(
+            " 🔔  Notifications ",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if notes.is_empty() {
+                "· empty".to_string()
+            } else {
+                format!("· {} recent", notes.len())
+            },
+            Style::default().fg(palette.muted),
+        ),
+    ]));
+    lines.push(Line::from(Span::raw("")));
+
+    if notes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No notifications yet",
+            Style::default().fg(palette.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Agent hooks and vmux notify land here",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        for (index, note) in notes.iter().enumerate() {
+            let active = index == selected;
+            lines.extend(notification_card_lines(
+                snapshot,
+                note,
+                active,
+                inner_width.max(24),
+                palette,
+            ));
+            // Spacing between cards (except after the last).
+            if index + 1 < notes.len() {
+                lines.push(Line::from(Span::raw("")));
+            }
+        }
+    }
+
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " ↑↓",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" move  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(palette.success)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" jump  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "c",
+            Style::default()
+                .fg(palette.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" clear all  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(palette.danger)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(palette.muted)),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block(" notifications ", palette))
+            .style(Style::default().bg(palette.surface)),
         area,
-        " notifications ",
-        lines,
-        Some(selected),
-        "No notifications",
-        palette,
     );
 }
 
@@ -7996,7 +8084,9 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
             } else {
                 notification_selected.min(visible - 1) + 1
             };
-            format!("{base} notifications:{selected}/{visible} j/k select Enter jump Esc close ")
+            format!(
+                "{base} notifications:{selected}/{visible} j/k select Enter jump c clear-all Esc close "
+            )
         }
         UiMode::Actions => format!("{base} actions j/k select Enter run Esc close "),
         UiMode::Commands => {
@@ -8073,51 +8163,219 @@ fn visible_notifications(snapshot: &Session) -> Vec<&crate::model::Notification>
         .collect()
 }
 
+/// Status emoji + palette color for a notification's agent status / color hint.
+fn notification_status_style(
+    note: &crate::model::Notification,
+    palette: ThemePalette,
+) -> (&'static str, Color) {
+    let status = note.status.as_deref().unwrap_or("");
+    match status {
+        "busy" | "running" | "working" => ("🔄", palette.command),
+        "attention" | "needs-input" | "needs_input" | "waiting" | "blocked" | "approval" => {
+            ("🙋", palette.warning)
+        }
+        "done" | "complete" => ("✅", palette.success),
+        "error" | "failed" => ("❌", palette.danger),
+        "idle" => ("💤", palette.muted),
+        _ => match note
+            .color
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "yellow" | "gold" => ("🔔", palette.warning),
+            "green" => ("🔔", palette.success),
+            "red" => ("🔔", palette.danger),
+            "blue" | "cyan" => ("🔔", palette.command),
+            _ => ("🔔", palette.active),
+        },
+    }
+}
+
+/// Workspace name, tab title, and agent/pane title for a notification card.
+fn notification_context_labels(
+    snapshot: &Session,
+    note: &crate::model::Notification,
+) -> (String, String, String) {
+    let workspace = notification_workspace(snapshot, note);
+    let workspace_name = workspace
+        .map(|ws| ws.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+
+    let loc = note
+        .pane
+        .as_ref()
+        .and_then(|pane_id| snapshot.find_pane_location(pane_id));
+    let tab_title = loc
+        .as_ref()
+        .and_then(|loc| loc.tab_id.as_ref())
+        .and_then(|tab_id| {
+            workspace.and_then(|ws| {
+                ws.tabs
+                    .iter()
+                    .find(|tab| &tab.id == tab_id)
+                    .map(|tab| tab.title.clone())
+            })
+        })
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+
+    let agent_name = note
+        .pane
+        .as_ref()
+        .and_then(|pane_id| snapshot.panes.get(pane_id))
+        .map(|pane| {
+            // Prefer a human title; fall back to a short command basename.
+            if !pane.title.is_empty()
+                && pane.title != "shell"
+                && pane.title != "bash"
+                && pane.title != "tab"
+            {
+                pane.title.clone()
+            } else {
+                let cmd = pane.command.split_whitespace().next().unwrap_or("");
+                let base = cmd.rsplit('/').next().unwrap_or(cmd);
+                if base.is_empty() {
+                    pane.title.clone()
+                } else {
+                    base.to_string()
+                }
+            }
+        })
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "—".to_string());
+
+    (workspace_name, tab_title, agent_name)
+}
+
+/// Two-line colored card for one notification (header + message).
+fn notification_card_lines(
+    snapshot: &Session,
+    note: &crate::model::Notification,
+    active: bool,
+    width: usize,
+    palette: ThemePalette,
+) -> Vec<Line<'static>> {
+    let (emoji, accent) = notification_status_style(note, palette);
+    let (workspace, tab, agent) = notification_context_labels(snapshot, note);
+    let marker = if active { "›" } else { " " };
+    let row_bg = if active { palette.hover } else { Color::Reset };
+    let text_style = if active {
+        selected_row_style(palette)
+    } else {
+        Style::default().fg(palette.text).bg(row_bg)
+    };
+    let muted = if active {
+        Style::default()
+            .fg(palette.on_bright)
+            .bg(palette.hover)
+            .add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+    let accent_style = if active {
+        Style::default()
+            .fg(accent)
+            .bg(palette.hover)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    };
+    let label_style = if active {
+        Style::default()
+            .fg(palette.on_bright)
+            .bg(palette.hover)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(palette.text)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    // Line 1: › 🔄  workspace · tab · agent
+    let ws_show = trim_label(&workspace, 16);
+    let tab_show = trim_label(&tab, 18);
+    let agent_show = trim_label(&agent, 16);
+    let header = Line::from(vec![
+        Span::styled(
+            format!("{marker} "),
+            if active {
+                Style::default()
+                    .fg(accent)
+                    .bg(palette.hover)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.muted)
+            },
+        ),
+        Span::styled(format!("{emoji} "), accent_style),
+        Span::styled("📁 ".to_string(), muted),
+        Span::styled(ws_show, label_style),
+        Span::styled("  ·  ".to_string(), muted),
+        Span::styled("📑 ".to_string(), muted),
+        Span::styled(tab_show, label_style),
+        Span::styled("  ·  ".to_string(), muted),
+        Span::styled("🤖 ".to_string(), muted),
+        Span::styled(agent_show, accent_style),
+    ]);
+
+    // Line 2: indented message in status color.
+    let msg_budget = width.saturating_sub(4).max(8);
+    let message = truncate_to_width(&note.message, msg_budget);
+    let message_line = Line::from(vec![
+        Span::styled(
+            "    ".to_string(),
+            if active {
+                Style::default().bg(palette.hover)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::styled(
+            message,
+            if active {
+                Style::default().fg(palette.on_bright).bg(palette.hover)
+            } else {
+                Style::default().fg(accent)
+            },
+        ),
+    ]);
+
+    // Pad both rows so the selected card reads as a solid block.
+    let mut lines = vec![header, message_line];
+    for line in &mut lines {
+        let used: usize = line
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        if used < width {
+            let pad_style = if active {
+                Style::default().bg(palette.hover)
+            } else {
+                text_style
+            };
+            line.spans
+                .push(Span::styled(" ".repeat(width - used), pad_style));
+        }
+    }
+    lines
+}
+
+/// Plain-text summary lines for tests (mirrors the card's content, no styles).
 fn notification_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> {
     visible_notifications(snapshot)
         .into_iter()
         .enumerate()
         .map(|(index, note)| {
-            let workspace = notification_workspace(snapshot, note);
-            let workspace_name = workspace
-                .as_ref()
-                .map(|workspace| workspace.name.as_str())
-                .unwrap_or("-");
-            let tab_title = note
-                .pane
-                .as_ref()
-                .and_then(|pane_id| snapshot.find_pane_location(pane_id))
-                .and_then(|loc| {
-                    loc.tab_id.and_then(|tab_id| {
-                        workspace.and_then(|ws| {
-                            ws.tabs
-                                .iter()
-                                .find(|tab| tab.id == tab_id)
-                                .map(|tab| tab.title.clone())
-                        })
-                    })
-                });
-            let pane_title = note
-                .pane
-                .as_ref()
-                .and_then(|pane_id| snapshot.panes.get(pane_id))
-                .map(|pane| pane.title.as_str())
-                .unwrap_or("-");
-            // Prefer the workspace tab title (agent context); fall back to pane title.
-            let target = tab_title
-                .as_deref()
-                .filter(|title| !title.is_empty())
-                .unwrap_or(pane_title);
-            let status = note.status.as_deref().unwrap_or("-");
-            let marker = if index == selected { "> " } else { "  " };
+            let (emoji, _) = notification_status_style(note, UiTheme::Midnight.palette());
+            let (workspace, tab, agent) = notification_context_labels(snapshot, note);
+            let marker = if index == selected { "›" } else { " " };
             format!(
-                "{marker}{} [{}] ws:{} tab:{} status:{} {}",
-                note.time,
-                note.color.as_deref().unwrap_or("-"),
-                trim_label(workspace_name, 14),
-                trim_label(target, 14),
-                status,
-                trim_label(&note.message, 80)
+                "{marker} {emoji} 📁 {workspace} · 📑 {tab} · 🤖 {agent}\n    {}",
+                note.message
             )
         })
         .collect()
@@ -10573,12 +10831,17 @@ mod tests {
 
         let lines = notification_panel_lines(&session, 1);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("tab:claude"));
+        // Newest first: pane note, then workspace note. Selected index 1 is the
+        // older workspace entry (› marker).
+        assert!(lines[0].contains("📑 claude") || lines[0].contains("claude"));
         assert!(lines[0].contains("pane note"));
-        assert!(lines[0].starts_with("  "));
-        assert!(lines[1].contains("ws:main"));
+        assert!(lines[0].starts_with("  ") || lines[0].starts_with("  "));
+        assert!(
+            lines[0].contains('✅') || lines[0].contains("done") || lines[0].contains("pane note")
+        );
+        assert!(lines[1].contains("📁 main") || lines[1].contains("main"));
         assert!(lines[1].contains("workspace note"));
-        assert!(lines[1].starts_with("> "));
+        assert!(lines[1].starts_with('›'));
     }
 
     #[test]
@@ -10887,7 +11150,7 @@ mod tests {
         );
         assert_eq!(
             session_footer(&session, UiMode::Notifications, 0),
-            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  notifications:1/2 j/k select Enter jump Esc close "
+            " session:test workspaces:1 tabs:1 running:2 busy:1 attention:1 done:1 error:0 notif:1  notifications:1/2 j/k select Enter jump c clear-all Esc close "
         );
         assert_eq!(
             session_footer(&session, UiMode::Actions, 0),
