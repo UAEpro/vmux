@@ -335,7 +335,10 @@ fn scan_ports_linux(input: &ScanInput) -> BTreeMap<u16, DetectedPort> {
     out
 }
 
+// Pure parsers: used by the Linux scanner and unit tests. On macOS release
+// builds neither path is linked, so allow dead_code there.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) struct SockEntry {
     host: String,
     port: u16,
@@ -343,6 +346,7 @@ pub(crate) struct SockEntry {
 }
 
 /// Parse `/proc/net/tcp` or `tcp6` LISTEN lines.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub(crate) fn parse_proc_net_tcp(text: &str, v6: bool) -> Vec<SockEntry> {
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
@@ -366,6 +370,7 @@ pub(crate) fn parse_proc_net_tcp(text: &str, v6: bool) -> Vec<SockEntry> {
     out
 }
 
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 fn parse_hex_addr(field: &str, v6: bool) -> Option<(String, u16)> {
     let (addr_hex, port_hex) = field.split_once(':')?;
     let port = u16::from_str_radix(port_hex, 16).ok()?;
