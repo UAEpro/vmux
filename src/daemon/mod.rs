@@ -2141,13 +2141,19 @@ impl Server {
                 .map_err(anyhow::Error::msg)?,
             None => session.active_workspace.clone(),
         };
-        let cwd = session
+        let workspace = session
             .workspaces
             .iter()
             .find(|workspace| workspace.id == target)
-            .map(|workspace| workspace.cwd.clone())
             .ok_or_else(|| anyhow!("unknown workspace {target}"))?;
+        let stored = workspace.cwd.clone();
+        // Prefer the live cwd of a shell in this workspace so new panes/tabs
+        // follow `cd` instead of the directory the workspace was first opened
+        // in. Order: live active pane → any tab's active pane → any running
+        // pane (covers `new_tab`, which clears active_pane before spawning).
+        let live = preferred_live_cwd(workspace, &session.panes);
         drop(session);
+        let cwd = live.unwrap_or(stored);
         Ok((target, normalize_cwd(Some(cwd))?))
     }
 
@@ -5432,18 +5438,90 @@ fn git_branch(cwd: &Path) -> Option<String> {
     None
 }
 
-/// Live working directory of a pane's shell via `/proc/<pid>/cwd`, so the
-/// sidebar path follows `cd`. Best-effort: `None` when the process is gone,
-/// the cwd was deleted, or `/proc` is unavailable (non-Linux).
-/// The pane process's current working directory.
+/// Live working directory of a pane's shell, so the sidebar path and new
+/// pane/tab spawns follow `cd`. Best-effort: `None` when the process is gone,
+/// the cwd was deleted, or the platform cannot query another process's cwd.
 ///
-/// Linux only: this reads `/proc/<pid>/cwd`, which macOS does not have, so it
-/// returns `None` there and the sidebar falls back to the workspace's stored
-/// cwd rather than the pane's live one. Reading it on macOS needs
-/// `proc_pidinfo(PROC_PIDVNODEPATHINFO)` via libproc.
+/// - Linux: `/proc/<pid>/cwd`
+/// - macOS: `proc_pidinfo(PROC_PIDVNODEPATHINFO)` (libproc / libc)
+#[cfg(target_os = "linux")]
 fn pane_live_cwd(pid: u32) -> Option<String> {
     let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     path.is_absolute().then(|| path.display().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn pane_live_cwd(pid: u32) -> Option<String> {
+    // SAFETY: buffer is zeroed and sized exactly to `proc_vnodepathinfo`;
+    // `proc_pidinfo` writes at most `buffersize` bytes into it.
+    unsafe {
+        let mut info: libc::proc_vnodepathinfo = std::mem::zeroed();
+        let size = std::mem::size_of_val(&info) as libc::c_int;
+        let ret = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        );
+        if ret <= 0 || ret < size {
+            return None;
+        }
+        // libc represents `vip_path: [c_char; MAXPATHLEN]` as `[[c_char; 32]; 32]`.
+        let path_ptr = info.pvi_cdir.vip_path.as_ptr() as *const libc::c_char;
+        let s = std::ffi::CStr::from_ptr(path_ptr).to_str().ok()?;
+        if s.is_empty() || !s.starts_with('/') {
+            return None;
+        }
+        Some(s.to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pane_live_cwd(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Best-effort live cwd for spawning a new pane/tab in `workspace`.
+///
+/// When the user has `cd`'d inside a pane, new panes and tabs should open
+/// there — not at the workspace's original spawn path. Falls through a few
+/// candidates because `new_tab` clears the live `active_pane` before the new
+/// pane is created.
+fn preferred_live_cwd(
+    workspace: &crate::model::Workspace,
+    panes: &BTreeMap<String, Pane>,
+) -> Option<String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(id) = workspace.active_pane.as_deref() {
+        candidates.push(id);
+    }
+    // Prefer more recently added tabs (end of list) so "new tab while on tab
+    // that already followed a cd" still picks a sensible peer.
+    for tab in workspace.tabs.iter().rev() {
+        if let Some(id) = tab.active_pane.as_deref() {
+            candidates.push(id);
+        }
+        for pane_id in tab.panes.iter().rev() {
+            candidates.push(pane_id.as_str());
+        }
+    }
+    for pane_id in &workspace.panes {
+        candidates.push(pane_id.as_str());
+    }
+    let mut seen = BTreeSet::new();
+    for pane_id in candidates {
+        if !seen.insert(pane_id) {
+            continue;
+        }
+        let Some(pid) = panes.get(pane_id).and_then(|p| p.pid) else {
+            continue;
+        };
+        if let Some(cwd) = pane_live_cwd(pid) {
+            return Some(cwd);
+        }
+    }
+    None
 }
 
 fn listening_ports_for_roots(roots: &[u32]) -> Vec<ListeningPort> {
@@ -7101,23 +7179,62 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// `/proc` is Linux-only, so this asserted `Some(cwd)` on a platform where
-    /// `pane_live_cwd` can only ever return `None`. It failed on every macOS
-    /// run — which nobody saw, because the workflow was invalid and CI had never
-    /// executed a single job.
+    /// Live cwd of this process (Linux `/proc` or macOS `proc_pidinfo`).
     #[test]
-    #[cfg(target_os = "linux")]
-    fn pane_live_cwd_reads_proc_cwd() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn pane_live_cwd_reads_own_process() {
         let expected = std::env::current_dir().unwrap().display().to_string();
         assert_eq!(pane_live_cwd(std::process::id()), Some(expected));
         assert_eq!(pane_live_cwd(u32::MAX), None);
     }
 
-    /// The macOS half of the same contract: no `/proc`, so no live cwd. Pins the
-    /// graceful degradation rather than leaving the platform untested.
+    /// New panes/tabs must follow a pane that has already `cd`'d, not the
+    /// workspace's original spawn path.
     #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn pane_live_cwd_is_unavailable_without_proc() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn preferred_live_cwd_follows_active_pane() {
+        let expected = std::env::current_dir().unwrap().display().to_string();
+        let mut ws = crate::model::Workspace::new("ws-1", "main");
+        ws.cwd = "/tmp".into(); // stored path deliberately different
+        ws.active_pane = Some("pane-1".into());
+        ws.panes = vec!["pane-1".into()];
+        let mut panes = BTreeMap::new();
+        let mut pane = Pane::new("pane-1".into(), "bash".into(), SplitDirection::Right);
+        pane.pid = Some(std::process::id());
+        panes.insert("pane-1".into(), pane);
+        assert_eq!(
+            preferred_live_cwd(&ws, &panes).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    /// `new_tab` clears `workspace.active_pane` before spawning; still find
+    /// the previous tab's pane via tab records.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn preferred_live_cwd_finds_pane_on_previous_tab() {
+        let expected = std::env::current_dir().unwrap().display().to_string();
+        let mut ws = crate::model::Workspace::new("ws-1", "main");
+        ws.cwd = "/tmp".into();
+        // Simulate post-add_tab: live view empty, old tab still has the pane.
+        ws.active_pane = None;
+        ws.panes.clear();
+        ws.tabs[0].panes = vec!["pane-1".into()];
+        ws.tabs[0].active_pane = Some("pane-1".into());
+        let mut panes = BTreeMap::new();
+        let mut pane = Pane::new("pane-1".into(), "bash".into(), SplitDirection::Right);
+        pane.pid = Some(std::process::id());
+        panes.insert("pane-1".into(), pane);
+        assert_eq!(
+            preferred_live_cwd(&ws, &panes).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    /// Unsupported OS: no process-cwd API, fall back to stored workspace path.
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn pane_live_cwd_is_unavailable_on_unsupported_os() {
         assert_eq!(pane_live_cwd(std::process::id()), None);
     }
 
