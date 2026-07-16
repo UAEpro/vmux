@@ -61,8 +61,12 @@ src/
   cli.rs            clap command definitions
   daemon/mod.rs     PTY management + socket server + port/meta refresh
   daemon/browser.rs browser surfaces
-  ui/mod.rs         attach TUI (ratatui)
-  ui/input_batch.rs input coalescing
+  ui/mod.rs              attach TUI (ratatui)
+  ui/theme.rs            themes + workspace second-line modes
+  ui/settings_panel.rs   settings rows + draw
+  ui/ports_panel.rs      ports panel draw
+  ui/command_palette.rs  command palette actions + draw
+  ui/input_batch.rs      input coalescing
   model.rs          Session / Workspace / Tab / Pane
   protocol.rs       RPC request and response types
   config.rs         user config (ui / relay / agent_titles / ports)
