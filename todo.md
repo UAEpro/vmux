@@ -33,12 +33,10 @@ gates, reserved session stems.
 
 ## Remaining (long-tail)
 
-1. **Deeper UI/daemon splits** — ports + view_size extracted; `ui/mod.rs` still
-   large (settings/draw still monolithic).
-2. **Dependency major bumps** — ratatui 0.26→0.30 etc. when Dependabot + phone
-   contract tests are green (intentionally not in this branch).
-3. **Phone e2e CI gate** — run `vmux-remote` contract suite from this repo when
-   the sibling checkout is available.
+1. **Further UI/daemon splits** — theme / settings_panel / ports_panel extracted;
+   `ui/mod.rs` still ~11k (draw/event loop).
+2. **Dependency major bumps** — ratatui 0.26→0.30 etc. via Dependabot + phone e2e.
+3. **Per-session relay ports** — deferred by design for now.
 
 ## Shipped later on this branch
 
@@ -46,6 +44,12 @@ gates, reserved session stems.
 - Multi-phone view size `min()` (`daemon/view_size.rs`, `viewer_id`)
 - `Events { since }` + `vmux events --since` / follow uses server cursor
 - `cargo bench --bench hot_path` micro-benchmarks
+
+## followups branch
+
+- UI splits: `theme.rs`, `settings_panel.rs`, `ports_panel.rs`
+- `AgentStatus` `#[serde(other)]` for forward-compatible state
+- Optional `phone-contract.yml` workflow (manual dispatch) for vmux-remote e2e
 
 Historical design notes for phone-fit sizing and port forwarding were folded
 into shipped docs; scratch `bugs.md` / `newimp.md` / `review-*.md` stay

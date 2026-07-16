@@ -1,0 +1,75 @@
+# Optional phone wire-contract suite (vmux-remote).
+# Runs only when the repository is available as a sibling checkout via
+# repository_dispatch or workflow_dispatch with a path, or when secrets
+# provide a token to clone UAEpro/vmux-remote.
+#
+# Not required on every PR — `cargo test` does not cover the phone wire
+# contract. See CLAUDE.md / CONTRIBUTING.md.
+
+name: phone-contract
+
+on:
+  workflow_dispatch:
+  # Uncomment when ready to run on every main push:
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   paths:
+  #     - 'src/relay/**'
+  #     - 'src/protocol.rs'
+  #     - 'src/daemon/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  XDG_RUNTIME_DIR: /tmp/vmux-xdg-runtime
+  XDG_CONFIG_HOME: /tmp/vmux-xdg-config
+  XDG_STATE_HOME: /tmp/vmux-xdg-state
+
+jobs:
+  contract:
+    name: vmux-remote e2e (wire contract)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout vmux
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build debug vmux
+        run: cargo build --locked
+
+      - name: Checkout vmux-remote
+        uses: actions/checkout@v4
+        with:
+          repository: UAEpro/vmux-remote
+          path: vmux-remote
+          # Public read; use a token if the app repo is private:
+          # token: ${{ secrets.VMUX_REMOTE_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: vmux-remote/package-lock.json
+
+      - name: Install app deps
+        working-directory: vmux-remote
+        run: npm ci
+
+      - name: Run wire contract e2e
+        working-directory: vmux-remote
+        env:
+          # Point the suite at this checkout's debug binary.
+          VMUX_BIN: ${{ github.workspace }}/target/debug/vmux
+        run: |
+          if npm run | grep -q 'test:e2e'; then
+            npm run test:e2e
+          else
+            echo "No test:e2e script in vmux-remote; skipping."
+            exit 0
+          fi
