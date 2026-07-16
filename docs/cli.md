@@ -72,6 +72,8 @@ vmux read-screen --pane pane-1 --limit-bytes 64000
 vmux search "needle"
 vmux identify --json
 vmux agents
+vmux events --limit 50
+vmux events --since 120 --follow --interval-ms 500
 ```
 
 Panes export discovery variables, so a process can find its own place in the
@@ -138,6 +140,40 @@ vmux remote ssh user@host --command "claude"
 vmux remote tmux user@host --session work
 ```
 
+## Ports
+
+Listening ports owned by pane processes (Linux `/proc` scanner). Full guide:
+[ports.md](ports.md).
+
+```sh
+vmux ports list
+vmux ports list --workspace ws-2 --json
+vmux ports ssh-cmd 5173
+vmux config set ports.ssh_host 'user@devbox'
+vmux ports forward 3000 --via tailscale
+vmux ports unforward 3000
+```
+
+```sh
+vmux config set ports.enabled true
+vmux config set ports.ignore 5432,6379
+vmux config set ports.notify toast          # toast | banner | off
+```
+
+## Relay
+
+Default port **4399**, change anytime. See [relay.md](relay.md).
+
+```sh
+vmux config set relay.port 4400
+vmux relay serve
+vmux relay serve --port 4400
+vmux relay serve --listen 127.0.0.1:4400
+vmux relay status
+vmux relay devices list
+vmux relay devices revoke <device_id>
+```
+
 ## Config, actions, skills
 
 ```sh
@@ -146,6 +182,7 @@ vmux config init
 vmux config set ui.prefix_key Ctrl-a
 vmux config set ui.sidebar_collapsed true
 vmux config set ui.theme contrast
+vmux config set relay.port 4399
 vmux actions list
 vmux actions run test
 vmux skills list
@@ -153,7 +190,7 @@ vmux skills install vmux-control --dir .vmux/skills
 ```
 
 Project actions are defined in `vmux.json` and can also be run from the TUI with
-`Ctrl-b A`. See [config.md](config.md).
+`Ctrl-b A`. See [config.md](config.md) and [config.schema.json](config.schema.json).
 
 ## Session ops
 
@@ -187,7 +224,7 @@ Session state is persisted separately, in `~/.local/state/vmux/`.
 
 ```text
 attach  daemon  new-pane  split  run  open-url  url-snapshot  url-links
-browser  agent  remote  markdown  actions  skills  config
+browser  agent  remote  markdown  actions  skills  config  ports  relay
 send  send-key  send-image  broadcast  read-screen  search  clear-pane
 copy-pane  paste  clipboard  kill-pane  duplicate-pane  prune  restart-pane
 move-pane  swap-panes  title  tab  move  metadata  wait  resize

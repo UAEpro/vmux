@@ -17,11 +17,22 @@ use crate::model::{
     infer_agent_status, insert_pane_in_layout, is_coding_agent_command, merge_agent_status,
     next_pane_in_layout, resize_layout, title_from_status_message, touch_agent_status, unix_time,
     AgentStatus, ClipboardItem, DaemonInfo, EventRecord, ListeningPort, Notification, Pane,
-    PaneStatus, PaneTab, Session, SurfaceKind,
+    PaneStatus, PaneTab, Session, SurfaceKind, PROTOCOL_VERSION,
 };
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request, Response};
 use crate::sync::MutexExt;
+
+mod ports;
+mod view_size;
+use ports::{
+    resolve_ssh_host, scan_ports, ssh_forward_command, start_tailscale_forward, to_listening_ports,
+    PortRegistry, ScanInput,
+};
+use view_size::{
+    clamp_lease_ms, clear_override, effective_with_overrides, expire_overrides, min_live_view,
+    upsert_override, ViewOverride,
+};
 
 pub fn ensure_running(session: &str) -> Result<()> {
     if is_running(session) {
@@ -275,18 +286,16 @@ struct PaneRuntime {
     terminal_modes: TerminalModeTracker,
     parser: vt100::Parser,
     /// Effective PTY size actually applied to the master and vt100 parser:
-    /// `min(layout_size, view_override)` per axis while an override is live,
+    /// `min(layout_size, min live viewers)` per axis while overrides are live,
     /// otherwise `layout_size`.
     size: PaneSize,
     /// The size the attach UI's layout last asked for. Kept separately from
     /// `size` so dropping a view override can restore the desktop layout
     /// without waiting for the next client resize.
     layout_size: PaneSize,
-    /// Phone-fit override (`SetPaneViewSize`): a small remote viewer is
-    /// watching, hold the PTY to at most this size until the lease runs out.
-    /// One slot per pane — a second viewer replaces the first (last writer
-    /// wins; with one slot a true min() across viewers isn't representable).
-    view_override: Option<ViewOverride>,
+    /// Phone-fit overrides (`SetPaneViewSize`): each live viewer holds a lease;
+    /// effective size is min(layout, min(live viewers)) per axis.
+    view_overrides: Vec<ViewOverride>,
     // Bumped by append_output whenever new bytes are processed. Used to skip the
     // scrollback-formatted walk in snapshot() when a pane produced no output
     // since the last snapshot.
@@ -405,37 +414,6 @@ fn cleared_parser_preserving_terminal_modes(
     }
     cleared
 }
-
-/// How long a pane's "is an agent running in here" answer is trusted before the
-/// process tree is walked again.
-const AGENT_INSIDE_TTL_SECS: u64 = 5;
-
-/// A leased view-size override (see `Request::SetPaneViewSize`).
-#[derive(Debug, Clone, Copy)]
-struct ViewOverride {
-    size: PaneSize,
-    /// The override silently expires at this instant unless re-leased, so a
-    /// viewer that dies without unsubscribing cannot pin the pane small.
-    expires_at: Instant,
-}
-
-/// "Smallest client wins", per axis: what the PTY should actually be when a
-/// view override is active on top of the layout size.
-fn effective_pane_size(layout: PaneSize, view: Option<PaneSize>) -> PaneSize {
-    match view {
-        Some(view) => sanitize_pane_size(PaneSize {
-            rows: layout.rows.min(view.rows),
-            cols: layout.cols.min(view.cols),
-        }),
-        None => layout,
-    }
-}
-
-/// Bounds for `SetPaneViewSize.lease_ms`. The floor keeps a buggy client from
-/// thrashing resize; the ceiling keeps a stuck client from pinning a pane for
-/// more than a minute even if it leased generously.
-const VIEW_LEASE_MS_MIN: u64 = 500;
-const VIEW_LEASE_MS_MAX: u64 = 60_000;
 
 /// One-shot lifecycle of the LLM tab-title fallback for a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +545,14 @@ struct Server {
     /// Automatic agent tab naming. Read once at start: changing it takes effect
     /// on the next daemon start (`vmux kill && vmux attach`).
     agent_titles: crate::config::AgentTitleSettings,
+    /// Port detection / forwarding (read once at start).
+    ports_settings: crate::config::PortsSettings,
+    /// Relay port so the ports scanner can ignore it.
+    relay_port: u16,
+    /// Live port registry (scan loop + forward handles).
+    port_registry: Mutex<PortRegistry>,
+    /// Active daemon client connections (soft cap).
+    active_connections: std::sync::atomic::AtomicUsize,
     /// Per-pane scrollback byte budget (`ui.scrollback_bytes`). Read once at
     /// start, like `agent_titles`.
     scrollback_cap: usize,
@@ -666,6 +652,10 @@ impl Server {
             pane_size_owner: Mutex::new(None),
             exit_notify: (Mutex::new(()), std::sync::Condvar::new()),
             agent_titles: config.agent_titles,
+            ports_settings: config.ports,
+            relay_port: config.relay.port,
+            port_registry: Mutex::new(PortRegistry::default()),
+            active_connections: std::sync::atomic::AtomicUsize::new(0),
             scrollback_cap: config.ui.scrollback_bytes,
             #[cfg(unix)]
             _session_lock: session_lock,
@@ -705,6 +695,10 @@ impl Server {
             let server = Arc::clone(&self);
             thread::spawn(move || server.agent_status_decay_loop());
         }
+        if self.ports_settings.enabled {
+            let server = Arc::clone(&self);
+            thread::spawn(move || server.ports_scan_loop());
+        }
         if self.socket_path.exists() {
             fs::remove_file(&self.socket_path).ok();
         }
@@ -716,13 +710,35 @@ impl Server {
         )
         .ok();
 
+        // Soft cap: extra connections get a JSON error instead of a thread.
+        const MAX_DAEMON_CONNECTIONS: usize = 256;
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let current = self
+                        .active_connections
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if current >= MAX_DAEMON_CONNECTIONS {
+                        let _ = protocol::write_response(
+                            &stream,
+                            &Response::err("too many concurrent connections"),
+                        );
+                        continue;
+                    }
                     let server = Arc::clone(&self);
+                    server
+                        .active_connections
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     thread::spawn(move || {
-                        let response = server.handle_stream(stream);
-                        if let Err(err) = response {
+                        // Bound idle clients so a stuck peer cannot pin a thread forever.
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+                        let counter = Arc::clone(&server);
+                        let result = server.handle_stream(stream);
+                        counter
+                            .active_connections
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Err(err) = result {
                             eprintln!("vmux connection error: {err:#}");
                         }
                     });
@@ -738,6 +754,195 @@ impl Server {
             self.refresh_workspace_meta();
             thread::sleep(Duration::from_secs(5));
         }
+    }
+
+    fn ports_scan_loop(self: Arc<Self>) {
+        let interval = Duration::from_secs(self.ports_settings.poll_secs.max(1));
+        loop {
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            self.refresh_ports();
+            thread::sleep(interval);
+        }
+    }
+
+    fn refresh_ports(&self) {
+        if !self.ports_settings.enabled {
+            return;
+        }
+        let pane_pids: BTreeMap<String, u32> = {
+            let panes = self.panes.lock_or_recover();
+            panes
+                .values()
+                .filter_map(|r| r.pane.pid.map(|pid| (r.pane.id.clone(), pid)))
+                .collect()
+        };
+        let pane_workspace: BTreeMap<String, String> = {
+            let session = self.session.lock_or_recover();
+            let mut map = BTreeMap::new();
+            for ws in &session.workspaces {
+                for pane_id in ws.all_pane_ids() {
+                    map.insert(pane_id.to_string(), ws.id.clone());
+                }
+            }
+            map
+        };
+
+        let mut ignore_ports: BTreeSet<u16> = self.ports_settings.ignore.iter().copied().collect();
+        ignore_ports.insert(self.relay_port);
+        let ignore_processes: BTreeSet<String> = self
+            .ports_settings
+            .ignore_processes
+            .iter()
+            .cloned()
+            .collect();
+        let input = ScanInput {
+            pane_pids,
+            pane_workspace,
+            ignore_ports,
+            ignore_processes,
+            ignore_ephemeral: self.ports_settings.ignore_ephemeral,
+        };
+        let detected = scan_ports(&input);
+
+        let mut reg = self.port_registry.lock_or_recover();
+        let diff = reg.replace_detected(detected);
+        let list = reg.list();
+        drop(reg);
+
+        if diff.opened.is_empty() && diff.closed.is_empty() {
+            return;
+        }
+
+        {
+            let mut meta = self.workspace_meta.lock_or_recover();
+            for entry in meta.values_mut() {
+                entry.ports.clear();
+            }
+            for det in &list {
+                if let Some(ws) = &det.workspace {
+                    let ports = to_listening_ports(std::slice::from_ref(det));
+                    meta.entry(ws.clone()).or_default().ports.extend(ports);
+                }
+            }
+        }
+
+        {
+            let mut session = self.session.lock_or_recover();
+            for det in &diff.opened {
+                push_event(
+                    &mut session,
+                    EventRecord {
+                        id: 0,
+                        time: unix_time(),
+                        kind: "port-opened".into(),
+                        pane: det.pane.clone(),
+                        workspace: det.workspace.clone(),
+                        status: None,
+                        key: Some("port".into()),
+                        value: Some(det.port.to_string()),
+                        message: format!(
+                            "port {} ({})",
+                            det.port,
+                            det.process.as_deref().unwrap_or("process")
+                        ),
+                    },
+                );
+                if self.ports_settings.notify != "off" {
+                    session.notifications.push(Notification {
+                        time: unix_time(),
+                        pane: det.pane.clone(),
+                        workspace: det.workspace.clone(),
+                        status: None,
+                        color: Some("cyan".into()),
+                        clear: false,
+                        message: format!(
+                            "Port {} ({}) — vmux ports",
+                            det.port,
+                            det.process.as_deref().unwrap_or("?")
+                        ),
+                    });
+                    const MAX_NOTIFS: usize = 50;
+                    if session.notifications.len() > MAX_NOTIFS {
+                        let drop_n = session.notifications.len() - MAX_NOTIFS;
+                        session.notifications.drain(0..drop_n);
+                    }
+                }
+            }
+            for det in &diff.closed {
+                push_event(
+                    &mut session,
+                    EventRecord {
+                        id: 0,
+                        time: unix_time(),
+                        kind: "port-closed".into(),
+                        pane: det.pane.clone(),
+                        workspace: det.workspace.clone(),
+                        status: None,
+                        key: Some("port".into()),
+                        value: Some(det.port.to_string()),
+                        message: format!("port {}", det.port),
+                    },
+                );
+            }
+        }
+        for det in &diff.closed {
+            self.port_registry.lock_or_recover().stop_forward(det.port);
+        }
+        if self.ports_settings.auto_forward {
+            for det in &diff.opened {
+                let _ = self.forward_port_inner(det.port, "tailscale");
+            }
+        }
+        self.touch();
+    }
+
+    fn forward_port_inner(&self, port: u16, via: &str) -> Result<ports::DetectedPort> {
+        if via != "tailscale" {
+            anyhow::bail!("only via=tailscale is supported for automatic forward");
+        }
+        let ts_ip_str = crate::relay::tailscale_ipv4()
+            .ok_or_else(|| anyhow!("Tailscale is offline or tailscale is not installed"))?;
+        let ts_ip: std::net::Ipv4Addr = ts_ip_str
+            .parse()
+            .map_err(|_| anyhow!("invalid Tailscale IPv4: {ts_ip_str}"))?;
+
+        let mut reg = self.port_registry.lock_or_recover();
+        let Some(mut det) = reg.get(port) else {
+            anyhow::bail!("port {port} is not currently detected");
+        };
+        if reg.has_forward(port) {
+            return Ok(det);
+        }
+        // Already on all-interfaces: just advertise Tailscale URL, no proxy.
+        if det.host == "0.0.0.0" || det.host == "::" || det.host == "*" {
+            let url = format!("http://{ts_ip}:{port}");
+            det.forward = Some(ports::ForwardInfo {
+                via: "tailscale".into(),
+                url: url.clone(),
+            });
+            reg.insert_forward(
+                port,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                url,
+            );
+            self.touch();
+            return Ok(det);
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let url = start_tailscale_forward(port, ts_ip, Arc::clone(&stop))
+            .with_context(|| format!("bind Tailscale forward on {ts_ip}:{port}"))?;
+        reg.insert_forward(port, stop, url.clone());
+        det.forward = Some(ports::ForwardInfo {
+            via: "tailscale".into(),
+            url,
+        });
+        self.touch();
+        Ok(det)
     }
 
     /// Recompute cached git/ss metadata for every workspace. Runs only on
@@ -783,15 +988,28 @@ impl Server {
             // Git metadata follows the live cwd so branch and path (both shown
             // on the sidebar second line) never describe different directories.
             let path = Path::new(live_cwd.as_deref().unwrap_or(&cwd));
-            let roots = pane_ids
-                .iter()
-                .filter_map(|pane| pane_pids.get(pane).copied())
-                .collect::<Vec<_>>();
+            let ports = if self.ports_settings.enabled {
+                // Prefer the dedicated ports registry (proc-native, attributed).
+                let list: Vec<_> = self
+                    .port_registry
+                    .lock_or_recover()
+                    .list()
+                    .into_iter()
+                    .filter(|p| p.workspace.as_deref() == Some(id.as_str()))
+                    .collect();
+                to_listening_ports(&list)
+            } else {
+                let roots = pane_ids
+                    .iter()
+                    .filter_map(|pane| pane_pids.get(pane).copied())
+                    .collect::<Vec<_>>();
+                listening_ports_for_roots(&roots)
+            };
             updated.insert(
                 id,
                 WorkspaceMeta {
                     git_branch: git_branch(path),
-                    ports: listening_ports_for_roots(&roots),
+                    ports,
                     cwd: live_cwd,
                 },
             );
@@ -1229,8 +1447,8 @@ impl Server {
                 let data = self.notifications(limit)?;
                 Ok(Response::ok(data))
             }
-            Request::Events { limit } => {
-                let data = self.events(limit)?;
+            Request::Events { limit, since } => {
+                let data = self.events(limit, since)?;
                 Ok(Response::ok(data))
             }
             Request::ClearNotifications => {
@@ -1300,15 +1518,53 @@ impl Server {
                 cols,
                 rows,
                 lease_ms,
+                viewer_id,
             } => {
-                self.set_pane_view_size(Some(pane), PaneSize { rows, cols }, lease_ms)?;
+                self.set_pane_view_size(Some(pane), PaneSize { rows, cols }, lease_ms, viewer_id)?;
                 Ok(Response::empty())
             }
-            Request::ClearPaneViewSize { pane } => {
-                self.clear_pane_view_size(Some(pane))?;
+            Request::ClearPaneViewSize { pane, viewer_id } => {
+                self.clear_pane_view_size(Some(pane), viewer_id)?;
                 Ok(Response::empty())
+            }
+            Request::ListPorts { workspace } => {
+                if self.ports_settings.enabled {
+                    // Opportunistic refresh so CLI is not stuck on a 2s tick.
+                    self.refresh_ports();
+                }
+                let mut ports = self.port_registry.lock_or_recover().list();
+                if let Some(ws) = workspace {
+                    let session = self.session.lock_or_recover();
+                    let id = session
+                        .resolve_workspace_selector(&ws)
+                        .unwrap_or_else(|_| ws.clone());
+                    ports.retain(|p| p.workspace.as_deref() == Some(id.as_str()));
+                }
+                Ok(Response::ok(ports))
+            }
+            Request::ForwardPort { port, via } => {
+                let det = self.forward_port_inner(port, &via)?;
+                Ok(Response::ok(det))
+            }
+            Request::UnforwardPort { port } => {
+                let stopped = self.port_registry.lock_or_recover().stop_forward(port);
+                if !stopped {
+                    anyhow::bail!("port {port} is not forwarded");
+                }
+                self.touch();
+                Ok(Response::empty())
+            }
+            Request::PortSshCmd { port } => {
+                let host = resolve_ssh_host(&self.ports_settings.ssh_host);
+                let command = ssh_forward_command(port, &host);
+                Ok(Response::ok(serde_json::json!({
+                    "port": port,
+                    "host": host,
+                    "command": command,
+                })))
             }
             Request::Shutdown => {
+                self.port_registry.lock_or_recover().stop_all_forwards();
                 self.shutting_down
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.save()?;
@@ -1805,7 +2061,7 @@ impl Server {
                 parser: vt100::Parser::new(24, 80, 2000),
                 size: PaneSize { rows: 24, cols: 80 },
                 layout_size: PaneSize { rows: 24, cols: 80 },
-                view_override: None,
+                view_overrides: Vec::new(),
                 output_generation: 0,
                 scrollback_formatted_cache: String::new(),
                 scrollback_formatted_generation: u64::MAX,
@@ -1839,12 +2095,32 @@ impl Server {
 
         let output_server = Arc::clone(self);
         thread::spawn(move || {
+            // Batch PTY reads: one append_output (and generation bump) per drain
+            // of full 4 KB chunks instead of once per chunk at high throughput.
             let mut buf = [0_u8; 4096];
+            let mut batch = Vec::with_capacity(64 * 1024);
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        output_server.append_output(&runtime_key, &pane_id, generation, &buf[..n])
+                        batch.extend_from_slice(&buf[..n]);
+                        // Keep pulling while the OS is handing full buffers.
+                        let mut last = n;
+                        while last == buf.len() && batch.len() < 256 * 1024 {
+                            match reader.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(m) => {
+                                    batch.extend_from_slice(&buf[..m]);
+                                    last = m;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        output_server.append_output(&runtime_key, &pane_id, generation, &batch);
+                        batch.clear();
+                        if last == 0 {
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
@@ -2119,31 +2395,38 @@ impl Server {
             let Some(runtime) = panes.get_mut(&key) else {
                 continue;
             };
-            // The client reports its layout box; a live view override
-            // (phone-fit) clamps what actually reaches the PTY.
+            // The client reports its layout box; live view overrides
+            // (phone-fit) clamp what actually reaches the PTY.
             runtime.layout_size = sanitize_pane_size(size);
-            let next =
-                effective_pane_size(runtime.layout_size, runtime.view_override.map(|v| v.size));
+            let next = effective_with_overrides(
+                runtime.layout_size,
+                &runtime.view_overrides,
+                Instant::now(),
+            );
             apply_pty_size(runtime, next)?;
         }
         Ok(())
     }
 
     /// Set or refresh a pane's phone-fit view override (see the request docs).
+    ///
+    /// `viewer_id`: when set, upserts that viewer's lease so multiple phones
+    /// can share a pane (effective size = min). Empty/None replaces the whole
+    /// set (legacy single-viewer).
     fn set_pane_view_size(
         &self,
         pane: Option<String>,
         view: PaneSize,
         lease_ms: u64,
+        viewer_id: Option<String>,
     ) -> Result<()> {
         let pane_id = self.resolve_pane(pane)?;
         let runtime_key = self.active_runtime_key(&pane_id)?;
         let view = sanitize_pane_size(view);
+        let viewer_id = viewer_id.unwrap_or_default();
 
-        // LOCK ORDER: session first, released before panes. Mirror the marker
-        // into the session pane (snapshots read it from there) and refuse
-        // zoomed panes — the user zoomed for a full-area view; a phone glance
-        // must not shrink it under them.
+        // LOCK ORDER: session first, released before panes. Refuse zoomed
+        // panes — the user zoomed for a full-area view.
         {
             let mut session = self.session.lock_or_recover();
             let zoomed = session.workspaces.iter().any(|ws| {
@@ -2161,92 +2444,117 @@ impl Server {
             let Some(pane) = session.panes.get_mut(&pane_id) else {
                 return Err(anyhow!("unknown pane {pane_id}"));
             };
+            // Snapshot field shows the effective clamp after we recompute.
             pane.view_size = Some(crate::model::PaneViewSize {
                 cols: view.cols,
                 rows: view.rows,
             });
         }
 
-        let lease = Duration::from_millis(lease_ms.clamp(VIEW_LEASE_MS_MIN, VIEW_LEASE_MS_MAX));
-        {
+        let lease = clamp_lease_ms(lease_ms);
+        let now = Instant::now();
+        let eff = {
             let mut panes = self.panes.lock_or_recover();
             let key = if panes.contains_key(&runtime_key) {
                 runtime_key
             } else {
                 legacy_runtime_key(&pane_id)
             };
-            if let Some(runtime) = panes.get_mut(&key) {
-                runtime.view_override = Some(ViewOverride {
-                    size: view,
-                    expires_at: Instant::now() + lease,
-                });
-                runtime.pane.view_size = Some(crate::model::PaneViewSize {
-                    cols: view.cols,
-                    rows: view.rows,
-                });
-                let next = effective_pane_size(runtime.layout_size, Some(view));
-                apply_pty_size(runtime, next)?;
-            }
-        }
-        self.touch();
-        Ok(())
-    }
-
-    /// Drop a pane's view override and return it to its layout size now.
-    fn clear_pane_view_size(&self, pane: Option<String>) -> Result<()> {
-        let pane_id = self.resolve_pane(pane)?;
-        let runtime_key = self.active_runtime_key(&pane_id)?;
+            let Some(runtime) = panes.get_mut(&key) else {
+                return Ok(());
+            };
+            upsert_override(&mut runtime.view_overrides, viewer_id, view, lease, now);
+            let eff = min_live_view(&runtime.view_overrides, now);
+            runtime.pane.view_size = eff.map(|s| crate::model::PaneViewSize {
+                cols: s.cols,
+                rows: s.rows,
+            });
+            let next = effective_with_overrides(runtime.layout_size, &runtime.view_overrides, now);
+            apply_pty_size(runtime, next)?;
+            eff
+        };
         {
             let mut session = self.session.lock_or_recover();
             if let Some(pane) = session.panes.get_mut(&pane_id) {
-                pane.view_size = None;
-            }
-        }
-        {
-            let mut panes = self.panes.lock_or_recover();
-            let key = if panes.contains_key(&runtime_key) {
-                runtime_key
-            } else {
-                legacy_runtime_key(&pane_id)
-            };
-            if let Some(runtime) = panes.get_mut(&key) {
-                runtime.view_override = None;
-                runtime.pane.view_size = None;
-                apply_pty_size(runtime, runtime.layout_size)?;
+                pane.view_size = eff.map(|s| crate::model::PaneViewSize {
+                    cols: s.cols,
+                    rows: s.rows,
+                });
             }
         }
         self.touch();
         Ok(())
     }
 
-    /// Drop view overrides whose lease ran out, restoring layout sizes.
-    /// Returns true when anything changed (callers bump the generation).
-    /// Runs from the housekeeping tick so a vanished phone restores the pane
-    /// within seconds even though it never said goodbye.
+    /// Drop a pane's view override(s) and return it toward its layout size.
+    /// `viewer_id` None/empty clears all viewers; otherwise only that viewer.
+    fn clear_pane_view_size(&self, pane: Option<String>, viewer_id: Option<String>) -> Result<()> {
+        let pane_id = self.resolve_pane(pane)?;
+        let runtime_key = self.active_runtime_key(&pane_id)?;
+        let now = Instant::now();
+        let eff = {
+            let mut panes = self.panes.lock_or_recover();
+            let key = if panes.contains_key(&runtime_key) {
+                runtime_key
+            } else {
+                legacy_runtime_key(&pane_id)
+            };
+            let Some(runtime) = panes.get_mut(&key) else {
+                return Ok(());
+            };
+            clear_override(&mut runtime.view_overrides, viewer_id.as_deref());
+            let eff = min_live_view(&runtime.view_overrides, now);
+            runtime.pane.view_size = eff.map(|s| crate::model::PaneViewSize {
+                cols: s.cols,
+                rows: s.rows,
+            });
+            let next = effective_with_overrides(runtime.layout_size, &runtime.view_overrides, now);
+            apply_pty_size(runtime, next)?;
+            eff
+        };
+        {
+            let mut session = self.session.lock_or_recover();
+            if let Some(pane) = session.panes.get_mut(&pane_id) {
+                pane.view_size = eff.map(|s| crate::model::PaneViewSize {
+                    cols: s.cols,
+                    rows: s.rows,
+                });
+            }
+        }
+        self.touch();
+        Ok(())
+    }
+
+    /// Drop expired view leases, restoring layout sizes when none remain.
     fn expire_view_overrides(&self, now: Instant) -> bool {
-        let mut restored: Vec<String> = Vec::new();
+        let mut changed_panes: Vec<(String, Option<PaneSize>)> = Vec::new();
         {
             let mut panes = self.panes.lock_or_recover();
             for runtime in panes.values_mut() {
-                let expired = runtime
-                    .view_override
-                    .map(|v| v.expires_at <= now)
-                    .unwrap_or(false);
-                if expired {
-                    runtime.view_override = None;
-                    runtime.pane.view_size = None;
-                    apply_pty_size(runtime, runtime.layout_size).ok();
-                    restored.push(runtime.pane.id.clone());
+                if !expire_overrides(&mut runtime.view_overrides, now) {
+                    continue;
                 }
+                let eff = min_live_view(&runtime.view_overrides, now);
+                runtime.pane.view_size = eff.map(|s| crate::model::PaneViewSize {
+                    cols: s.cols,
+                    rows: s.rows,
+                });
+                let next =
+                    effective_with_overrides(runtime.layout_size, &runtime.view_overrides, now);
+                apply_pty_size(runtime, next).ok();
+                changed_panes.push((runtime.pane.id.clone(), eff));
             }
         }
-        if restored.is_empty() {
+        if changed_panes.is_empty() {
             return false;
         }
         let mut session = self.session.lock_or_recover();
-        for pane_id in &restored {
+        for (pane_id, eff) in &changed_panes {
             if let Some(pane) = session.panes.get_mut(pane_id) {
-                pane.view_size = None;
+                pane.view_size = eff.map(|s| crate::model::PaneViewSize {
+                    cols: s.cols,
+                    rows: s.rows,
+                });
             }
         }
         true
@@ -3063,12 +3371,13 @@ impl Server {
         }))
     }
 
-    fn events(&self, limit: usize) -> Result<serde_json::Value> {
+    fn events(&self, limit: usize, since: Option<u64>) -> Result<serde_json::Value> {
         let snapshot = self.snapshot(false)?;
         let limit = limit.clamp(1, 500);
         let events = snapshot
             .events
             .iter()
+            .filter(|event| since.map(|s| event.id > s).unwrap_or(true))
             .rev()
             .take(limit)
             .map(|event| {
@@ -3815,26 +4124,46 @@ impl Server {
     /// (`vmux new-pane --command claude`) or, far more commonly, as a process
     /// the user started inside the pane's shell.
     ///
-    /// The process-tree walk is cached for `AGENT_INSIDE_TTL_SECS`: it is only
-    /// reached when a pane emits a title worth acting on or is due for the
-    /// summarizer, but a shell that retitles on every prompt would otherwise
-    /// walk /proc on every command.
-    fn pane_runs_agent(&self, runtime: &mut PaneRuntime) -> bool {
+    /// Never walks `/proc` here: that walk is O(all processes) and used to run
+    /// under the `panes` lock on the PTY hot path (OSC titles). Cached
+    /// `agent_inside` is refreshed by [`Self::refresh_agent_inside_flags`] on
+    /// the decay loop instead.
+    fn pane_runs_agent(&self, runtime: &PaneRuntime) -> bool {
         if is_coding_agent_command(&runtime.pane.command) {
             return true;
         }
-        let Some(pid) = runtime.pane.pid else {
+        if runtime.pane.pid.is_none() {
             return false;
+        }
+        runtime.agent_inside
+    }
+
+    /// Background `/proc` walk for `agent_inside` — never called under `panes`
+    /// while holding the lock during PTY output.
+    fn refresh_agent_inside_flags(&self) {
+        let targets: Vec<(String, u32)> = {
+            let panes = self.panes.lock_or_recover();
+            panes
+                .iter()
+                .filter_map(|(key, runtime)| {
+                    if is_coding_agent_command(&runtime.pane.command) {
+                        return None;
+                    }
+                    runtime.pane.pid.map(|pid| (key.clone(), pid))
+                })
+                .collect()
         };
         let now = unix_time();
-        if now.saturating_sub(runtime.agent_inside_at) < AGENT_INSIDE_TTL_SECS
-            && runtime.agent_inside_at != 0
-        {
-            return runtime.agent_inside;
+        for (key, pid) in targets {
+            let inside = agent_running_in_pane(pid);
+            let mut panes = self.panes.lock_or_recover();
+            if let Some(runtime) = panes.get_mut(&key) {
+                if runtime.pane.pid == Some(pid) {
+                    runtime.agent_inside = inside;
+                    runtime.agent_inside_at = now;
+                }
+            }
         }
-        runtime.agent_inside = agent_running_in_pane(pid);
-        runtime.agent_inside_at = now;
-        runtime.agent_inside
     }
 
     /// Put an agent-derived title on the tab owning `pane_id`. Tabs the user has
@@ -3950,6 +4279,19 @@ impl Server {
                 runtime.killer = None;
             }
         }
+        // Tear down any Tailscale forwards that belonged to this pane.
+        {
+            let mut reg = self.port_registry.lock_or_recover();
+            let ports: Vec<u16> = reg
+                .list()
+                .into_iter()
+                .filter(|p| p.pane.as_deref() == Some(pane_id))
+                .map(|p| p.port)
+                .collect();
+            for port in ports {
+                reg.stop_forward(port);
+            }
+        }
         let Some(runtime_pane) = runtime_pane else {
             return;
         };
@@ -4027,6 +4369,19 @@ impl Server {
             }
         }
 
+        // Panes on inactive tabs are invisible to attach; lean polls skip their
+        // screen strings entirely (status/cursor only) unless the client is
+        // scrolled back in them.
+        let visible_panes: Option<BTreeSet<String>> = lean_scrollback.map(|_| {
+            let mut visible = BTreeSet::new();
+            for workspace in &session.workspaces {
+                for pane_id in &workspace.panes {
+                    visible.insert(pane_id.clone());
+                }
+            }
+            visible
+        });
+
         // The vt100 parser lives in the runtime, so screen access must happen
         // under the panes lock; collect the minimal per-pane data here and
         // perform the (allocation-heavy) session merge after releasing it.
@@ -4051,8 +4406,6 @@ impl Server {
                         runtime.parser.screen(),
                     );
                     let output = if include_output {
-                        let contents = runtime.parser.screen().contents();
-                        let formatted = screen_contents_formatted(runtime.parser.screen());
                         let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
                         pane.cursor_row = Some(cursor_row);
                         pane.cursor_col = Some(cursor_col);
@@ -4060,39 +4413,58 @@ impl Server {
                         pane.screen_rows = Some(screen_rows);
                         pane.screen_cols = Some(screen_cols);
                         update_pane_terminal_modes(&mut pane, runtime.parser.screen());
-                        let lean_skip = lean_scrollback
-                            .map(|keep| !keep.contains(&pane.id))
+                        let on_hidden_tab = visible_panes
+                            .as_ref()
+                            .map(|v| !v.contains(&pane.id))
                             .unwrap_or(false);
-                        if lean_skip {
-                            // Lean poll: the client only needs the live screen
-                            // plus a line count for scroll clamping — skip the
-                            // joined-output copy and styled-scrollback rebuild.
+                        let keep_scrollback = lean_scrollback
+                            .map(|keep| keep.contains(&pane.id))
+                            .unwrap_or(false);
+                        if on_hidden_tab && !keep_scrollback {
+                            // Inactive tab: metadata only — no screen strings.
                             pane.scrollback_lines = Some(chunked_line_count(&runtime.output));
-                            Some((contents, formatted, String::new(), String::new()))
+                            Some((String::new(), String::new(), String::new(), String::new()))
                         } else {
-                            // Rebuild styled scrollback only when output changed.
-                            if runtime.scrollback_formatted_generation != runtime.output_generation
-                            {
-                                runtime.scrollback_formatted_cache = screen_scrollback_formatted(
-                                    &mut runtime.parser,
-                                    SCROLLBACK_FORMATTED_ROW_CAP,
-                                );
-                                runtime.scrollback_formatted_generation = runtime.output_generation;
+                            let contents = runtime.parser.screen().contents();
+                            let formatted = screen_contents_formatted(runtime.parser.screen());
+                            let lean_skip = lean_scrollback
+                                .map(|keep| !keep.contains(&pane.id))
+                                .unwrap_or(false);
+                            if lean_skip {
+                                // Lean poll: the client only needs the live screen
+                                // plus a line count for scroll clamping — skip the
+                                // joined-output copy and styled-scrollback rebuild.
+                                pane.scrollback_lines = Some(chunked_line_count(&runtime.output));
+                                Some((contents, formatted, String::new(), String::new()))
+                            } else {
+                                // Rebuild styled scrollback only when output changed.
+                                if runtime.scrollback_formatted_generation
+                                    != runtime.output_generation
+                                {
+                                    runtime.scrollback_formatted_cache =
+                                        screen_scrollback_formatted(
+                                            &mut runtime.parser,
+                                            SCROLLBACK_FORMATTED_ROW_CAP,
+                                        );
+                                    runtime.scrollback_formatted_generation =
+                                        runtime.output_generation;
+                                }
+                                // Also keep plain scrollback string in runtime for persist/save.
+                                let raw = runtime.joined_output();
+                                runtime.pane.scrollback =
+                                    trim_output(raw.clone(), self.scrollback_cap);
+                                runtime.pane.output = contents.clone();
+                                runtime.pane.output_formatted = formatted.clone();
+                                runtime.pane.scrollback_formatted =
+                                    runtime.scrollback_formatted_cache.clone();
+                                Some((
+                                    contents,
+                                    formatted,
+                                    raw,
+                                    runtime.scrollback_formatted_cache.clone(),
+                                ))
                             }
-                            // Also keep plain scrollback string in runtime for persist/save.
-                            let raw = runtime.joined_output();
-                            runtime.pane.scrollback = trim_output(raw.clone(), self.scrollback_cap);
-                            runtime.pane.output = contents.clone();
-                            runtime.pane.output_formatted = formatted.clone();
-                            runtime.pane.scrollback_formatted =
-                                runtime.scrollback_formatted_cache.clone();
-                            Some((
-                                contents,
-                                formatted,
-                                raw,
-                                runtime.scrollback_formatted_cache.clone(),
-                            ))
-                        }
+                        } // end visible-pane lean branch
                     } else {
                         // Light snapshot: cursor/status only, no heavy strings.
                         let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
@@ -4279,6 +4651,7 @@ impl Server {
             started_at: self.started_at,
             // Read from the cache the background thread keeps fresh (cheap).
             update_available: crate::update::available_update(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }
     }
 
@@ -4318,6 +4691,8 @@ impl Server {
             // Same tick also reaps expired phone-fit view leases, so a viewer
             // that vanished restores the pane within DECAY_TICK_SECS + lease.
             changed |= self.expire_view_overrides(Instant::now());
+            // Refresh agent-inside flags off the PTY hot path (/proc walk).
+            self.refresh_agent_inside_flags();
             if changed {
                 self.touch();
                 self.save().ok();
@@ -4389,7 +4764,8 @@ impl Server {
             pane.view_size = None;
             pane.alternate_scroll_mode = false;
         }
-        let payload = serde_json::to_vec_pretty(&snapshot)?;
+        // Compact JSON: pretty-print was multi-MB and blocked request threads.
+        let payload = serde_json::to_vec(&snapshot)?;
         *counter = counter.wrapping_add(1);
         let tmp =
             self.state_path
@@ -4691,7 +5067,9 @@ fn screen_scrollback_formatted(parser: &mut vt100::Parser, row_cap: usize) -> St
 
 /// Row cap for [`screen_scrollback_formatted`]; bounds the per-snapshot walk and
 /// the serialized payload while still covering deep scrolled-back views.
-const SCROLLBACK_FORMATTED_ROW_CAP: usize = 500;
+/// Kept in the same ballpark as default scrollback (~2500 lines) so
+/// `scrollback_lines` and styled history no longer disagree after ~500 lines.
+const SCROLLBACK_FORMATTED_ROW_CAP: usize = 2500;
 
 fn update_pane_terminal_modes(pane: &mut Pane, screen: &vt100::Screen) {
     pane.mouse_protocol_mode = match screen.mouse_protocol_mode() {
@@ -5177,7 +5555,13 @@ fn parse_listening_ports(output: &str, owned: &BTreeSet<u32>) -> Vec<ListeningPo
                     }
                 }
             })
-            .or_insert(ListeningPort { host, port, pids });
+            .or_insert(ListeningPort {
+                host,
+                port,
+                pids,
+                process: None,
+                pane: None,
+            });
     }
     ports.into_values().collect()
 }
@@ -6405,6 +6789,7 @@ mod tests {
 
     #[test]
     fn effective_pane_size_is_min_per_axis() {
+        use super::view_size::effective_pane_size;
         let layout = PaneSize { cols: 80, rows: 24 };
         // Phone narrower but taller than the layout: each axis clamps alone.
         let out = effective_pane_size(layout, Some(PaneSize { cols: 46, rows: 60 }));
@@ -6449,7 +6834,7 @@ mod tests {
                     parser: vt100::Parser::new(24, 80, 1000),
                     size: PaneSize { cols: 80, rows: 24 },
                     layout_size: PaneSize { cols: 80, rows: 24 },
-                    view_override: None,
+                    view_overrides: Vec::new(),
                     output_generation: 1,
                     scrollback_formatted_cache: String::new(),
                     scrollback_formatted_generation: u64::MAX,
@@ -6470,6 +6855,7 @@ mod tests {
                 Some("pane-1".into()),
                 PaneSize { cols: 46, rows: 60 },
                 10_000,
+                None,
             )
             .unwrap();
         assert!(server.generation() > before, "set must bump the generation");
@@ -6528,7 +6914,7 @@ mod tests {
                     rows: 30
                 }
             );
-            assert!(panes["pane-1"].view_override.is_none());
+            assert!(panes["pane-1"].view_overrides.is_empty());
         }
         let snap = server.snapshot(false).unwrap();
         assert!(snap.panes["pane-1"].view_size.is_none());
@@ -6541,6 +6927,7 @@ mod tests {
                 Some("pane-1".into()),
                 PaneSize { cols: 46, rows: 22 },
                 5_000,
+                None,
             )
             .unwrap_err();
         assert!(
@@ -7468,7 +7855,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 parser: vt100::Parser::new(24, 80, 1000),
                 size: PaneSize { cols: 80, rows: 24 },
                 layout_size: PaneSize { cols: 80, rows: 24 },
-                view_override: None,
+                view_overrides: Vec::new(),
                 output_generation: 1,
                 scrollback_formatted_cache: String::new(),
                 scrollback_formatted_generation: u64::MAX,
@@ -7559,7 +7946,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                     parser: vt100::Parser::new(24, 80, 1000),
                     size: PaneSize { cols: 80, rows: 24 },
                     layout_size: PaneSize { cols: 80, rows: 24 },
-                    view_override: None,
+                    view_overrides: Vec::new(),
                     output_generation: 1,
                     scrollback_formatted_cache: String::new(),
                     scrollback_formatted_generation: u64::MAX,

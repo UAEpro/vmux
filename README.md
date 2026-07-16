@@ -2,6 +2,8 @@
 
 A terminal multiplexer for Linux, built for working alongside AI coding agents.
 
+**Website:** [https://vmux.sh](https://vmux.sh) · **Source:** [GitHub](https://github.com/UAEpro/vmux)
+
 ```text
   ┌──────── sidebar ────────┐  ┌──────────── workspace ────────────┐
   │ 📁 agents          🔄   │  │  tab: main │ tab: tests │ +       │
@@ -25,6 +27,9 @@ language you did not ask for.
 
 ## Install
 
+Docs and install options: **[https://vmux.sh](https://vmux.sh)** /
+[https://vmux.sh/install.html](https://vmux.sh/install.html).
+
 Prebuilt binary — Linux (x86_64, aarch64) and macOS (Apple silicon, Intel):
 
 ```sh
@@ -35,8 +40,10 @@ This picks the build for your platform, puts `vmux` in `~/.local/bin` (override
 with `VMUX_INSTALL_DIR`) and verifies the release checksum. The Linux binaries
 are static, so they run on any distro.
 
-Windows is not supported: vmux is built on Unix domain sockets, `fork`/`setsid`
-and POSIX signals. It runs under WSL.
+**Windows is not supported.** vmux depends on Unix domain sockets, `fork` /
+`setsid`, and POSIX signals. There is no native Windows build. **WSL is fine**
+— it is Linux, so the Linux binary and source builds work there the same as on
+a bare-metal distro.
 
 From crates.io, with Rust 1.87 or newer:
 
@@ -48,9 +55,9 @@ The crate is `vmux-tui` because `vmux` was already taken on crates.io. The
 command it installs is still `vmux`.
 
 vmux shells out to a few tools. `git` and `curl` are worth having. `ss` and
-`tailscale` are optional, and unlock port detection and the phone relay
-respectively. vmux makes no network calls of its own beyond the once-a-day
-update check.
+`tailscale` are optional, and unlock [port detection](docs/ports.md) and the
+[phone relay](docs/relay.md) respectively. vmux makes no network calls of its
+own beyond the once-a-day update check.
 
 ## Quick start
 
@@ -93,6 +100,8 @@ Session  (default, work, …)          one daemon, one socket
 
 A workspace is the unit you think in. It has a directory, so a new pane opens
 where you expect, and the sidebar shows its git branch and its agent's status.
+Listening ports owned by pane processes show up too — list or forward them with
+`vmux ports` ([docs/ports.md](docs/ports.md)).
 
 ## Keys
 
@@ -135,6 +144,22 @@ vmux notify --pane pane-1 --status done --message "tests passed"
 printf '\033]9;needs input\a'          # or just an OSC escape
 ```
 
+## Phone relay
+
+The [phone relay](docs/relay.md) speaks the Cmux Remote protocol so you can
+drive a session from your phone over Tailscale. It is **on by default** on
+attach.
+
+Default listen port is **4399** (what the phone app expects), but it is
+**configurable**:
+
+```sh
+vmux config set relay.port 4399
+vmux relay serve --listen 127.0.0.1:4400
+```
+
+The relay never binds `0.0.0.0` / `::` — Tailscale or localhost only.
+
 ## Pasting screenshots over SSH
 
 Claude Code's Ctrl+V image paste reads the clipboard of the machine it runs
@@ -142,11 +167,12 @@ on. When you SSH into a box running vmux, your screenshot is on your laptop,
 so Claude says "No image found on clipboard". vmux bridges that two ways.
 
 **The paste page — nothing to install.** With the [relay](docs/relay.md)
-running (`vmux relay serve`), open `http://<host>:4399/paste` in any browser
-on your tailnet and press `Cmd+V`. The image is saved on the host and its
-path is typed into the active pane, where Claude Code picks it up as an
-attachment. Works from a phone too — same page, photo picker included. Keep
-the tab around and pasting a screenshot is: screenshot, switch tab, `Cmd+V`.
+running (`vmux relay serve`), open `http://<host>:<port>/paste` in any browser
+on your tailnet (default port **4399**) and press `Cmd+V`. The image is saved
+on the host and its path is typed into the active pane, where Claude Code picks
+it up as an attachment. Works from a phone too — same page, photo picker
+included. Keep the tab around and pasting a screenshot is: screenshot, switch
+tab, `Cmd+V`.
 
 **`vmux send-image` — for the terminal.** Pipes image bytes over SSH and
 types the saved path into a pane:
@@ -169,9 +195,14 @@ For both, `--pane pane-2` / `?pane=pane-2` targets a specific pane and
 ## Docs
 
 - [CLI reference](docs/cli.md), or `vmux --help`
-- [Configuration](docs/config.md), including themes and project actions
-- [Phone relay](docs/relay.md), a Cmux Remote-compatible server for driving vmux from an iPhone over Tailscale
-- [Contributing](CONTRIBUTING.md) and architecture notes
+- [Configuration](docs/config.md) (themes, relay, ports, agent titles)
+- [Config JSON Schema](docs/config.schema.json)
+- [Ports](docs/ports.md) — detection, list, ssh-cmd, forward
+- [Phone relay](docs/relay.md) — Cmux Remote-compatible server over Tailscale
+- [Architecture](docs/architecture.md) — daemon / client / relay
+- [Troubleshooting](docs/troubleshooting.md)
+- [Contributing](CONTRIBUTING.md)
+- Website: [https://vmux.sh](https://vmux.sh)
 
 ## Prior art
 

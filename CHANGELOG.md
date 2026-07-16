@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+Documentation, branding, config schema, and full-roadmap platform work.
+
+### Added
+
+- **Config JSON Schema** at `docs/config.schema.json` covering `ui.*`,
+  `relay.*`, `agent_titles.*`, and `ports.*` (with `$schema` usage notes in
+  `docs/config.md`).
+- **Ports subsystem** (`src/daemon/ports.rs`): Linux `/proc` scanner with
+  pane attribution, open/close events + notifications, `ports.*` config,
+  CLI + attach panel (`Ctrl-b o`), Tailscale TCP proxy. See `docs/ports.md`.
+- **Multi-viewer phone-fit** (`daemon/view_size.rs`): `min()` across live
+  leased viewers via `viewer_id` on set/clear view size.
+- **`Events { since }`** incremental poll; `vmux events --since` / follow.
+- **Settings** rows: relay port, CGNAT, phone-fit resize, ports toggles.
+- **Docs / schema:** architecture, troubleshooting, ports, config schema.
+- **`protocol_version`** on `DaemonInfo` / Ping.
+- **Attach reconnect** via `request_with_retry`.
+- **Daemon connection cap** (256) + socket timeouts.
+- **`cargo bench --bench hot_path`** micro-benchmarks.
+
+### Changed
+
+- **Branding:** package `homepage` is `https://vmux.sh` (repository remains
+  GitHub). Windows is explicitly unsupported; WSL is fine (it is Linux).
+- **Relay port** configurable (`relay.port`, `vmux relay serve --port`).
+- **Scroll:** styled history cap 2500; UI clamp matches styled length.
+- **Perf:** PTY batching; compact saves; agent_inside `/proc` off PTY path.
+- Repo hygiene: clean `todo.md`; scratch notes stay gitignored.
+
 ## v0.4.1 — 2026-07-14
 
 Bug-fix and polish release. Upgrade with the install one-liner,

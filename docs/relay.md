@@ -2,11 +2,13 @@
 
 `vmux relay` speaks the community
 [Cmux Remote](https://github.com/NewTurn2017/cmux-remote) HTTP and WebSocket
-protocol. Point that iPhone app at your Tailscale IP on port `4399` and you can
-drive vmux workspaces and panes from your phone.
+protocol. Point that iPhone app at your Tailscale IP and the relay port (default
+`4399`, **configurable**) and you can drive vmux workspaces and panes from your
+phone.
 
 ```text
-iPhone (Cmux Remote)  ── Tailscale ──►  vmux relay :4399  ── Unix socket ──►  vmux daemon
+iPhone (Cmux Remote)  ── Tailscale ──►  vmux relay :port  ── Unix socket ──►  vmux daemon
+                                         (default 4399)
 ```
 
 The relay is **on by default**. On `vmux attach`, a managed relay starts if it is
@@ -20,6 +22,27 @@ daemon behave beyond that process.
 > Mobile Connect is a different stack and will not work with it. Protocol drift
 > in the App Store app may require relay updates.
 
+## Port (not fixed)
+
+The historical Cmux Remote default is **4399**, and vmux uses that out of the
+box — but the port is **not** hard-wired.
+
+| How | Example |
+|-----|---------|
+| Config (managed relay / attach auto-start) | `vmux config set relay.port 4400` |
+| CLI override | `vmux relay serve --listen 100.x.y.z:4400` |
+| relay.json `listen` | `"listen": "127.0.0.1:4400"` |
+
+Whatever you choose, the phone app (and paste-page URLs) must use the **same**
+port. `relay.port` is an integer **1–65535** (`0` is rejected).
+
+### One relay for all sessions
+
+The managed phone relay is **machine-global**, not per `vmux --session`.
+Session `default` and session `dev` share the same config port (default 4399)
+and the same process: a second attach sees “already running” and reuses it.
+That is intentional — the phone app points at one host:port.
+
 ## Settings
 
 In `vmux attach`, open **⚙ set** and find the **mobile relay** section:
@@ -28,7 +51,15 @@ In `vmux attach`, open **⚙ set** and find the **mobile relay** section:
 |---------|---------|
 | mobile relay | `on` / `off` (default **on**). When on, attach auto-starts the relay. |
 | relay bind | `auto` (Tailscale IP if online, else localhost), `tailscale`, or `local` |
+| relay port | TCP port (default `4399`) |
 | relay localhost | Allow device registration from `127.0.0.1`, for dev |
+| paste page | Serve `/paste` for screenshot paste |
+| phone-fit resize | Leased view-size overrides (`relay.allow_view_resize`) |
+
+**Deferred apply:** changing relay port / bind / toggles in Settings does **not**
+restart the relay on every keypress. Edits stay **pending** until you move to
+another settings row or close Settings (Esc / ⚙). Then config is saved once and
+the managed relay is restarted once — no multi-second lag while cycling ports.
 
 There is deliberately no "all interfaces" option. The relay refuses to bind
 `0.0.0.0` or `::`, so it will not end up exposed on every NIC. Phone access goes
@@ -40,7 +71,10 @@ The same settings from the CLI:
 vmux config set relay.enabled true       # default
 vmux config set relay.enabled false      # disable auto-start
 vmux config set relay.bind auto          # auto | tailscale | local
+vmux config set relay.port 4399
 vmux config set relay.allow_localhost false
+vmux config set relay.allow_paste true
+vmux config set relay.allow_view_resize false
 ```
 
 With `relay.enabled` set (the default), the next `vmux attach` starts a managed
@@ -50,6 +84,9 @@ relay process. Turning it off stops it.
 
 ```sh
 vmux relay serve
+
+# Custom port / address
+vmux relay serve --listen 127.0.0.1:4400
 
 # Same-machine testing, skipping the Tailscale whois check
 vmux relay serve --allow-localhost --listen 127.0.0.1:4399
@@ -63,7 +100,10 @@ The relay auto-starts a session daemon if one is not already up.
 
 ## Configuration
 
-Written on first run to `~/.config/vmux/relay.json`:
+User-level preferences (`relay.*`) live in the main vmux config
+([config.md](config.md), [config.schema.json](config.schema.json)).
+
+Runtime relay file written on first run to `~/.config/vmux/relay.json`:
 
 ```json
 {
@@ -79,7 +119,7 @@ Written on first run to `~/.config/vmux/relay.json`:
 
 | Key | Meaning |
 |-----|---------|
-| `listen` | Host and port. Must not be `0.0.0.0` or `::`; the relay refuses to start. |
+| `listen` | Host and port. Must not be `0.0.0.0` or `::`; the relay refuses to start. Change the port here or via `relay.port` / `--listen`. |
 | `allow_login` | Tailscale login names allowed to pair. Empty means any successful `tailscale whois`. |
 | `allow_localhost` | Allow `127.0.0.1` registration. Also settable with `VMUX_RELAY_ALLOW_LOCALHOST=1`. |
 | `allow_tailnet_cgnat` | Accept `100.64.0.0/10` peers without a whois lookup. Practical with Tailscale. |
@@ -93,14 +133,16 @@ lost phone with `vmux relay devices revoke`.
 
 1. Install Cmux Remote, or another client that speaks the same wire protocol.
 2. Run Tailscale on the phone and on the Linux host, on the same tailnet.
-3. On the host, run `vmux relay serve`.
-4. In the app, set host to your `tailscale ip -4` address and port to `4399`.
+3. On the host, run `vmux relay serve` (or attach with `relay.enabled`).
+4. In the app, set host to your `tailscale ip -4` address and port to your
+   relay port (**4399** unless you changed `relay.port` / `--listen`).
 5. Pair, list workspaces, open a surface.
 
 To check the relay is reachable before you touch the phone:
 
 ```sh
-curl -s http://$(tailscale ip -4):4399/v1/health
+PORT=4399   # or whatever you configured
+curl -s http://$(tailscale ip -4):${PORT}/v1/health
 # {"ok":true,"version":"…","backend":"vmux",…}
 ```
 
@@ -134,12 +176,12 @@ you are SSH'd in from another machine — the case where Ctrl+V inside Claude
 Code can never work, because the image is in *your laptop's* clipboard and the
 agent only checks the host's.
 
-Open `http://<host>:4399/paste` in any browser on the tailnet, press
-`Cmd+V`/`Ctrl+V` (or drop an image file), and the relay saves the image on the
-host and types its path into the active pane. Claude Code and friends pick the
-path up as an attachment. Nothing to install on the laptop or phone; the page
-pairs itself with the relay using the same device registration as the app, and
-the token sticks in browser storage.
+Open `http://<host>:<port>/paste` in any browser on the tailnet (default port
+**4399**), press `Cmd+V`/`Ctrl+V` (or drop an image file), and the relay saves
+the image on the host and types its path into the active pane. Claude Code and
+friends pick the path up as an attachment. Nothing to install on the laptop or
+phone; the page pairs itself with the relay using the same device registration
+as the app, and the token sticks in browser storage.
 
 The endpoint behind it is `POST /v1/paste` (raw image bytes, `Bearer` device
 token). `?pane=pane-2` targets a pane other than the active one, `?enter=1`
@@ -156,3 +198,8 @@ vmux config set relay.allow_paste false
 
 For scripting the same thing over plain SSH, see `vmux send-image` in the
 [CLI reference](cli.md).
+
+## Troubleshooting
+
+Pairing and reachability issues are covered in
+[troubleshooting.md](troubleshooting.md).

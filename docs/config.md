@@ -1,7 +1,8 @@
 # Configuration
 
 Config is managed with `vmux config` and mirrored in the attach **Settings**
-panel (**⚙ set**). Changes from either side apply to the running session.
+panel (**⚙ set**). Changes from either side apply to the running session
+unless noted.
 
 ```sh
 vmux config show
@@ -9,26 +10,102 @@ vmux config init                      # write defaults, install agent hooks
 vmux config set ui.prefix_key Ctrl-a
 ```
 
+Path (XDG): typically `~/.config/vmux/config.json`.
+
+### JSON Schema
+
+Editors and CI can validate against the checked-in schema:
+
+```json
+{
+  "$schema": "./config.schema.json"
+}
+```
+
+Or open [config.schema.json](config.schema.json) directly (`$id`:
+`https://vmux.sh/docs/config.schema.json`). The schema documents `ui.*`,
+`relay.*`, `agent_titles.*`, and `ports.*`.
+
 ## Keys
+
+### `ui.*`
 
 | Key | Example | Notes |
 |-----|---------|-------|
 | `ui.prefix_key` | `Ctrl-b`, `Ctrl-a` | Prefix chord. Default `Ctrl-b`. |
 | `ui.sidebar_collapsed` | `true` / `false` | Start with a compact sidebar |
-| `ui.sidebar_width` | `28` | Width when expanded |
+| `ui.sidebar_width` | `28` | Expanded width (12–60). Max when `sidebar_fit` is on |
+| `ui.sidebar_fit` | `true` / `false` | Fit width to workspace name text |
+| `ui.sidebar_responsive` | `true` / `false` | Auto-hide sidebar on narrow terminals (default on) |
 | `ui.scroll_step` | `8` | Lines per scroll step |
-| `ui.scrollback_bytes` | `200000` | Output retained per pane, in bytes (~2500 lines). Clamped to 16 KB–5 MB. Takes effect on the next daemon start. |
+| `ui.scrollback_bytes` | `200000` | Output retained per pane (~2500 lines). Clamped 16 KB–5 MB. **Next daemon start** |
 | `ui.theme` | see below | Color theme |
+| `ui.workspace_second_line` | `path`, `branch`, … | Second line of each sidebar workspace row |
 | `ui.status_markers` | `emoji`, `ascii`, `off` | How agent status renders in the sidebar |
-| `ui.cursor` | set in the Settings panel | Cursor style and blink |
-| `agent_titles.enabled` | `true` / `false` | Name tabs after what the agent in them is doing |
-| `agent_titles.llm_fallback` | `true` / `false` | Ask a model to name tabs agents don't title themselves |
-| `agent_titles.llm_command` | `claude -p` | Headless command that reads a prompt and prints a title |
-| `agent_titles.llm_delay_ms` | `20000` | How long to wait for the agent's own title first |
+| `ui.cursor_blink` | `true` / `false` | Soft-blink active caret while idle |
+| `ui.cursor_blink_ms` | `1000` | Half-period of caret blink (200–5000 ms) |
+| `ui.default_shell` | `zsh`, empty | Empty = `$SHELL` |
+| `ui.default_cwd` | `launch`, `home` | New pane/workspace directory |
+| `ui.mouse` | `true` / `false` | Capture mouse in attach UI |
+| `ui.tab_close_button` | `true` / `false` | Show × on tabs when more than one exists |
+| `ui.bell_on_attention` | `true` / `false` | Terminal bell on attention / needs-input |
 
-Relay keys (`relay.enabled`, `relay.bind`, `relay.allow_localhost`,
-`relay.allow_paste`, `relay.allow_view_resize`) are covered in
-[relay.md](relay.md).
+### `relay.*`
+
+| Key | Example | Notes |
+|-----|---------|-------|
+| `relay.enabled` | `true` / `false` | Auto-start phone relay on attach (default **on**) |
+| `relay.bind` | `auto`, `tailscale`, `local` | Never binds `0.0.0.0` |
+| `relay.port` | `4399` | TCP port **1–65535** (default 4399). Also: `vmux relay serve --listen host:port` |
+| `relay.allow_localhost` | `true` / `false` | Allow device registration from loopback |
+| `relay.allow_tailnet_cgnat` | `true` / `false` | Accept CGNAT peers without whois |
+| `relay.allow_paste` | `true` / `false` | Browser paste page (`/paste`) |
+| `relay.allow_view_resize` | `true` / `false` | Phone-fit leased pane resize (default off) |
+
+Full relay behaviour: [relay.md](relay.md).
+
+```sh
+vmux config set relay.port 4400
+vmux config set relay.bind auto
+vmux relay serve --listen 127.0.0.1:4400
+```
+
+### `agent_titles.*`
+
+| Key | Example | Notes |
+|-----|---------|-------|
+| `agent_titles.enabled` | `true` / `false` | Name tabs after agent work |
+| `agent_titles.llm_fallback` | `true` / `false` | LLM last-resort titles |
+| `agent_titles.llm_command` | `claude -p` | Reads prompt on stdin, prints a short title |
+| `agent_titles.llm_delay_ms` | `20000` | Wait for free sources before LLM |
+
+### `ports.*`
+
+Workspace listening-port detection and forward helpers. See [ports.md](ports.md).
+
+| Key | Example | Notes |
+|-----|---------|-------|
+| `ports.enabled` | `true` / `false` | Detect ports via `/proc` on Linux (default **on**) |
+| `ports.notify` | `toast`, `banner`, `off` | How new ports surface in the UI |
+| `ports.auto_forward` | `true` / `false` | Auto Tailscale-forward new ports (default **off**) |
+| `ports.forward_via` | `ask`, `tailscale`, `ssh` | Preference (CLI auto-forward uses tailscale) |
+| `ports.poll_secs` | `2` | Scan interval (1–60) |
+| `ports.ignore` | `5432,6379` | Never surface these ports (comma-separated) |
+| `ports.ignore_processes` | `ssh,sshd` | Ignore by `/proc` comm (comma-separated) |
+| `ports.ignore_ephemeral` | `true` / `false` | Hide kernel ephemeral range (default on) |
+| `ports.ssh_host` | `user@host` | Default host for `vmux ports ssh-cmd` |
+
+Takes effect on the **next daemon start** for poll interval and enable flag;
+ignore lists apply on the next scan after restart.
+
+```sh
+vmux config set ports.enabled true
+vmux config set ports.notify toast
+vmux config set ports.auto_forward false
+vmux config set ports.ignore 5432,6379
+vmux config set ports.ignore_processes node_modules
+vmux config set ports.ssh_host 'user@devbox'
+```
 
 ## Automatic tab names
 
@@ -56,9 +133,12 @@ Sources, in order (first usable label wins for that update):
 Shells never rename tabs (`user@host`, paths). Renaming a tab yourself pins it:
 vmux will not rename it again.
 
-    vmux config set agent_titles.enabled false     # off entirely
+```sh
+vmux config set agent_titles.enabled false     # off entirely
+```
 
-Changes take effect on the next daemon start (`vmux kill`, then attach).
+Changes take effect on the next daemon start (`vmux kill` / `vmux stop`, then
+attach).
 
 ## Themes
 
@@ -76,11 +156,10 @@ vmux config set ui.theme tokyo-night
 
 ## Responsive layout
 
-Below 90 columns, the workspace sidebar auto-hides so panes get the full width.
-It is on by default and can be turned off in Settings. When it is hidden, reach
-workspaces through the **📱 menu** button on the control bar, or press
-`Ctrl-b w` for the picker (`j`/`k` or arrows, `Enter` to switch, `Esc` to
-close).
+Below 90 columns, the workspace sidebar auto-hides so panes get the full width
+(`ui.sidebar_responsive`, default on). When it is hidden, reach workspaces
+through the **📱 menu** button on the control bar, or press `Ctrl-b w` for the
+picker (`j`/`k` or arrows, `Enter` to switch, `Esc` to close).
 
 ## Project actions
 
@@ -95,4 +174,4 @@ vmux actions run test
 ## Update checks
 
 vmux checks for a new release once a day and prints a notice. Disable it by
-setting `VMUX_NO_UPDATE_CHECK=1`.
+setting `VMUX_NO_UPDATE_CHECK=1`. Site and releases: https://vmux.sh

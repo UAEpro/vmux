@@ -193,9 +193,20 @@ struct Ui {
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
     mobile_relay_allow_paste: bool,
-    /// No settings-panel toggle (config-set only), but carried in App state so
-    /// the panel's settings writeback can't silently reset the gate to false.
+    /// Phone-fit pane resize gate (settings + config).
     mobile_relay_allow_view_resize: bool,
+    /// Relay rows edited in Settings but not yet written / applied. Restarting
+    /// the managed relay on every ←/→ for port was multi-second lag; flush when
+    /// the user leaves the settings panel or moves to another settings row.
+    settings_relay_dirty: bool,
+    /// Port detection / forward settings (daemon reads most on next start).
+    ports_enabled: bool,
+    ports_notify: String,
+    ports_auto_forward: bool,
+    ports_poll_secs: u64,
+    /// Cached rows for the Ports panel (`vmux ports list`).
+    ports_list: Vec<PortListRow>,
+    ports_selected: usize,
     /// Pane ids last seen in Attention (for one-shot bell).
     prev_attention_panes: BTreeSet<String>,
     actions: Vec<UiAction>,
@@ -247,9 +258,22 @@ enum UiMode {
     Actions,
     Commands,
     Settings,
+    /// Listening ports attributed to panes (`vmux ports`).
+    Ports,
     /// Mobile-style workspace list opened from the ☰ burger control.
     WorkspacePicker,
     ContextMenu,
+}
+
+/// One row in the Ports panel (from `ListPorts`).
+#[derive(Debug, Clone)]
+struct PortListRow {
+    port: u16,
+    host: String,
+    process: Option<String>,
+    pane: Option<String>,
+    workspace: Option<String>,
+    forward_url: Option<String>,
 }
 
 /// Terminal width (columns) below which the sidebar auto-hides and the burger menu is used.
@@ -362,6 +386,7 @@ enum CommandPaletteAction {
     PreviousWorkspace,
     ToggleNotifications,
     ToggleActions,
+    TogglePorts,
     ToggleZoom,
     NextTab,
     PreviousTab,
@@ -1131,6 +1156,13 @@ impl Ui {
             mobile_relay_allow_cgnat: config.relay.allow_tailnet_cgnat,
             mobile_relay_allow_paste: config.relay.allow_paste,
             mobile_relay_allow_view_resize: config.relay.allow_view_resize,
+            settings_relay_dirty: false,
+            ports_enabled: config.ports.enabled,
+            ports_notify: config.ports.notify.clone(),
+            ports_auto_forward: config.ports.auto_forward,
+            ports_poll_secs: config.ports.poll_secs,
+            ports_list: Vec::new(),
+            ports_selected: 0,
             prev_attention_panes: BTreeSet::new(),
             actions: Vec::new(),
             action_error: std::cell::RefCell::new(None),
@@ -1307,6 +1339,14 @@ impl Ui {
                             self.mobile_relay_allow_localhost,
                             self.mobile_relay_allow_cgnat,
                             self.mobile_relay_allow_paste,
+                            self.mobile_relay_allow_view_resize,
+                            self.settings_relay_dirty,
+                            self.ports_enabled,
+                            self.ports_notify.as_str(),
+                            self.ports_auto_forward,
+                            self.ports_poll_secs,
+                            &self.ports_list,
+                            self.ports_selected,
                             self.sidebar_responsive,
                             sidebar_fit,
                             self.workspace_picker_selected,
@@ -1381,7 +1421,7 @@ impl Ui {
         } else {
             None
         };
-        let response = protocol::request(
+        let response = protocol::request_with_retry(
             &paths::socket_path(&self.session)?,
             &Request::Snapshot {
                 since,
@@ -1511,6 +1551,26 @@ impl Ui {
                     }
                     return Ok(false);
                 }
+                if self.mode == UiMode::Ports {
+                    match key.code {
+                        KeyCode::Esc => self.mode = UiMode::Panes,
+                        KeyCode::Up | KeyCode::Char('k') => self.move_ports_selection(-1),
+                        KeyCode::Down | KeyCode::Char('j') => self.move_ports_selection(1),
+                        KeyCode::Home => self.ports_selected = 0,
+                        KeyCode::End => {
+                            self.ports_selected = self.ports_list.len().saturating_sub(1);
+                        }
+                        KeyCode::Enter => self.jump_selected_port()?,
+                        KeyCode::Char('c') | KeyCode::Char('C') => self.copy_selected_port_ssh()?,
+                        KeyCode::Char('f') | KeyCode::Char('F') => self.forward_selected_port()?,
+                        KeyCode::Char('x') | KeyCode::Char('X') => {
+                            self.unforward_selected_port()?
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => self.refresh_ports_list()?,
+                        _ => {}
+                    }
+                    return Ok(false);
+                }
                 if self.mode == UiMode::Actions {
                     match key.code {
                         KeyCode::Esc => self.mode = UiMode::Panes,
@@ -1558,7 +1618,10 @@ impl Ui {
                 }
                 if self.mode == UiMode::Settings {
                     match key.code {
-                        KeyCode::Esc => self.mode = UiMode::Panes,
+                        KeyCode::Esc => {
+                            self.flush_pending_relay_settings();
+                            self.mode = UiMode::Panes;
+                        }
                         KeyCode::Up | KeyCode::Char('k') => self.move_settings_selection(-1),
                         KeyCode::Down | KeyCode::Char('j') => self.move_settings_selection(1),
                         KeyCode::Left | KeyCode::Char('h') => self.adjust_selected_setting(-1)?,
@@ -1844,7 +1907,7 @@ impl Ui {
     }
 
     fn request(&self, request: &Request) -> Result<protocol::Response> {
-        protocol::request(&paths::socket_path(&self.session)?, request)
+        protocol::request_with_retry(&paths::socket_path(&self.session)?, request)
     }
 
     fn rpc(&self, request: &Request) -> Result<()> {
@@ -2157,6 +2220,162 @@ impl Ui {
         };
     }
 
+    fn toggle_ports(&mut self) -> Result<()> {
+        if self.mode == UiMode::Ports {
+            self.mode = UiMode::Panes;
+            return Ok(());
+        }
+        self.refresh_ports_list()?;
+        self.mode = UiMode::Ports;
+        Ok(())
+    }
+
+    fn refresh_ports_list(&mut self) -> Result<()> {
+        let response = self.request(&Request::ListPorts { workspace: None })?;
+        if let Some(message) = response_error(&response) {
+            self.set_action_error(message);
+            self.ports_list.clear();
+            return Ok(());
+        }
+        let data = response.data.unwrap_or(serde_json::Value::Null);
+        let rows = data.as_array().cloned().unwrap_or_default();
+        self.ports_list = rows
+            .into_iter()
+            .filter_map(|v| {
+                let port = v.get("port")?.as_u64()? as u16;
+                Some(PortListRow {
+                    port,
+                    host: v
+                        .get("host")
+                        .and_then(|h| h.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    process: v
+                        .get("process")
+                        .and_then(|p| p.as_str())
+                        .map(str::to_string),
+                    pane: v.get("pane").and_then(|p| p.as_str()).map(str::to_string),
+                    workspace: v
+                        .get("workspace")
+                        .and_then(|w| w.as_str())
+                        .map(str::to_string),
+                    forward_url: v
+                        .get("forward")
+                        .and_then(|f| f.get("url"))
+                        .and_then(|u| u.as_str())
+                        .map(str::to_string),
+                })
+            })
+            .collect();
+        if self.ports_selected >= self.ports_list.len() {
+            self.ports_selected = self.ports_list.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn move_ports_selection(&mut self, delta: isize) {
+        let count = self.ports_list.len();
+        if count == 0 {
+            self.ports_selected = 0;
+            return;
+        }
+        let current = self.ports_selected.min(count - 1);
+        self.ports_selected = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current + delta as usize).min(count - 1)
+        };
+    }
+
+    fn jump_selected_port(&mut self) -> Result<()> {
+        let Some(row) = self.ports_list.get(self.ports_selected).cloned() else {
+            return Ok(());
+        };
+        if let Some(pane) = row.pane {
+            self.rpc(&Request::FocusPane { pane })?;
+            self.mode = UiMode::Panes;
+        } else {
+            self.set_action_error(format!("port {} has no attributed pane", row.port));
+        }
+        Ok(())
+    }
+
+    fn copy_selected_port_ssh(&mut self) -> Result<()> {
+        let Some(row) = self.ports_list.get(self.ports_selected).cloned() else {
+            return Ok(());
+        };
+        let response = self.request(&Request::PortSshCmd { port: row.port })?;
+        if let Some(message) = response_error(&response) {
+            self.set_action_error(message);
+            return Ok(());
+        }
+        let cmd = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("command"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if cmd.is_empty() {
+            self.set_action_error("empty ssh command".into());
+            return Ok(());
+        }
+        // Session clipboard + local/OSC 52 (works over SSH to the laptop).
+        let _ = self.request(&Request::SetClipboard {
+            text: cmd.clone(),
+            source_pane: row.pane,
+            source: "ports-ssh-cmd".into(),
+        });
+        copy_to_system_clipboard(&cmd);
+        self.set_action_error(format!("copied: {cmd}"));
+        Ok(())
+    }
+
+    fn forward_selected_port(&mut self) -> Result<()> {
+        let Some(row) = self.ports_list.get(self.ports_selected).cloned() else {
+            return Ok(());
+        };
+        let response = self.request(&Request::ForwardPort {
+            port: row.port,
+            via: "tailscale".into(),
+        })?;
+        if let Some(message) = response_error(&response) {
+            self.set_action_error(message);
+            return Ok(());
+        }
+        let url = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("forward"))
+            .and_then(|f| f.get("url"))
+            .and_then(|u| u.as_str())
+            .or_else(|| {
+                response
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("url"))
+                    .and_then(|u| u.as_str())
+            })
+            .unwrap_or("ok");
+        self.set_action_error(format!("forwarded :{} → {url}", row.port));
+        self.refresh_ports_list()?;
+        Ok(())
+    }
+
+    fn unforward_selected_port(&mut self) -> Result<()> {
+        let Some(row) = self.ports_list.get(self.ports_selected).cloned() else {
+            return Ok(());
+        };
+        let response = self.request(&Request::UnforwardPort { port: row.port })?;
+        if let Some(message) = response_error(&response) {
+            self.set_action_error(message);
+            return Ok(());
+        }
+        self.set_action_error(format!("stopped forward for :{}", row.port));
+        self.refresh_ports_list()?;
+        Ok(())
+    }
+
     fn toggle_actions(&mut self) -> Result<()> {
         if self.mode == UiMode::Actions {
             self.mode = UiMode::Panes;
@@ -2179,12 +2398,48 @@ impl Ui {
     }
 
     fn toggle_settings(&mut self) {
-        self.mode = if self.mode == UiMode::Settings {
-            UiMode::Panes
+        if self.mode == UiMode::Settings {
+            self.flush_pending_relay_settings();
+            self.mode = UiMode::Panes;
         } else {
             self.settings_selected = self.settings_selected.min(settings_entries().len() - 1);
-            UiMode::Settings
-        };
+            self.mode = UiMode::Settings;
+        }
+    }
+
+    /// Write deferred relay settings and restart the managed relay once.
+    fn flush_pending_relay_settings(&mut self) {
+        if !self.settings_relay_dirty {
+            return;
+        }
+        self.settings_relay_dirty = false;
+        let settings = self.relay_settings();
+        // One config write for the whole relay block (not one restart per key).
+        if let Err(err) = self.save_relay_settings_block(&settings) {
+            *self.action_error.get_mut() = Some(format!("save config: {err:#}"));
+            return;
+        }
+        let session = self.session.clone();
+        match crate::relay::apply_enabled(&session, &settings) {
+            Ok(msg) => {
+                *self.action_error.get_mut() = Some(format!("{msg} · saved"));
+            }
+            Err(err) => {
+                *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
+            }
+        }
+    }
+
+    fn save_relay_settings_block(&self, settings: &crate::config::RelaySettings) -> Result<()> {
+        let (path, mut config) = crate::config::load_for_mutation()?;
+        config.relay = settings.clone();
+        config = config.normalized();
+        crate::config::save_to_path(&path, &config)?;
+        Ok(())
+    }
+
+    fn mark_relay_settings_dirty(&mut self) {
+        self.settings_relay_dirty = true;
     }
 
     fn toggle_workspace_picker(&mut self) {
@@ -2287,6 +2542,8 @@ impl Ui {
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
+        // Leaving a row applies pending relay edits (one save + one restart).
+        self.flush_pending_relay_settings();
         let entries = settings_entries();
         let count = entries.len();
         if count == 0 {
@@ -2302,7 +2559,9 @@ impl Ui {
             };
             if !matches!(
                 entries[current].id,
-                SettingsEntryId::Section | SettingsEntryId::SectionRelay
+                SettingsEntryId::Section
+                    | SettingsEntryId::SectionRelay
+                    | SettingsEntryId::SectionPorts
             ) {
                 break;
             }
@@ -2315,7 +2574,9 @@ impl Ui {
         // If we landed on a section (edge case), nudge off it.
         if matches!(
             entries[current].id,
-            SettingsEntryId::Section | SettingsEntryId::SectionRelay
+            SettingsEntryId::Section
+                | SettingsEntryId::SectionRelay
+                | SettingsEntryId::SectionPorts
         ) {
             if current + 1 < count {
                 current += 1;
@@ -2436,20 +2697,7 @@ impl Ui {
             }
             SettingsEntryId::MobileRelay => {
                 self.mobile_relay_enabled = !self.mobile_relay_enabled;
-                if let Err(err) =
-                    self.save_ui_config("relay.enabled", &self.mobile_relay_enabled.to_string())
-                {
-                    *self.action_error.get_mut() = Some(format!("save config: {err:#}"));
-                }
-                // Never fail attach on relay start/stop.
-                let settings = self.relay_settings();
-                let session = self.session.clone();
-                match crate::relay::apply_enabled(&session, &settings) {
-                    Ok(msg) => *self.action_error.get_mut() = Some(msg),
-                    Err(err) => {
-                        *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
-                    }
-                }
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayBind => {
                 let next = crate::config::cycle_choice(
@@ -2457,51 +2705,70 @@ impl Ui {
                     &self.mobile_relay_bind,
                     delta,
                 );
-                self.mobile_relay_bind = next.clone();
-                let _ = self.save_ui_config("relay.bind", &next);
-                if self.mobile_relay_enabled {
-                    let settings = self.relay_settings();
-                    let session = self.session.clone();
-                    let _ = crate::relay::stop_managed();
-                    match crate::relay::ensure_started(&session, &settings) {
-                        Ok(Some(msg)) => *self.action_error.get_mut() = Some(msg),
-                        Ok(None) => {}
-                        Err(err) => {
-                            *self.action_error.get_mut() =
-                                Some(format!("mobile relay error: {err:#}"));
-                        }
-                    }
-                }
+                self.mobile_relay_bind = next;
+                self.mark_relay_settings_dirty();
+            }
+            SettingsEntryId::MobileRelayPort => {
+                let next = crate::config::cycle_u16(
+                    &crate::config::relay_port_choices(),
+                    self.mobile_relay_port,
+                    delta,
+                );
+                self.mobile_relay_port = next;
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayLocalhost => {
                 self.mobile_relay_allow_localhost = !self.mobile_relay_allow_localhost;
-                let _ = self.save_ui_config(
-                    "relay.allow_localhost",
-                    &self.mobile_relay_allow_localhost.to_string(),
-                );
-                if self.mobile_relay_enabled {
-                    let settings = self.relay_settings();
-                    let session = self.session.clone();
-                    let _ = crate::relay::stop_managed();
-                    if let Err(err) = crate::relay::ensure_started(&session, &settings) {
-                        *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
-                    }
-                }
+                self.mark_relay_settings_dirty();
+            }
+            SettingsEntryId::MobileRelayCgnat => {
+                self.mobile_relay_allow_cgnat = !self.mobile_relay_allow_cgnat;
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayPaste => {
                 self.mobile_relay_allow_paste = !self.mobile_relay_allow_paste;
+                self.mark_relay_settings_dirty();
+            }
+            SettingsEntryId::MobileRelayViewResize => {
+                self.mobile_relay_allow_view_resize = !self.mobile_relay_allow_view_resize;
+                // No relay process restart needed — only config for phone-fit.
                 let _ = self.save_ui_config(
-                    "relay.allow_paste",
-                    &self.mobile_relay_allow_paste.to_string(),
+                    "relay.allow_view_resize",
+                    &self.mobile_relay_allow_view_resize.to_string(),
                 );
-                if self.mobile_relay_enabled {
-                    let settings = self.relay_settings();
-                    let session = self.session.clone();
-                    let _ = crate::relay::stop_managed();
-                    if let Err(err) = crate::relay::ensure_started(&session, &settings) {
-                        *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
-                    }
-                }
+            }
+            SettingsEntryId::PortsEnabled => {
+                self.ports_enabled = !self.ports_enabled;
+                let _ = self.save_ui_config("ports.enabled", &self.ports_enabled.to_string());
+                *self.action_error.get_mut() =
+                    Some("ports.enabled applies on next daemon start".into());
+            }
+            SettingsEntryId::PortsNotify => {
+                let next = crate::config::cycle_choice(
+                    &crate::config::supported_ports_notify(),
+                    &self.ports_notify,
+                    delta,
+                );
+                self.ports_notify = next.clone();
+                let _ = self.save_ui_config("ports.notify", &next);
+            }
+            SettingsEntryId::PortsAutoForward => {
+                self.ports_auto_forward = !self.ports_auto_forward;
+                let _ =
+                    self.save_ui_config("ports.auto_forward", &self.ports_auto_forward.to_string());
+                *self.action_error.get_mut() =
+                    Some("ports.auto_forward applies on next daemon start".into());
+            }
+            SettingsEntryId::PortsPollSecs => {
+                let next = crate::config::cycle_u64(
+                    &crate::config::ports_poll_secs_choices(),
+                    self.ports_poll_secs,
+                    delta,
+                );
+                self.ports_poll_secs = next;
+                let _ = self.save_ui_config("ports.poll_secs", &next.to_string());
+                *self.action_error.get_mut() =
+                    Some("ports.poll_secs applies on next daemon start".into());
             }
             SettingsEntryId::HookShell
             | SettingsEntryId::HookClaude
@@ -2511,7 +2778,9 @@ impl Ui {
                 // Install / re-install agent hooks (Enter / l / h all install).
                 self.install_selected_agent_hooks(entry.id)?;
             }
-            SettingsEntryId::Section | SettingsEntryId::SectionRelay => {}
+            SettingsEntryId::Section
+            | SettingsEntryId::SectionRelay
+            | SettingsEntryId::SectionPorts => {}
         }
         Ok(())
     }
@@ -2770,6 +3039,7 @@ impl Ui {
             CommandPaletteAction::PreviousWorkspace => self.switch_relative(-1)?,
             CommandPaletteAction::ToggleNotifications => self.toggle_notifications(),
             CommandPaletteAction::ToggleActions => self.toggle_actions()?,
+            CommandPaletteAction::TogglePorts => self.toggle_ports()?,
             CommandPaletteAction::Settings => self.toggle_settings(),
             CommandPaletteAction::ToggleZoom => self.toggle_zoom()?,
             CommandPaletteAction::NextTab => self.switch_active_workspace_tab(1)?,
@@ -3842,6 +4112,14 @@ fn draw(
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
     mobile_relay_allow_paste: bool,
+    mobile_relay_allow_view_resize: bool,
+    settings_relay_dirty: bool,
+    ports_enabled: bool,
+    ports_notify: &str,
+    ports_auto_forward: bool,
+    ports_poll_secs: u64,
+    ports_list: &[PortListRow],
+    ports_selected: usize,
     sidebar_responsive: bool,
     sidebar_fit: bool,
     workspace_picker_selected: usize,
@@ -4018,6 +4296,14 @@ fn draw(
             hover_notification,
             palette,
         ),
+        UiMode::Ports => draw_ports(
+            frame,
+            main_chunks[0],
+            ports_list,
+            ports_selected,
+            action_error,
+            palette,
+        ),
         UiMode::Actions => draw_actions(
             frame,
             main_chunks[0],
@@ -4060,9 +4346,18 @@ fn draw(
                 mobile_relay_allow_localhost,
                 mobile_relay_allow_cgnat,
                 mobile_relay_allow_paste,
+                mobile_relay_allow_view_resize,
+                settings_relay_dirty,
+                ports_enabled,
+                ports_notify,
+                ports_auto_forward,
+                ports_poll_secs,
                 selected: settings_selected,
             },
         ),
+        // settings_relay_dirty is only used above; silence unused-param when
+        // not drawing settings (other modes).
+        // (parameter still required for SettingsView construction.)
         UiMode::WorkspacePicker => draw_workspace_picker(
             frame,
             main_chunks[0],
@@ -4184,6 +4479,146 @@ fn draw_list_panel(
 const NOTIF_LIST_TOP: u16 = 2;
 /// Rows per card (header + message). Spacer between cards is separate.
 const NOTIF_CARD_ROWS: u16 = 2;
+
+fn draw_ports(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    ports: &[PortListRow],
+    selected: usize,
+    action_error: Option<&str>,
+    palette: ThemePalette,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            " 🔌  Ports ",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if ports.is_empty() {
+                "· none detected".to_string()
+            } else {
+                format!("· {} listening", ports.len())
+            },
+            Style::default().fg(palette.muted),
+        ),
+    ]));
+    lines.push(Line::from(Span::raw("")));
+    if ports.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No pane-owned listeners right now",
+            Style::default().fg(palette.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Start a dev server in a pane, then press r to rescan",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {:<6} {:<14} {:<10} {:<12} {}",
+                "PORT", "PROCESS", "PANE", "WORKSPACE", "FORWARD"
+            ),
+            Style::default().fg(palette.muted),
+        )));
+        for (index, row) in ports.iter().enumerate() {
+            let process = row.process.as_deref().unwrap_or("-");
+            let pane = row.pane.as_deref().unwrap_or("-");
+            let workspace = row.workspace.as_deref().unwrap_or("-");
+            let forward = row.forward_url.as_deref().unwrap_or("-");
+            let text = format!(
+                "  {:<6} {:<14} {:<10} {:<12} {}",
+                row.port,
+                trim_label(process, 14),
+                trim_label(pane, 10),
+                trim_label(workspace, 12),
+                trim_label(forward, 40)
+            );
+            let style = if index == selected {
+                Style::default()
+                    .fg(palette.background)
+                    .bg(palette.active)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+            if index == selected {
+                lines.push(Line::from(Span::styled(
+                    format!("     {} · host {}", row.host, "ssh -L ready with c"),
+                    Style::default().fg(palette.muted),
+                )));
+            }
+        }
+    }
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " j/k",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" select  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" focus pane  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "c",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" copy ssh -L  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "f",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" forward  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "x",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" unforward  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "r",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" rescan  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(palette.active)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(palette.muted)),
+    ]));
+    if let Some(err) = action_error {
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(palette.warning),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block(" ports ", palette))
+            .style(Style::default().fg(palette.text).bg(palette.surface))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
 
 fn draw_notifications(
     frame: &mut ratatui::Frame,
@@ -6945,7 +7380,7 @@ fn draw_pane_controls(
 /// Zero when content fits entirely in the view.
 fn max_pane_scroll_offset(pane: &crate::model::Pane, view_height: usize) -> usize {
     let height = view_height.max(1);
-    let content_lines = match pane.scrollback_lines {
+    let mut content_lines = match pane.scrollback_lines {
         // Lean snapshots carry the count so the (omitted) scrollback text
         // never needs scanning here.
         Some(lines) if lines > 0 => lines,
@@ -6960,6 +7395,14 @@ fn max_pane_scroll_offset(pane: &crate::model::Pane, view_height: usize) -> usiz
             }
         }
     };
+    // Styled history is capped server-side; never claim more scroll range than
+    // the rendered path can actually show (plain fallback can go further).
+    if !pane.scrollback_formatted.is_empty() {
+        let styled = pane.scrollback_formatted.lines().count();
+        if styled > 0 {
+            content_lines = content_lines.min(styled);
+        }
+    }
     content_lines.saturating_sub(height)
 }
 
@@ -8171,6 +8614,9 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
                 "{base} notifications:{selected}/{visible} j/k select Enter jump c clear-all Esc close "
             )
         }
+        UiMode::Ports => {
+            format!("{base} ports j/k select Enter focus c copy-ssh f forward x unforward r rescan Esc ")
+        }
         UiMode::Actions => format!("{base} actions j/k select Enter run Esc close "),
         UiMode::Commands => {
             format!("{base} commands type to filter ↑/↓ select Enter run Esc clear/close ")
@@ -8516,6 +8962,7 @@ fn prefix_action_bindings() -> &'static [(KeyCode, &'static str, CommandPaletteA
         (KeyCode::Char('p'), "p", PreviousWorkspace),
         (KeyCode::Char('N'), "N", ToggleNotifications),
         (KeyCode::Char('A'), "A", ToggleActions),
+        (KeyCode::Char('o'), "o", TogglePorts),
         (KeyCode::Char('z'), "z", ToggleZoom),
         (KeyCode::Char(']'), "]", NextTab),
         (KeyCode::Char('['), "[", PreviousTab),
@@ -8814,6 +9261,13 @@ fn command_palette_entries() -> Vec<CommandPaletteEntry> {
             action: CommandPaletteAction::ToggleNotifications,
             section: Panels,
             icon: "🔔",
+        },
+        CommandPaletteEntry {
+            name: "ports",
+            description: "list listening ports · copy ssh -L · Tailscale forward",
+            action: CommandPaletteAction::TogglePorts,
+            section: Panels,
+            icon: "🔌",
         },
         CommandPaletteEntry {
             name: "actions",
@@ -9148,8 +9602,16 @@ enum SettingsEntryId {
     SectionRelay,
     MobileRelay,
     MobileRelayBind,
+    MobileRelayPort,
     MobileRelayLocalhost,
+    MobileRelayCgnat,
     MobileRelayPaste,
+    MobileRelayViewResize,
+    SectionPorts,
+    PortsEnabled,
+    PortsNotify,
+    PortsAutoForward,
+    PortsPollSecs,
     Section,
     HookShell,
     HookClaude,
@@ -9242,12 +9704,44 @@ fn settings_entries() -> Vec<SettingsEntry> {
             name: "relay bind",
         },
         SettingsEntry {
+            id: SettingsEntryId::MobileRelayPort,
+            name: "relay port",
+        },
+        SettingsEntry {
             id: SettingsEntryId::MobileRelayLocalhost,
             name: "relay localhost",
         },
         SettingsEntry {
+            id: SettingsEntryId::MobileRelayCgnat,
+            name: "relay CGNAT",
+        },
+        SettingsEntry {
             id: SettingsEntryId::MobileRelayPaste,
             name: "paste page",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::MobileRelayViewResize,
+            name: "phone-fit resize",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::SectionPorts,
+            name: "── ports ──",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::PortsEnabled,
+            name: "port detection",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::PortsNotify,
+            name: "port notify",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::PortsAutoForward,
+            name: "auto-forward",
+        },
+        SettingsEntry {
+            id: SettingsEntryId::PortsPollSecs,
+            name: "port scan interval",
         },
         SettingsEntry {
             id: SettingsEntryId::Section,
@@ -9299,6 +9793,13 @@ struct SettingsView<'a> {
     mobile_relay_allow_localhost: bool,
     mobile_relay_allow_cgnat: bool,
     mobile_relay_allow_paste: bool,
+    mobile_relay_allow_view_resize: bool,
+    /// True while relay edits are pending (not yet saved / applied).
+    settings_relay_dirty: bool,
+    ports_enabled: bool,
+    ports_notify: &'a str,
+    ports_auto_forward: bool,
+    ports_poll_secs: u64,
     selected: usize,
 }
 
@@ -9387,7 +9888,7 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                     }
                 }
                 SettingsEntryId::SectionRelay => {
-                    "Cmux Remote / phone (Tailscale or localhost only)".to_string()
+                    "one relay for all sessions · change applies when you leave the row".to_string()
                 }
                 SettingsEntryId::MobileRelay => {
                     let settings = crate::config::RelaySettings {
@@ -9400,18 +9901,49 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         // Display-only: runtime_status_line reads enabled/bind/port.
                         allow_view_resize: false,
                     };
-                    crate::relay::runtime_status_line(&settings)
+                    let mut line = crate::relay::runtime_status_line(&settings);
+                    if view.settings_relay_dirty {
+                        line.push_str(" · pending save");
+                    }
+                    line
                 }
-                SettingsEntryId::MobileRelayBind => match view.mobile_relay_bind {
-                    "tailscale" => "tailscale only".to_string(),
-                    "local" => "localhost only".to_string(),
-                    _ => "auto (Tailscale → localhost)".to_string(),
-                },
+                SettingsEntryId::MobileRelayBind => {
+                    let base = match view.mobile_relay_bind {
+                        "tailscale" => "tailscale only",
+                        "local" => "localhost only",
+                        _ => "auto (Tailscale → localhost)",
+                    };
+                    if view.settings_relay_dirty {
+                        format!("{base} · pending")
+                    } else {
+                        base.to_string()
+                    }
+                }
+                SettingsEntryId::MobileRelayPort => {
+                    if view.settings_relay_dirty {
+                        format!(
+                            "{} · pending · leave row or Esc to apply (shared by all sessions)",
+                            view.mobile_relay_port
+                        )
+                    } else {
+                        format!(
+                            "{} · h/l to cycle · applies on leave · one port for all sessions",
+                            view.mobile_relay_port
+                        )
+                    }
+                }
                 SettingsEntryId::MobileRelayLocalhost => {
                     if view.mobile_relay_allow_localhost {
                         "allow register from 127.0.0.1".to_string()
                     } else {
                         "deny localhost register".to_string()
+                    }
+                }
+                SettingsEntryId::MobileRelayCgnat => {
+                    if view.mobile_relay_allow_cgnat {
+                        "allow Tailscale CGNAT peers without whois".to_string()
+                    } else {
+                        "require whois / bootstrap for CGNAT".to_string()
                     }
                 }
                 SettingsEntryId::MobileRelayPaste => {
@@ -9420,6 +9952,41 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                     } else {
                         "off · /paste returns 404".to_string()
                     }
+                }
+                SettingsEntryId::MobileRelayViewResize => {
+                    if view.mobile_relay_allow_view_resize {
+                        "on · phone can shrink PTY to fit".to_string()
+                    } else {
+                        "off · phone wraps only".to_string()
+                    }
+                }
+                SettingsEntryId::SectionPorts => {
+                    "detect listeners in panes · vmux ports".to_string()
+                }
+                SettingsEntryId::PortsEnabled => {
+                    if view.ports_enabled {
+                        "on · scan pane process trees (next daemon start)".to_string()
+                    } else {
+                        "off (next daemon start)".to_string()
+                    }
+                }
+                SettingsEntryId::PortsNotify => match view.ports_notify {
+                    "banner" => "banner".to_string(),
+                    "off" => "off · silent".to_string(),
+                    _ => "toast · notification feed".to_string(),
+                },
+                SettingsEntryId::PortsAutoForward => {
+                    if view.ports_auto_forward {
+                        "on · Tailscale-forward new ports (next daemon start)".to_string()
+                    } else {
+                        "off (next daemon start)".to_string()
+                    }
+                }
+                SettingsEntryId::PortsPollSecs => {
+                    format!(
+                        "{}s between scans (next daemon start)",
+                        view.ports_poll_secs
+                    )
                 }
                 SettingsEntryId::Section => "sidebar emoji for agents".to_string(),
                 SettingsEntryId::HookShell => {
@@ -9728,6 +10295,14 @@ mod tests {
                     false,
                     true,
                     true,  // mobile_relay_allow_paste
+                    false, // mobile_relay_allow_view_resize
+                    false, // settings_relay_dirty
+                    true,  // ports_enabled
+                    "toast",
+                    false, // ports_auto_forward
+                    2,     // ports_poll_secs
+                    &[],   // ports_list
+                    0,     // ports_selected
                     false, // sidebar_responsive off so tests keep the rail
                     false, // sidebar_fit
                     0,     // workspace_picker_selected
@@ -9806,6 +10381,14 @@ mod tests {
                     false,
                     true,
                     true,  // mobile_relay_allow_paste
+                    false, // mobile_relay_allow_view_resize
+                    false, // settings_relay_dirty
+                    true,  // ports_enabled
+                    "toast",
+                    false, // ports_auto_forward
+                    2,     // ports_poll_secs
+                    &[],   // ports_list
+                    0,     // ports_selected
                     false, // sidebar_responsive off so tests keep the rail
                     false, // sidebar_fit
                     0,     // workspace_picker_selected
@@ -11166,6 +11749,12 @@ mod tests {
             mobile_relay_allow_localhost: false,
             mobile_relay_allow_cgnat: true,
             mobile_relay_allow_paste: true,
+            mobile_relay_allow_view_resize: false,
+            settings_relay_dirty: false,
+            ports_enabled: true,
+            ports_notify: "toast",
+            ports_auto_forward: false,
+            ports_poll_secs: 2,
             selected: 0,
         });
 
@@ -11197,6 +11786,18 @@ mod tests {
             line.spans
                 .first()
                 .map(|s| s.content.as_ref().contains("mobile relay"))
+                .unwrap_or(false)
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .first()
+                .map(|s| s.content.as_ref().contains("relay port"))
+                .unwrap_or(false)
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .first()
+                .map(|s| s.content.as_ref().contains("port detection"))
                 .unwrap_or(false)
         }));
         assert!(lines.iter().any(|line| {

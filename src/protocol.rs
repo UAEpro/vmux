@@ -294,6 +294,10 @@ pub enum Request {
     },
     Events {
         limit: usize,
+        /// When set, only return events with `id` strictly greater than this
+        /// (for follow / incremental poll). Additive; old clients omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
     },
     ClearNotifications,
     JumpNotification,
@@ -367,12 +371,43 @@ pub enum Request {
         cols: u16,
         rows: u16,
         lease_ms: u64,
+        /// Stable viewer id so multiple phones can share a pane (min size).
+        /// Empty/omitted replaces the whole override set (legacy single-viewer).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
     },
-    /// Drop a pane's view-size override and restore its layout size now.
+    /// Drop a pane's view-size override and restore layout size when none remain.
     ClearPaneViewSize {
         pane: String,
+        /// When set, only drop this viewer; otherwise clear all leases.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
+    },
+    /// List listening ports attributed to pane processes.
+    ListPorts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+    },
+    /// Forward a detected local port via Tailscale (daemon TCP proxy).
+    ForwardPort {
+        port: u16,
+        /// Currently only `tailscale` is supported for automatic forwarding.
+        #[serde(default = "default_forward_via")]
+        via: String,
+    },
+    /// Stop a previously started forward.
+    UnforwardPort {
+        port: u16,
+    },
+    /// Build an `ssh -L` command for the given port (client runs it locally).
+    PortSshCmd {
+        port: u16,
     },
     Shutdown,
+}
+
+fn default_forward_via() -> String {
+    "tailscale".to_string()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -491,6 +526,38 @@ pub fn request(path: &Path, request: &Request) -> Result<Response> {
     serde_json::from_str(&line).context("decode vmux response")
 }
 
+/// Like [`request`], but retries transient connect/read failures with backoff.
+///
+/// The attach UI uses this so a brief socket blip does not tear down the TUI —
+/// the daemon is designed to outlive clients.
+pub fn request_with_retry(path: &Path, request: &Request) -> Result<Response> {
+    const ATTEMPTS: u32 = 8;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match self::request(path, request) {
+            Ok(resp) => return Ok(resp),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                let retryable = msg.contains("connect")
+                    || msg.contains("Connection refused")
+                    || msg.contains("No such file")
+                    || msg.contains("Broken pipe")
+                    || msg.contains("Resource temporarily unavailable")
+                    || msg.contains("timed out")
+                    || msg.contains("os error 11")
+                    || msg.contains("os error 2")
+                    || msg.contains("os error 111");
+                if !retryable || attempt + 1 == ATTEMPTS {
+                    return Err(err);
+                }
+                last_err = Some(err);
+                std::thread::sleep(Duration::from_millis(50 * u64::from(attempt + 1)));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("vmux request failed")))
+}
+
 pub fn write_response(mut stream: &UnixStream, response: &Response) -> Result<()> {
     serde_json::to_writer(&mut stream, response)?;
     stream.write_all(b"\n")?;
@@ -600,6 +667,7 @@ mod tests {
             cols: 46,
             rows: 22,
             lease_ms: 10_000,
+            viewer_id: None,
         })
         .unwrap();
         assert_eq!(
@@ -612,12 +680,14 @@ mod tests {
                 cols: 46,
                 rows: 22,
                 lease_ms: 10_000,
+                viewer_id: None,
                 ..
             }
         ));
 
         let encoded = serde_json::to_string(&Request::ClearPaneViewSize {
             pane: "pane-1".to_string(),
+            viewer_id: None,
         })
         .unwrap();
         assert_eq!(
@@ -628,7 +698,11 @@ mod tests {
 
     #[test]
     fn events_request_uses_socket_protocol_shape() {
-        let encoded = serde_json::to_string(&Request::Events { limit: 10 }).unwrap();
+        let encoded = serde_json::to_string(&Request::Events {
+            limit: 10,
+            since: None,
+        })
+        .unwrap();
         assert_eq!(encoded, r#"{"action":"events","limit":10}"#);
     }
 

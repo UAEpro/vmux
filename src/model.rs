@@ -369,6 +369,13 @@ impl Session {
     }
 }
 
+/// Wire protocol major version for Ping / daemon identity.
+///
+/// Bump when request/response shapes change incompatibly. Clients and older
+/// daemons still rely on `#[serde(default)]` for additive fields; this value
+/// lets a caller detect "too new / too old" before relying on a feature.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonInfo {
     pub pid: u32,
@@ -380,6 +387,9 @@ pub struct DaemonInfo {
     /// A newer published `vmux` version, if the background update check found one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_available: Option<String>,
+    /// See [`PROTOCOL_VERSION`]. Absent on daemons older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -901,6 +911,12 @@ pub struct ListeningPort {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pids: Vec<u32>,
+    /// Process name when known (`ss` / `/proc`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    /// Owning pane id when attribution succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
