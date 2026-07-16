@@ -4,7 +4,9 @@
 //! registry diffs opens/closes so the daemon can notify and tear down proxies.
 //! Forwarding binds only on a Tailscale IP (never `0.0.0.0`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -208,7 +210,15 @@ pub fn scan_ports(input: &ScanInput) -> BTreeMap<u16, DetectedPort> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = input;
+        // Touch every field so macOS/clippy does not treat ScanInput as dead
+        // when the Linux scanner is not compiled.
+        let _ = (
+            input.pane_pids.len(),
+            input.pane_workspace.len(),
+            input.ignore_ports.len(),
+            input.ignore_processes.len(),
+            input.ignore_ephemeral,
+        );
         BTreeMap::new()
     }
 }
@@ -404,6 +414,8 @@ fn parse_hex_addr(field: &str, v6: bool) -> Option<(String, u16)> {
     Some((ip.to_string(), port))
 }
 
+// /proc walk helpers — only used by `scan_ports_linux`.
+#[cfg(target_os = "linux")]
 fn ephemeral_port_floor() -> u16 {
     if let Ok(text) = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
         let mut parts = text.split_whitespace();
@@ -414,6 +426,7 @@ fn ephemeral_port_floor() -> u16 {
     32768
 }
 
+#[cfg(target_os = "linux")]
 fn build_ppid_map() -> HashMap<u32, u32> {
     let mut map = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -435,6 +448,7 @@ fn build_ppid_map() -> HashMap<u32, u32> {
     map
 }
 
+#[cfg(target_os = "linux")]
 fn proc_stat_ppid(stat: &str) -> Option<u32> {
     let rest = stat.rsplit_once(") ")?.1;
     let mut fields = rest.split_whitespace();
@@ -442,6 +456,7 @@ fn proc_stat_ppid(stat: &str) -> Option<u32> {
     fields.next()?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn is_descendant_of(pid: u32, roots: &BTreeSet<u32>, ppid_map: &HashMap<u32, u32>) -> bool {
     if roots.contains(&pid) {
         return true;
@@ -462,6 +477,7 @@ fn is_descendant_of(pid: u32, roots: &BTreeSet<u32>, ppid_map: &HashMap<u32, u32
     false
 }
 
+#[cfg(target_os = "linux")]
 fn socket_inodes_for_pid(pid: u32) -> Option<BTreeSet<u64>> {
     let fd_dir = format!("/proc/{pid}/fd");
     let entries = fs::read_dir(fd_dir).ok()?;
@@ -482,6 +498,7 @@ fn socket_inodes_for_pid(pid: u32) -> Option<BTreeSet<u64>> {
     Some(set)
 }
 
+#[cfg(target_os = "linux")]
 fn process_name(pid: u32) -> Option<String> {
     let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     let name = comm.trim().to_string();
