@@ -519,6 +519,14 @@ fn main() -> Result<()> {
             message,
         } => {
             daemon::ensure_running(session)?;
+            // Meaningful busy messages become an explicit new-turn title so
+            // they still re-open 🔄 after the user acknowledged ✅ (hooks that
+            // only send boilerplate "agent working" stay suppressed).
+            let title = if status.eq_ignore_ascii_case("busy") {
+                crate::model::title_from_status_message(&message)
+            } else {
+                None
+            };
             let response = protocol::request(
                 &paths::socket_path(session)?,
                 &protocol::Request::Notify {
@@ -528,7 +536,7 @@ fn main() -> Result<()> {
                     color,
                     clear: false,
                     message,
-                    title: None,
+                    title,
                 },
             )?;
             print_response(response)

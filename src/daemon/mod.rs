@@ -3217,13 +3217,16 @@ impl Server {
                 .as_deref()
                 .map(|status| matches!(parse_agent_status(status), AgentStatus::Attention))
                 .unwrap_or(true);
-        // UserPromptSubmit condenses the prompt into `title` / auto_title — that
-        // is the signal a *new* turn started, vs late PreToolUse after Stop.
-        let has_new_turn_title = auto_title.is_some()
-            || title
-                .as_deref()
-                .map(|t| !t.trim().is_empty())
-                .unwrap_or(false);
+        // Only an *explicit* Notify title (UserPromptSubmit prompt, or
+        // set-status that promotes its message to title) counts as a new turn.
+        // Do NOT use auto_title from the busy message here: PreToolUse payloads
+        // often put the tool name in `message`/`summary`, which would look like
+        // a task title and re-raise 🔄 after Done/ack (especially when Grok also
+        // loads Claude's ~/.claude/settings.json hooks and double-fires events).
+        let has_new_turn_title = title
+            .as_deref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
         let mut session = self.session.lock_or_recover();
         let mut runtime_target = None;
         if let Some(pane_id) = &target_pane {
@@ -5190,14 +5193,18 @@ fn is_settled_after_turn(pane: &Pane) -> bool {
             && pane.agent_status_pinned)
 }
 
-/// Grok (and others) often fire PreToolUse/PostToolUse with "agent working"
-/// after Stop has already set ✅. That late boilerplate must not demote a
-/// finished turn. A real new turn carries a UserPromptSubmit title and/or a
-/// custom busy message (`set-status busy --message "fix auth"`).
+/// Grok (and others) often fire PreToolUse/PostToolUse after Stop has already
+/// set ✅ — including when Grok also runs Claude-compat hooks from
+/// `~/.claude/settings.json` and every event hits vmux twice. Late busy must
+/// not demote a finished/acknowledged turn.
+///
+/// A real new turn is only an **explicit** Notify `title` (UserPromptSubmit
+/// prompt text, or `set-status busy` with a meaningful message promoted to
+/// title). Tool-hook noise in `message` alone is never enough.
 fn should_skip_busy_after_settled(
     pane: &Pane,
     status: &str,
-    message: &str,
+    _message: &str,
     has_new_turn_title: bool,
 ) -> bool {
     if !matches!(parse_agent_status(status), AgentStatus::Busy) {
@@ -5206,10 +5213,8 @@ fn should_skip_busy_after_settled(
     if !is_settled_after_turn(pane) {
         return false;
     }
-    if has_new_turn_title {
-        return false;
-    }
-    is_boilerplate_lifecycle_message(message)
+    // Settled Done/Idle: ignore busy unless this notify carries a new-turn title.
+    !has_new_turn_title
 }
 
 /// Apply a hook/CLI status so it sticks in the sidebar (pinned).
@@ -6509,6 +6514,39 @@ mod tests {
         {
             let session = server.session.lock_or_recover();
             assert_eq!(session.panes["pane-1"].agent_status, AgentStatus::Busy);
+        }
+
+        // Tool-hook noise: message looks like a task (not boilerplate) but there
+        // is no UserPromptSubmit title — must stay Idle after ack.
+        {
+            let mut session = server.session.lock_or_recover();
+            touch_agent_status(
+                session.panes.get_mut("pane-1").unwrap(),
+                AgentStatus::Done,
+                true,
+            );
+            assert!(acknowledge_done_status(
+                session.panes.get_mut("pane-1").unwrap()
+            ));
+        }
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("busy".to_string()),
+                Some("yellow".to_string()),
+                false,
+                "Read".to_string(), // typical PreToolUse tool name leak
+                None,
+            )
+            .unwrap();
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(
+                session.panes["pane-1"].agent_status,
+                AgentStatus::Idle,
+                "tool-name busy without prompt title must not re-raise 🔄 after ack"
+            );
         }
 
         fs::remove_file(server.state_path.clone()).ok();
