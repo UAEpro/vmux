@@ -560,7 +560,7 @@ pub fn assert_safe_listen(listen: &str) -> Result<()> {
     Ok(())
 }
 
-fn tailscale_ipv4() -> Option<String> {
+pub(crate) fn tailscale_ipv4() -> Option<String> {
     let output = ProcessCommand::new("tailscale")
         .args(["ip", "-4"])
         .output()
@@ -818,9 +818,13 @@ fn spawn_push_event_poller(state: Arc<RelayState>) {
             let mut initialized = false;
             while state.running.load(Ordering::Relaxed) {
                 let devices = state.devices.push_devices();
-                if let Ok(response) =
-                    protocol::request(&state.socket, &Request::Events { limit: 100 })
-                {
+                if let Ok(response) = protocol::request(
+                    &state.socket,
+                    &Request::Events {
+                        limit: 100,
+                        since: None,
+                    },
+                ) {
                     if let Some(events) = response.data.as_ref().and_then(event_array) {
                         if !initialized {
                             seen_ids.extend(events.iter().map(event_id));
@@ -1402,7 +1406,13 @@ fn handle_ws_upgrade(
         thread::spawn(move || {
             let mut last_ids: HashSet<String> = HashSet::new();
             while !stop.load(Ordering::Relaxed) {
-                if let Ok(resp) = protocol::request(&socket, &Request::Events { limit: 50 }) {
+                if let Ok(resp) = protocol::request(
+                    &socket,
+                    &Request::Events {
+                        limit: 50,
+                        since: None,
+                    },
+                ) {
                     if let Some(data) = resp.data {
                         if let Some(arr) = data
                             .get("events")
@@ -1823,6 +1833,8 @@ fn run_surface_poller(
                         cols,
                         rows,
                         lease_ms: VIEW_LEASE_MS,
+                        // Use surface id so two phones on one pane min() correctly.
+                        viewer_id: Some(surface_id.clone()),
                     },
                 );
             }
@@ -1912,6 +1924,7 @@ fn run_surface_poller(
             &socket,
             &Request::ClearPaneViewSize {
                 pane: surface_id.clone(),
+                viewer_id: Some(surface_id.clone()),
             },
         );
     }

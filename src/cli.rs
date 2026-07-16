@@ -103,6 +103,11 @@ pub enum Command {
         #[command(subcommand)]
         command: RelayCommand,
     },
+    /// Detected listening ports in panes, SSH copy helpers, Tailscale forward.
+    Ports {
+        #[command(subcommand)]
+        command: PortsCommand,
+    },
     Markdown {
         #[command(subcommand)]
         command: MarkdownCommand,
@@ -399,6 +404,10 @@ pub enum Command {
     Events {
         #[arg(long, default_value_t = 50)]
         limit: usize,
+
+        /// Only events with id greater than this (incremental follow).
+        #[arg(long)]
+        since: Option<u64>,
 
         #[arg(long)]
         follow: bool,
@@ -828,13 +837,22 @@ pub enum AgentCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum RelayCommand {
-    /// Start the phone relay (HTTP + WebSocket, default :4399).
+    /// Start the phone relay (HTTP + WebSocket).
+    ///
+    /// Default port is 4399 (Cmux Remote). Change with `--listen host:port`
+    /// or `vmux config set relay.port <n>` (attach-managed relay).
     Serve {
         #[arg(long)]
         config: Option<String>,
 
-        #[arg(long, help = "Override listen address (host:port)")]
+        #[arg(
+            long,
+            help = "Override listen address (host:port), e.g. 127.0.0.1:4400"
+        )]
         listen: Option<String>,
+
+        #[arg(long, help = "Override TCP port only (merged with resolved host)")]
+        port: Option<u16>,
 
         #[arg(
             long,
@@ -852,6 +870,28 @@ pub enum RelayCommand {
         #[command(subcommand)]
         command: RelayDevicesCommand,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PortsCommand {
+    /// List listening ports attributed to pane processes.
+    List {
+        #[arg(long)]
+        workspace: Option<String>,
+
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print an `ssh -L` command to forward a port to your laptop.
+    SshCmd { port: u16 },
+    /// Expose a detected port on the Tailscale interface (daemon TCP proxy).
+    Forward {
+        port: u16,
+        #[arg(long, default_value = "tailscale")]
+        via: String,
+    },
+    /// Stop a Tailscale forward started by `ports forward`.
+    Unforward { port: u16 },
 }
 
 #[derive(Debug, Clone, Subcommand)]

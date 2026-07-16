@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vmux.sh/docs/config.schema.json",
+  "title": "LmuxConfig",
+  "description": "User configuration for vmux (vmux-tui). Written to the XDG config path (typically ~/.config/vmux/config.json) via `vmux config set` or the attach Settings panel.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Attach UI and pane defaults.",
+      "properties": {
+        "sidebar_collapsed": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start with a compact sidebar."
+        },
+        "sidebar_width": {
+          "type": "integer",
+          "minimum": 12,
+          "maximum": 60,
+          "default": 24,
+          "description": "Expanded sidebar width in terminal columns. When sidebar_fit is true this is the maximum width."
+        },
+        "sidebar_fit": {
+          "type": "boolean",
+          "default": false,
+          "description": "Fit sidebar width to workspace name text (up to sidebar_width)."
+        },
+        "prefix_key": {
+          "type": "string",
+          "default": "Ctrl-b",
+          "description": "Prefix chord for attach UI keybindings (must parse as a key binding)."
+        },
+        "scroll_step": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 5,
+          "description": "Lines per scroll step in the attach UI."
+        },
+        "scrollback_bytes": {
+          "type": "integer",
+          "minimum": 16000,
+          "maximum": 5000000,
+          "default": 200000,
+          "description": "Bytes of raw output retained per pane for scrollback and persistence. Takes effect on the next daemon start."
+        },
+        "theme": {
+          "type": "string",
+          "enum": [
+            "midnight",
+            "daylight",
+            "contrast",
+            "nord",
+            "dracula",
+            "gruvbox",
+            "catppuccin",
+            "solarized-dark",
+            "solarized-light",
+            "tokyo-night",
+            "forest",
+            "rose-pine",
+            "ocean",
+            "ember",
+            "monokai"
+          ],
+          "default": "midnight",
+          "description": "Color theme for the attach UI."
+        },
+        "workspace_second_line": {
+          "type": "string",
+          "enum": [
+            "path",
+            "details",
+            "branch",
+            "id",
+            "status",
+            "cursor",
+            "none"
+          ],
+          "default": "path",
+          "description": "What the second line of each workspace row in the sidebar shows."
+        },
+        "cursor_blink": {
+          "type": "boolean",
+          "default": true,
+          "description": "Soft-blink the active pane caret while idle."
+        },
+        "cursor_blink_ms": {
+          "type": "integer",
+          "minimum": 200,
+          "maximum": 5000,
+          "default": 1000,
+          "description": "Half-period of the caret blink in milliseconds (on or off duration)."
+        },
+        "status_markers": {
+          "type": "string",
+          "enum": ["emoji", "ascii", "off"],
+          "default": "emoji",
+          "description": "How agent status markers render in the sidebar."
+        },
+        "default_shell": {
+          "type": "string",
+          "default": "",
+          "description": "Shell binary name or path when a pane command is empty. Empty uses $SHELL."
+        },
+        "default_cwd": {
+          "type": "string",
+          "enum": ["launch", "home"],
+          "default": "launch",
+          "description": "Default working directory for new workspaces/panes: launch cwd or $HOME."
+        },
+        "mouse": {
+          "type": "boolean",
+          "default": true,
+          "description": "Capture mouse in the attach UI (click, drag, wheel)."
+        },
+        "tab_close_button": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show × on workspace tabs when more than one tab exists."
+        },
+        "bell_on_attention": {
+          "type": "boolean",
+          "default": false,
+          "description": "Terminal bell when a pane enters attention / needs-input."
+        },
+        "sidebar_responsive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-hide the workspace sidebar on narrow terminals (burger + picker)."
+        }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Mobile / Cmux Remote-compatible phone relay preferences.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, vmux attach starts the phone relay if it is not already up."
+        },
+        "bind": {
+          "type": "string",
+          "enum": ["auto", "tailscale", "local"],
+          "default": "auto",
+          "description": "Where the relay listens. Never binds 0.0.0.0. auto: Tailscale IP if online else localhost; tailscale: Tailscale only; local: 127.0.0.1 only."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 4399,
+          "description": "TCP port for the phone relay (default 4399, Cmux Remote default). Override with config or `vmux relay serve --listen host:port`."
+        },
+        "allow_localhost": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow localhost device registration (dev / same machine)."
+        },
+        "allow_tailnet_cgnat": {
+          "type": "boolean",
+          "default": false,
+          "description": "Accept Tailscale CGNAT peers without whois (weaker; practical when whois is unavailable)."
+        },
+        "allow_paste": {
+          "type": "boolean",
+          "default": true,
+          "description": "Serve the browser paste page (GET /paste, POST /v1/paste). Uploads still require a paired device token."
+        },
+        "allow_view_resize": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let phone viewers shrink panes to fit their screen (leased view-size overrides)."
+        }
+      }
+    },
+    "agent_titles": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Automatic tab naming for panes running coding agents.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch for automatic tab titles."
+        },
+        "llm_fallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask llm_command to name the tab when no free source produced a title."
+        },
+        "llm_command": {
+          "type": "string",
+          "default": "claude -p",
+          "description": "Headless command that reads a prompt on stdin and prints a short title."
+        },
+        "llm_delay_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 20000,
+          "description": "How long an agent pane may run without a usable title before falling back to llm_command."
+        }
+      }
+    },
+    "ports": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Workspace listening-port detection and optional local forwarding helpers.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Detect listening ports owned by processes under workspace panes (via ss)."
+        },
+        "notify": {
+          "type": "string",
+          "enum": ["toast", "banner", "off"],
+          "default": "toast",
+          "description": "How to surface newly detected ports in the attach UI."
+        },
+        "auto_forward": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start a forward when a new matching port appears."
+        },
+        "forward_via": {
+          "type": "string",
+          "enum": ["ask", "tailscale", "ssh"],
+          "default": "ask",
+          "description": "Preferred path when auto_forward is on or when the UI offers forward."
+        },
+        "poll_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2,
+          "description": "How often the background meta loop rescans listening ports."
+        },
+        "ignore": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "default": [],
+          "description": "Port numbers to never surface or auto-forward."
+        },
+        "ignore_processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Process names (comm) to ignore when attributing listening ports."
+        },
+        "ignore_ephemeral": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide high-numbered ephemeral listeners that are usually not app servers."
+        },
+        "ssh_host": {
+          "type": "string",
+          "default": "",
+          "description": "Default SSH target for `vmux ports ssh-cmd` / SSH-based forwards (e.g. user@host)."
+        }
+      }
+    }
+  }
+}

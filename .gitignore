@@ -20,17 +20,17 @@ Cargo.lock.bak
 .agents/
 .vmux/
 
-# Local scratch
+# Local scratch (do not commit; docs/*, todo.md, CHANGELOG.md stay tracked)
 test.md
 *.log
 *.tmp
 bugs.md
 newimp.md
+improve.md
 port-forwarding-plan.md
-review-659a0c1.md
+review-*.md
 
 # Env / secrets
 .env
 .env.*
 !.env.example
-improve.md

@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["terminal", "multiplexer", "tui", "cli", "tmux"]
 categories = ["command-line-utilities", "development-tools"]
 repository = "https://github.com/UAEpro/vmux"
-homepage = "https://github.com/UAEpro/vmux"
+homepage = "https://vmux.sh"
 exclude = [
     "*.md",
     "!README.md",
@@ -65,3 +65,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+[[bench]]
+name = "hot_path"
+harness = false

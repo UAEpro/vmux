@@ -15,6 +15,49 @@ pub struct LmuxConfig {
     /// Name tabs after what the coding agent running in them is doing.
     #[serde(default)]
     pub agent_titles: AgentTitleSettings,
+    /// Auto-detect listening ports in panes and optional Tailscale forward.
+    #[serde(default)]
+    pub ports: PortsSettings,
+}
+
+/// Port detection + forwarding preferences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PortsSettings {
+    /// Scan for listening ports owned by pane processes.
+    pub enabled: bool,
+    /// How to surface a newly opened port: `toast`, `banner`, or `off`.
+    pub notify: String,
+    /// Automatically Tailscale-forward newly detected ports (opt-in).
+    pub auto_forward: bool,
+    /// Preferred forward mechanism when asked: `ask`, `tailscale`, or `ssh`.
+    pub forward_via: String,
+    /// Scan interval in seconds (clamped 1–60).
+    pub poll_secs: u64,
+    /// Ports never reported (relay port is always added at runtime).
+    pub ignore: Vec<u16>,
+    /// Process names to ignore (e.g. language servers).
+    pub ignore_processes: Vec<String>,
+    /// Drop ports in the kernel ephemeral range (LSP/debugger noise).
+    pub ignore_ephemeral: bool,
+    /// Override for `vmux ports ssh-cmd` host (`user@host`). Empty = auto.
+    pub ssh_host: String,
+}
+
+impl Default for PortsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            notify: "toast".to_string(),
+            auto_forward: false,
+            forward_via: "ask".to_string(),
+            poll_secs: 2,
+            ignore: Vec::new(),
+            ignore_processes: Vec::new(),
+            ignore_ephemeral: true,
+            ssh_host: String::new(),
+        }
+    }
 }
 
 /// Automatic tab naming for panes running **any** coding agent.
@@ -202,6 +245,10 @@ impl LmuxConfig {
         if self.relay.port == 0 {
             self.relay.port = 4399;
         }
+        self.ports.notify = normalize_ports_notify(&self.ports.notify);
+        self.ports.forward_via = normalize_ports_forward_via(&self.ports.forward_via);
+        self.ports.poll_secs = self.ports.poll_secs.clamp(1, 60);
+        self.ports.ssh_host = self.ports.ssh_host.trim().to_string();
         self
     }
 }
@@ -359,6 +406,49 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
         "relay.allow_view_resize" => {
             config.relay.allow_view_resize = parse_bool(value)?;
         }
+        "ports.enabled" => {
+            config.ports.enabled = parse_bool(value)?;
+        }
+        "ports.notify" => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if !supported_ports_notify().contains(&normalized.as_str()) {
+                return Err(anyhow!(
+                    "ports.notify must be one of {}",
+                    supported_ports_notify().join(", ")
+                ));
+            }
+            config.ports.notify = normalized;
+        }
+        "ports.auto_forward" => {
+            config.ports.auto_forward = parse_bool(value)?;
+        }
+        "ports.forward_via" => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if !supported_ports_forward_via().contains(&normalized.as_str()) {
+                return Err(anyhow!(
+                    "ports.forward_via must be one of {}",
+                    supported_ports_forward_via().join(", ")
+                ));
+            }
+            config.ports.forward_via = normalized;
+        }
+        "ports.poll_secs" => {
+            config.ports.poll_secs = value
+                .parse::<u64>()
+                .map_err(|_| anyhow!("ports.poll_secs must be an integer"))?;
+        }
+        "ports.ignore_ephemeral" => {
+            config.ports.ignore_ephemeral = parse_bool(value)?;
+        }
+        "ports.ignore" => {
+            config.ports.ignore = parse_u16_list(value)?;
+        }
+        "ports.ignore_processes" => {
+            config.ports.ignore_processes = parse_string_list(value);
+        }
+        "ports.ssh_host" => {
+            config.ports.ssh_host = value.trim().to_string();
+        }
         "agent_titles.enabled" => {
             config.agent_titles.enabled = parse_bool(value)?;
         }
@@ -415,6 +505,50 @@ fn parse_bool(value: &str) -> Result<bool> {
         "false" | "0" | "no" | "off" => Ok(false),
         _ => Err(anyhow!("boolean value must be true or false")),
     }
+}
+
+fn parse_u16_list(value: &str) -> Result<Vec<u16>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Accept "1,2,3" or JSON-ish "[1, 2, 3]".
+    let body = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let mut out = Vec::new();
+    for part in body.split([',', ' ']) {
+        let part = part.trim().trim_matches(',');
+        if part.is_empty() {
+            continue;
+        }
+        let n: u16 = part
+            .parse()
+            .map_err(|_| anyhow!("ports.ignore entries must be port numbers, got {part}"))?;
+        if n == 0 {
+            return Err(anyhow!("ports.ignore entries must be non-zero"));
+        }
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_string_list(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let body = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    body.split([',', ' '])
+        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 pub fn default_prefix_key() -> String {
@@ -477,6 +611,32 @@ pub fn supported_relay_binds() -> Vec<&'static str> {
     vec!["auto", "tailscale", "local"]
 }
 
+pub fn supported_ports_notify() -> Vec<&'static str> {
+    vec!["toast", "banner", "off"]
+}
+
+pub fn supported_ports_forward_via() -> Vec<&'static str> {
+    vec!["ask", "tailscale", "ssh"]
+}
+
+fn normalize_ports_notify(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if supported_ports_notify().contains(&normalized.as_str()) {
+        normalized
+    } else {
+        "toast".to_string()
+    }
+}
+
+fn normalize_ports_forward_via(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if supported_ports_forward_via().contains(&normalized.as_str()) {
+        normalized
+    } else {
+        "ask".to_string()
+    }
+}
+
 fn normalize_relay_bind(value: &str) -> String {
     let normalized = value.trim().to_ascii_lowercase();
     // Migrate removed "all" (insecure all-interfaces) to safe auto.
@@ -501,6 +661,31 @@ pub fn scroll_step_choices() -> Vec<usize> {
 
 pub fn cursor_blink_ms_choices() -> Vec<u64> {
     vec![500, 1000, 1500, 2000]
+}
+
+/// Common phone-relay ports (Cmux Remote default first).
+pub fn relay_port_choices() -> Vec<u16> {
+    vec![4399, 4400, 4401, 8080, 8443, 9000, 3000]
+}
+
+pub fn ports_poll_secs_choices() -> Vec<u64> {
+    vec![1, 2, 3, 5, 10]
+}
+
+pub fn cycle_u16(choices: &[u16], current: u16, delta: isize) -> u16 {
+    if choices.is_empty() {
+        return current;
+    }
+    // If the live value is not in the list (user edited config.json), include it
+    // so cycling does not jump away without a way back.
+    let mut list = choices.to_vec();
+    if !list.contains(&current) {
+        list.push(current);
+        list.sort_unstable();
+    }
+    let idx = list.iter().position(|c| *c == current).unwrap_or(0);
+    let next = (idx as isize + delta).rem_euclid(list.len() as isize) as usize;
+    list[next]
 }
 
 pub fn default_shell_choices() -> Vec<&'static str> {
@@ -686,6 +871,19 @@ mod tests {
         let mut high = LmuxConfig::default();
         high.ui.scroll_step = 500;
         assert_eq!(high.normalized().ui.scroll_step, 50);
+    }
+
+    #[test]
+    fn set_value_ports_ignore_lists() {
+        let mut config = LmuxConfig::default();
+        set_value(&mut config, "ports.ignore", "5432, 6379").unwrap();
+        assert_eq!(config.ports.ignore, vec![5432, 6379]);
+        set_value(&mut config, "ports.ignore_processes", "ssh,sshd").unwrap();
+        assert_eq!(config.ports.ignore_processes, vec!["ssh", "sshd"]);
+        set_value(&mut config, "ports.poll_secs", "5").unwrap();
+        assert_eq!(config.ports.poll_secs, 5);
+        set_value(&mut config, "ports.notify", "off").unwrap();
+        assert_eq!(config.ports.notify, "off");
     }
 
     #[test]

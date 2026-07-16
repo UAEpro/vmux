@@ -25,8 +25,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use cli::SurfaceKindArg;
 use cli::{
     ActionCommand, AgentCommand, BrowserCommand, Cli, Command, ConfigCommand, HookShell,
-    HooksCommand, MarkdownCommand, MetadataCommand, PaneTabCommand, ProgressCommand, RelayCommand,
-    RelayDevicesCommand, RemoteCommand, SkillsCommand, SurfaceCommand, TabCommand,
+    HooksCommand, MarkdownCommand, MetadataCommand, PaneTabCommand, PortsCommand, ProgressCommand,
+    RelayCommand, RelayDevicesCommand, RemoteCommand, SkillsCommand, SurfaceCommand, TabCommand,
     WorkspaceCommand,
 };
 use model::SurfaceKind;
@@ -117,6 +117,7 @@ fn main() -> Result<()> {
         Command::Agent { command } => agent_command(session, command),
         Command::Remote { command } => remote_command(session, command),
         Command::Relay { command } => relay_command(session, command),
+        Command::Ports { command } => ports_command(session, command),
         Command::Markdown { command } => markdown_command(session, command),
         Command::Actions { command } => {
             daemon::ensure_running(session)?;
@@ -384,7 +385,10 @@ fn main() -> Result<()> {
                 .or_else(|| std::env::var("VMUX_SURFACE_ID").ok())
                 .ok_or_else(|| anyhow!("--pane required (not running inside a vmux pane)"))?;
             let request = if clear {
-                protocol::Request::ClearPaneViewSize { pane }
+                protocol::Request::ClearPaneViewSize {
+                    pane,
+                    viewer_id: None,
+                }
             } else {
                 let (Some(cols), Some(rows)) = (cols, rows) else {
                     anyhow::bail!("pass --cols and --rows, or --clear");
@@ -394,6 +398,7 @@ fn main() -> Result<()> {
                     cols,
                     rows,
                     lease_ms,
+                    viewer_id: None,
                 }
             };
             let response = protocol::request(&paths::socket_path(session)?, &request)?;
@@ -561,16 +566,17 @@ fn main() -> Result<()> {
         }
         Command::Events {
             limit,
+            since,
             follow,
             interval_ms,
         } => {
             daemon::ensure_running(session)?;
             if follow {
-                return follow_events(session, limit, interval_ms);
+                return follow_events(session, limit, interval_ms, since);
             }
             let response = protocol::request(
                 &paths::socket_path(session)?,
-                &protocol::Request::Events { limit },
+                &protocol::Request::Events { limit, since },
             )?;
             print_response(response)
         }
@@ -643,18 +649,118 @@ fn relay_command(session: &str, command: RelayCommand) -> Result<()> {
         RelayCommand::Serve {
             config,
             listen,
+            port,
             allow_localhost,
-        } => relay::serve(
-            session,
-            config.map(std::path::PathBuf::from),
-            listen,
-            allow_localhost,
-        ),
+        } => {
+            let listen = match (listen, port) {
+                (Some(addr), Some(p)) => {
+                    // Replace trailing :port if present, else append.
+                    Some(if let Some((host, _)) = addr.rsplit_once(':') {
+                        if host.starts_with('[') || addr.matches(':').count() == 1 {
+                            format!("{host}:{p}")
+                        } else {
+                            format!("{addr}:{p}")
+                        }
+                    } else {
+                        format!("{addr}:{p}")
+                    })
+                }
+                (None, Some(p)) => {
+                    let cfg = config::load().unwrap_or_default().normalized();
+                    let host = match cfg.relay.bind.as_str() {
+                        "local" => "127.0.0.1".to_string(),
+                        _ => relay::tailscale_ipv4().unwrap_or_else(|| "127.0.0.1".to_string()),
+                    };
+                    Some(format!("{host}:{p}"))
+                }
+                (listen, None) => listen,
+            };
+            relay::serve(
+                session,
+                config.map(std::path::PathBuf::from),
+                listen,
+                allow_localhost,
+            )
+        }
         RelayCommand::Status { config } => relay::status(config.map(std::path::PathBuf::from)),
         RelayCommand::Devices { command } => match command {
             RelayDevicesCommand::List => relay::devices_list(),
             RelayDevicesCommand::Revoke { device_id } => relay::devices_revoke(&device_id),
         },
+    }
+}
+
+fn ports_command(session: &str, command: PortsCommand) -> Result<()> {
+    daemon::ensure_running(session)?;
+    let socket = paths::socket_path(session)?;
+    match command {
+        PortsCommand::List { workspace, json } => {
+            let response = protocol::request(&socket, &protocol::Request::ListPorts { workspace })?;
+            if !response.ok {
+                anyhow::bail!(response.error.unwrap_or_else(|| "list ports failed".into()));
+            }
+            let data = response.data.unwrap_or(serde_json::Value::Null);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&data)?);
+                return Ok(());
+            }
+            let ports: Vec<serde_json::Value> = serde_json::from_value(data).unwrap_or_default();
+            if ports.is_empty() {
+                println!("(no listening ports detected in panes)");
+                return Ok(());
+            }
+            println!(
+                "{:<6} {:<16} {:<10} {:<12} {:<18} FORWARD",
+                "PORT", "PROCESS", "PANE", "WORKSPACE", "HOST"
+            );
+            for p in ports {
+                let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+                let process = p.get("process").and_then(|v| v.as_str()).unwrap_or("-");
+                let pane = p.get("pane").and_then(|v| v.as_str()).unwrap_or("-");
+                let workspace = p.get("workspace").and_then(|v| v.as_str()).unwrap_or("-");
+                let host = p.get("host").and_then(|v| v.as_str()).unwrap_or("-");
+                let forward = p
+                    .get("forward")
+                    .and_then(|f| f.get("url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                println!(
+                    "{:<6} {:<16} {:<10} {:<12} {:<18} {}",
+                    port, process, pane, workspace, host, forward
+                );
+            }
+            Ok(())
+        }
+        PortsCommand::SshCmd { port } => {
+            let response = protocol::request(&socket, &protocol::Request::PortSshCmd { port })?;
+            if !response.ok {
+                anyhow::bail!(response.error.unwrap_or_else(|| "ssh-cmd failed".into()));
+            }
+            let data = response.data.unwrap_or(serde_json::Value::Null);
+            if let Some(cmd) = data.get("command").and_then(|v| v.as_str()) {
+                println!("{cmd}");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&data)?);
+            }
+            Ok(())
+        }
+        PortsCommand::Forward { port, via } => {
+            let response =
+                protocol::request(&socket, &protocol::Request::ForwardPort { port, via })?;
+            if !response.ok {
+                anyhow::bail!(response.error.unwrap_or_else(|| "forward failed".into()));
+            }
+            println!("{}", serde_json::to_string_pretty(&response.data)?);
+            Ok(())
+        }
+        PortsCommand::Unforward { port } => {
+            let response = protocol::request(&socket, &protocol::Request::UnforwardPort { port })?;
+            if !response.ok {
+                anyhow::bail!(response.error.unwrap_or_else(|| "unforward failed".into()));
+            }
+            println!("stopped forward for port {port}");
+            Ok(())
+        }
     }
 }
 
@@ -2626,7 +2732,13 @@ fn smoke(keep: bool) -> Result<()> {
             == Some("smoke-agent");
         checks.push(smoke_check("metadata-identify", metadata_visible));
 
-        let events = protocol::request(&socket, &protocol::Request::Events { limit: 20 })?;
+        let events = protocol::request(
+            &socket,
+            &protocol::Request::Events {
+                limit: 20,
+                since: None,
+            },
+        )?;
         let event_kinds = events
             .data
             .as_ref()
@@ -2917,23 +3029,29 @@ fn wait_for_socket_ping(socket: &std::path::Path, attempts: usize) -> Result<boo
     Ok(false)
 }
 
-fn follow_events(session: &str, limit: usize, interval_ms: u64) -> Result<()> {
+fn follow_events(
+    session: &str,
+    limit: usize,
+    interval_ms: u64,
+    initial_since: Option<u64>,
+) -> Result<()> {
     let socket = paths::socket_path(session)?;
     let event_id = |event: &serde_json::Value| event.get("id").and_then(|v| v.as_u64());
     // Cursor: the highest event id already emitted. Dedup on the monotonic id,
     // NOT the serialized JSON — the daemon embeds mutable pane_title /
     // workspace_name resolved at query time, so a title change would otherwise
-    // re-serialize a seen event and re-print it as new. (A burst larger than
-    // `limit` between polls can still scroll out of the window; fully fixing
-    // that needs a `since`-cursor on the Events request.)
-    let mut last_id = events_from_socket(&socket, limit)?
-        .iter()
-        .filter_map(&event_id)
-        .max()
-        .unwrap_or(0);
+    // re-serialize a seen event and re-print it as new. Server-side `since`
+    // keeps large bursts from scrolling out of the limit window.
+    let mut last_id = initial_since.unwrap_or_else(|| {
+        events_from_socket(&socket, limit, None)
+            .ok()
+            .and_then(|events| events.iter().filter_map(&event_id).max())
+            .unwrap_or(0)
+    });
     let interval = std::time::Duration::from_millis(interval_ms.clamp(100, 10_000));
     loop {
-        let mut events = events_from_socket(&socket, limit)?;
+        let mut events = events_from_socket(&socket, limit, Some(last_id))?;
+        // Server returns newest-first; print oldest-first for follow streams.
         events.reverse();
         for event in events {
             let Some(id) = event_id(&event) else { continue };
@@ -2948,8 +3066,12 @@ fn follow_events(session: &str, limit: usize, interval_ms: u64) -> Result<()> {
     }
 }
 
-fn events_from_socket(socket: &std::path::Path, limit: usize) -> Result<Vec<serde_json::Value>> {
-    let response = protocol::request(socket, &protocol::Request::Events { limit })?;
+fn events_from_socket(
+    socket: &std::path::Path,
+    limit: usize,
+    since: Option<u64>,
+) -> Result<Vec<serde_json::Value>> {
+    let response = protocol::request(socket, &protocol::Request::Events { limit, since })?;
     if !response.ok {
         return Err(anyhow!(
             "{}",
@@ -3323,10 +3445,12 @@ mod tests {
         match cli.command.unwrap() {
             Command::Events {
                 limit,
+                since,
                 follow,
                 interval_ms,
             } => {
                 assert_eq!(limit, 25);
+                assert!(since.is_none());
                 assert!(follow);
                 assert_eq!(interval_ms, 250);
             }
