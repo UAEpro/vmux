@@ -1,35 +1,71 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 — 2026-07-16
 
-Documentation, branding, config schema, and full-roadmap platform work.
+Feature release: ports panel, phone multi-viewer sizing, settings that
+apply cleanly, notification/command-palette UI, website, and new tabs
+that inherit the directory you `cd`'d into. Upgrade with the install
+one-liner, `cargo install vmux-tui`, or wait for the in-app update notice.
 
 ### Added
 
-- **Config JSON Schema** at `docs/config.schema.json` covering `ui.*`,
-  `relay.*`, `agent_titles.*`, and `ports.*` (with `$schema` usage notes in
-  `docs/config.md`).
 - **Ports subsystem** (`src/daemon/ports.rs`): Linux `/proc` scanner with
   pane attribution, open/close events + notifications, `ports.*` config,
   CLI + attach panel (`Ctrl-b o`), Tailscale TCP proxy. See `docs/ports.md`.
-- **Multi-viewer phone-fit** (`daemon/view_size.rs`): `min()` across live
-  leased viewers via `viewer_id` on set/clear view size.
-- **`Events { since }`** incremental poll; `vmux events --since` / follow.
-- **Settings** rows: relay port, CGNAT, phone-fit resize, ports toggles.
-- **Docs / schema:** architecture, troubleshooting, ports, config schema.
+- **Multi-viewer phone-fit** (`daemon/view_size.rs`): when several phones
+  watch the same pane, the PTY uses `min()` across live leased viewers
+  via `viewer_id` on set/clear view size (no more last-writer-wins).
+- **`Events { since }`** incremental poll; `vmux events --since` / follow
+  for agents and scripts.
+- **Settings panel rows** for relay port, CGNAT, phone-fit resize, and
+  ports toggles (with deferred apply so typing a port does not thrash
+  the listener until you leave the row or close Settings).
+- **Config JSON Schema** at `docs/config.schema.json` covering `ui.*`,
+  `relay.*`, `agent_titles.*`, and `ports.*` (with `$schema` usage notes
+  in `docs/config.md`).
+- **Website** at [vmux.sh](https://vmux.sh) (install, Remote, privacy,
+  support pages).
+- **Authenticated remote push notifications** for the phone workflow
+  (pairing-backed; production host config stays private).
+- **Command palette redesign**: sections, icons, clearer chrome, one
+  line per command, scrollable list (`src/ui/command_palette.rs`).
+- **Notifications panel redesign**: color cards, clear-all, theme
+  selection, hover, and click-to-select/jump.
+- **UI modules**: `theme`, `settings_panel`, `ports_panel`,
+  `command_palette` extracted from the attach UI.
 - **`protocol_version`** on `DaemonInfo` / Ping.
 - **Attach reconnect** via `request_with_retry`.
 - **Daemon connection cap** (256) + socket timeouts.
 - **`cargo bench --bench hot_path`** micro-benchmarks.
+- **Docs:** architecture, troubleshooting, ports, config schema.
+- **Phone contract CI** workflow for the Remote wire protocol.
 
 ### Changed
 
-- **Branding:** package `homepage` is `https://vmux.sh` (repository remains
-  GitHub). Windows is explicitly unsupported; WSL is fine (it is Linux).
+- **New tabs and panes open in the live shell directory.** After you
+  `cd` in a pane, a new tab (or split) starts in that path — not the
+  directory the workspace was first opened in. Linux uses
+  `/proc/<pid>/cwd`; macOS uses `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
+- **Mobile relay enabled by default** so phone pairing works out of the
+  box.
 - **Relay port** configurable (`relay.port`, `vmux relay serve --port`).
+- **Branding:** package `homepage` is `https://vmux.sh` (repository
+  remains GitHub). Windows is explicitly unsupported; WSL is fine
+  (it is Linux).
 - **Scroll:** styled history cap 2500; UI clamp matches styled length.
-- **Perf:** PTY batching; compact saves; agent_inside `/proc` off PTY path.
+- **Perf:** PTY batching; compact saves; agent_inside `/proc` off the
+  PTY hot path.
 - Repo hygiene: clean `todo.md`; scratch notes stay gitignored.
+
+### Fixed
+
+- **Finished Grok turns no longer flip back to busy** when a late busy
+  status arrives after the turn is done.
+- **Notification feed spam** reduced; jumps are tab-aware.
+- **macOS CI / clippy:** Linux-only port scanner helpers and proc parsers
+  gated so the macOS matrix stays clean.
+- **Settings relay port** no longer rebinds on every keystroke (deferred
+  apply until leave-row / close).
 
 ## v0.4.1 — 2026-07-14
 
