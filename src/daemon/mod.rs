@@ -2141,13 +2141,19 @@ impl Server {
                 .map_err(anyhow::Error::msg)?,
             None => session.active_workspace.clone(),
         };
-        let cwd = session
+        let workspace = session
             .workspaces
             .iter()
             .find(|workspace| workspace.id == target)
-            .map(|workspace| workspace.cwd.clone())
             .ok_or_else(|| anyhow!("unknown workspace {target}"))?;
+        let stored = workspace.cwd.clone();
+        // Prefer the live cwd of a shell in this workspace so new panes/tabs
+        // follow `cd` instead of the directory the workspace was first opened
+        // in. Order: live active pane → any tab's active pane → any running
+        // pane (covers `new_tab`, which clears active_pane before spawning).
+        let live = preferred_live_cwd(workspace, &session.panes);
         drop(session);
+        let cwd = live.unwrap_or(stored);
         Ok((target, normalize_cwd(Some(cwd))?))
     }
 
@@ -5446,6 +5452,48 @@ fn pane_live_cwd(pid: u32) -> Option<String> {
     path.is_absolute().then(|| path.display().to_string())
 }
 
+/// Best-effort live cwd for spawning a new pane/tab in `workspace`.
+///
+/// When the user has `cd`'d inside a pane, new panes and tabs should open
+/// there — not at the workspace's original spawn path. Falls through a few
+/// candidates because `new_tab` clears the live `active_pane` before the new
+/// pane is created.
+fn preferred_live_cwd(
+    workspace: &crate::model::Workspace,
+    panes: &BTreeMap<String, Pane>,
+) -> Option<String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(id) = workspace.active_pane.as_deref() {
+        candidates.push(id);
+    }
+    // Prefer more recently added tabs (end of list) so "new tab while on tab
+    // that already followed a cd" still picks a sensible peer.
+    for tab in workspace.tabs.iter().rev() {
+        if let Some(id) = tab.active_pane.as_deref() {
+            candidates.push(id);
+        }
+        for pane_id in tab.panes.iter().rev() {
+            candidates.push(pane_id.as_str());
+        }
+    }
+    for pane_id in &workspace.panes {
+        candidates.push(pane_id.as_str());
+    }
+    let mut seen = BTreeSet::new();
+    for pane_id in candidates {
+        if !seen.insert(pane_id) {
+            continue;
+        }
+        let Some(pid) = panes.get(pane_id).and_then(|p| p.pid) else {
+            continue;
+        };
+        if let Some(cwd) = pane_live_cwd(pid) {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
 fn listening_ports_for_roots(roots: &[u32]) -> Vec<ListeningPort> {
     if roots.is_empty() {
         return Vec::new();
@@ -7111,6 +7159,49 @@ mod tests {
         let expected = std::env::current_dir().unwrap().display().to_string();
         assert_eq!(pane_live_cwd(std::process::id()), Some(expected));
         assert_eq!(pane_live_cwd(u32::MAX), None);
+    }
+
+    /// New panes/tabs must follow a pane that has already `cd`'d, not the
+    /// workspace's original spawn path. Uses this process's cwd via /proc.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn preferred_live_cwd_follows_active_pane() {
+        let expected = std::env::current_dir().unwrap().display().to_string();
+        let mut ws = crate::model::Workspace::new("ws-1", "main");
+        ws.cwd = "/tmp".into(); // stored path deliberately different
+        ws.active_pane = Some("pane-1".into());
+        ws.panes = vec!["pane-1".into()];
+        let mut panes = BTreeMap::new();
+        let mut pane = Pane::new("pane-1".into(), "bash".into(), SplitDirection::Right);
+        pane.pid = Some(std::process::id());
+        panes.insert("pane-1".into(), pane);
+        assert_eq!(
+            preferred_live_cwd(&ws, &panes).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    /// `new_tab` clears `workspace.active_pane` before spawning; still find
+    /// the previous tab's pane via tab records.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn preferred_live_cwd_finds_pane_on_previous_tab() {
+        let expected = std::env::current_dir().unwrap().display().to_string();
+        let mut ws = crate::model::Workspace::new("ws-1", "main");
+        ws.cwd = "/tmp".into();
+        // Simulate post-add_tab: live view empty, old tab still has the pane.
+        ws.active_pane = None;
+        ws.panes.clear();
+        ws.tabs[0].panes = vec!["pane-1".into()];
+        ws.tabs[0].active_pane = Some("pane-1".into());
+        let mut panes = BTreeMap::new();
+        let mut pane = Pane::new("pane-1".into(), "bash".into(), SplitDirection::Right);
+        pane.pid = Some(std::process::id());
+        panes.insert("pane-1".into(), pane);
+        assert_eq!(
+            preferred_live_cwd(&ws, &panes).as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     /// The macOS half of the same contract: no `/proc`, so no live cwd. Pins the
