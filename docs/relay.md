@@ -36,6 +36,13 @@ box — but the port is **not** hard-wired.
 Whatever you choose, the phone app (and paste-page URLs) must use the **same**
 port. `relay.port` is an integer **1–65535** (`0` is rejected).
 
+### One relay for all sessions
+
+The managed phone relay is **machine-global**, not per `vmux --session`.
+Session `default` and session `dev` share the same config port (default 4399)
+and the same process: a second attach sees “already running” and reuses it.
+That is intentional — the phone app points at one host:port.
+
 ## Settings
 
 In `vmux attach`, open **⚙ set** and find the **mobile relay** section:
@@ -48,6 +55,11 @@ In `vmux attach`, open **⚙ set** and find the **mobile relay** section:
 | relay localhost | Allow device registration from `127.0.0.1`, for dev |
 | paste page | Serve `/paste` for screenshot paste |
 | phone-fit resize | Leased view-size overrides (`relay.allow_view_resize`) |
+
+**Deferred apply:** changing relay port / bind / toggles in Settings does **not**
+restart the relay on every keypress. Edits stay **pending** until you move to
+another settings row or close Settings (Esc / ⚙). Then config is saved once and
+the managed relay is restarted once — no multi-second lag while cycling ports.
 
 There is deliberately no "all interfaces" option. The relay refuses to bind
 `0.0.0.0` or `::`, so it will not end up exposed on every NIC. Phone access goes

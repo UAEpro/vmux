@@ -670,7 +670,11 @@ pub fn ensure_started(session: &str, settings: &RelaySettings) -> Result<Option<
     let listen = resolve_listen(settings);
     assert_safe_listen(&listen)?;
     if is_healthy(&listen) {
-        return Ok(Some(format!("mobile relay already running on {listen}")));
+        // One managed relay per machine (shared by every vmux session). A second
+        // attach must not re-bind the port or restart the process.
+        return Ok(Some(format!(
+            "mobile relay already running on {listen} (shared by all sessions)"
+        )));
     }
     // Clean stale pid
     let _ = stop_managed();

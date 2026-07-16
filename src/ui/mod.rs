@@ -195,6 +195,10 @@ struct Ui {
     mobile_relay_allow_paste: bool,
     /// Phone-fit pane resize gate (settings + config).
     mobile_relay_allow_view_resize: bool,
+    /// Relay rows edited in Settings but not yet written / applied. Restarting
+    /// the managed relay on every ←/→ for port was multi-second lag; flush when
+    /// the user leaves the settings panel or moves to another settings row.
+    settings_relay_dirty: bool,
     /// Port detection / forward settings (daemon reads most on next start).
     ports_enabled: bool,
     ports_notify: String,
@@ -1152,6 +1156,7 @@ impl Ui {
             mobile_relay_allow_cgnat: config.relay.allow_tailnet_cgnat,
             mobile_relay_allow_paste: config.relay.allow_paste,
             mobile_relay_allow_view_resize: config.relay.allow_view_resize,
+            settings_relay_dirty: false,
             ports_enabled: config.ports.enabled,
             ports_notify: config.ports.notify.clone(),
             ports_auto_forward: config.ports.auto_forward,
@@ -1335,6 +1340,7 @@ impl Ui {
                             self.mobile_relay_allow_cgnat,
                             self.mobile_relay_allow_paste,
                             self.mobile_relay_allow_view_resize,
+                            self.settings_relay_dirty,
                             self.ports_enabled,
                             self.ports_notify.as_str(),
                             self.ports_auto_forward,
@@ -1612,7 +1618,10 @@ impl Ui {
                 }
                 if self.mode == UiMode::Settings {
                     match key.code {
-                        KeyCode::Esc => self.mode = UiMode::Panes,
+                        KeyCode::Esc => {
+                            self.flush_pending_relay_settings();
+                            self.mode = UiMode::Panes;
+                        }
                         KeyCode::Up | KeyCode::Char('k') => self.move_settings_selection(-1),
                         KeyCode::Down | KeyCode::Char('j') => self.move_settings_selection(1),
                         KeyCode::Left | KeyCode::Char('h') => self.adjust_selected_setting(-1)?,
@@ -2389,12 +2398,48 @@ impl Ui {
     }
 
     fn toggle_settings(&mut self) {
-        self.mode = if self.mode == UiMode::Settings {
-            UiMode::Panes
+        if self.mode == UiMode::Settings {
+            self.flush_pending_relay_settings();
+            self.mode = UiMode::Panes;
         } else {
             self.settings_selected = self.settings_selected.min(settings_entries().len() - 1);
-            UiMode::Settings
-        };
+            self.mode = UiMode::Settings;
+        }
+    }
+
+    /// Write deferred relay settings and restart the managed relay once.
+    fn flush_pending_relay_settings(&mut self) {
+        if !self.settings_relay_dirty {
+            return;
+        }
+        self.settings_relay_dirty = false;
+        let settings = self.relay_settings();
+        // One config write for the whole relay block (not one restart per key).
+        if let Err(err) = self.save_relay_settings_block(&settings) {
+            *self.action_error.get_mut() = Some(format!("save config: {err:#}"));
+            return;
+        }
+        let session = self.session.clone();
+        match crate::relay::apply_enabled(&session, &settings) {
+            Ok(msg) => {
+                *self.action_error.get_mut() = Some(format!("{msg} · saved"));
+            }
+            Err(err) => {
+                *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
+            }
+        }
+    }
+
+    fn save_relay_settings_block(&self, settings: &crate::config::RelaySettings) -> Result<()> {
+        let (path, mut config) = crate::config::load_for_mutation()?;
+        config.relay = settings.clone();
+        config = config.normalized();
+        crate::config::save_to_path(&path, &config)?;
+        Ok(())
+    }
+
+    fn mark_relay_settings_dirty(&mut self) {
+        self.settings_relay_dirty = true;
     }
 
     fn toggle_workspace_picker(&mut self) {
@@ -2497,6 +2542,8 @@ impl Ui {
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
+        // Leaving a row applies pending relay edits (one save + one restart).
+        self.flush_pending_relay_settings();
         let entries = settings_entries();
         let count = entries.len();
         if count == 0 {
@@ -2650,20 +2697,7 @@ impl Ui {
             }
             SettingsEntryId::MobileRelay => {
                 self.mobile_relay_enabled = !self.mobile_relay_enabled;
-                if let Err(err) =
-                    self.save_ui_config("relay.enabled", &self.mobile_relay_enabled.to_string())
-                {
-                    *self.action_error.get_mut() = Some(format!("save config: {err:#}"));
-                }
-                // Never fail attach on relay start/stop.
-                let settings = self.relay_settings();
-                let session = self.session.clone();
-                match crate::relay::apply_enabled(&session, &settings) {
-                    Ok(msg) => *self.action_error.get_mut() = Some(msg),
-                    Err(err) => {
-                        *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
-                    }
-                }
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayBind => {
                 let next = crate::config::cycle_choice(
@@ -2671,9 +2705,8 @@ impl Ui {
                     &self.mobile_relay_bind,
                     delta,
                 );
-                self.mobile_relay_bind = next.clone();
-                let _ = self.save_ui_config("relay.bind", &next);
-                self.restart_mobile_relay_if_enabled();
+                self.mobile_relay_bind = next;
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayPort => {
                 let next = crate::config::cycle_u16(
@@ -2682,35 +2715,23 @@ impl Ui {
                     delta,
                 );
                 self.mobile_relay_port = next;
-                let _ = self.save_ui_config("relay.port", &next.to_string());
-                self.restart_mobile_relay_if_enabled();
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayLocalhost => {
                 self.mobile_relay_allow_localhost = !self.mobile_relay_allow_localhost;
-                let _ = self.save_ui_config(
-                    "relay.allow_localhost",
-                    &self.mobile_relay_allow_localhost.to_string(),
-                );
-                self.restart_mobile_relay_if_enabled();
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayCgnat => {
                 self.mobile_relay_allow_cgnat = !self.mobile_relay_allow_cgnat;
-                let _ = self.save_ui_config(
-                    "relay.allow_tailnet_cgnat",
-                    &self.mobile_relay_allow_cgnat.to_string(),
-                );
-                self.restart_mobile_relay_if_enabled();
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayPaste => {
                 self.mobile_relay_allow_paste = !self.mobile_relay_allow_paste;
-                let _ = self.save_ui_config(
-                    "relay.allow_paste",
-                    &self.mobile_relay_allow_paste.to_string(),
-                );
-                self.restart_mobile_relay_if_enabled();
+                self.mark_relay_settings_dirty();
             }
             SettingsEntryId::MobileRelayViewResize => {
                 self.mobile_relay_allow_view_resize = !self.mobile_relay_allow_view_resize;
+                // No relay process restart needed — only config for phone-fit.
                 let _ = self.save_ui_config(
                     "relay.allow_view_resize",
                     &self.mobile_relay_allow_view_resize.to_string(),
@@ -2762,23 +2783,6 @@ impl Ui {
             | SettingsEntryId::SectionPorts => {}
         }
         Ok(())
-    }
-
-    /// Stop + start the managed phone relay so bind/port/auth changes take effect.
-    fn restart_mobile_relay_if_enabled(&mut self) {
-        if !self.mobile_relay_enabled {
-            return;
-        }
-        let settings = self.relay_settings();
-        let session = self.session.clone();
-        let _ = crate::relay::stop_managed();
-        match crate::relay::ensure_started(&session, &settings) {
-            Ok(Some(msg)) => *self.action_error.get_mut() = Some(msg),
-            Ok(None) => {}
-            Err(err) => {
-                *self.action_error.get_mut() = Some(format!("mobile relay error: {err:#}"));
-            }
-        }
     }
 
     fn relay_settings(&self) -> crate::config::RelaySettings {
@@ -4109,6 +4113,7 @@ fn draw(
     mobile_relay_allow_cgnat: bool,
     mobile_relay_allow_paste: bool,
     mobile_relay_allow_view_resize: bool,
+    settings_relay_dirty: bool,
     ports_enabled: bool,
     ports_notify: &str,
     ports_auto_forward: bool,
@@ -4342,6 +4347,7 @@ fn draw(
                 mobile_relay_allow_cgnat,
                 mobile_relay_allow_paste,
                 mobile_relay_allow_view_resize,
+                settings_relay_dirty,
                 ports_enabled,
                 ports_notify,
                 ports_auto_forward,
@@ -4349,6 +4355,9 @@ fn draw(
                 selected: settings_selected,
             },
         ),
+        // settings_relay_dirty is only used above; silence unused-param when
+        // not drawing settings (other modes).
+        // (parameter still required for SettingsView construction.)
         UiMode::WorkspacePicker => draw_workspace_picker(
             frame,
             main_chunks[0],
@@ -9785,6 +9794,8 @@ struct SettingsView<'a> {
     mobile_relay_allow_cgnat: bool,
     mobile_relay_allow_paste: bool,
     mobile_relay_allow_view_resize: bool,
+    /// True while relay edits are pending (not yet saved / applied).
+    settings_relay_dirty: bool,
     ports_enabled: bool,
     ports_notify: &'a str,
     ports_auto_forward: bool,
@@ -9877,7 +9888,7 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                     }
                 }
                 SettingsEntryId::SectionRelay => {
-                    "Cmux Remote / phone (Tailscale or localhost only)".to_string()
+                    "one relay for all sessions · change applies when you leave the row".to_string()
                 }
                 SettingsEntryId::MobileRelay => {
                     let settings = crate::config::RelaySettings {
@@ -9890,18 +9901,36 @@ fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
                         // Display-only: runtime_status_line reads enabled/bind/port.
                         allow_view_resize: false,
                     };
-                    crate::relay::runtime_status_line(&settings)
+                    let mut line = crate::relay::runtime_status_line(&settings);
+                    if view.settings_relay_dirty {
+                        line.push_str(" · pending save");
+                    }
+                    line
                 }
-                SettingsEntryId::MobileRelayBind => match view.mobile_relay_bind {
-                    "tailscale" => "tailscale only".to_string(),
-                    "local" => "localhost only".to_string(),
-                    _ => "auto (Tailscale → localhost)".to_string(),
-                },
+                SettingsEntryId::MobileRelayBind => {
+                    let base = match view.mobile_relay_bind {
+                        "tailscale" => "tailscale only",
+                        "local" => "localhost only",
+                        _ => "auto (Tailscale → localhost)",
+                    };
+                    if view.settings_relay_dirty {
+                        format!("{base} · pending")
+                    } else {
+                        base.to_string()
+                    }
+                }
                 SettingsEntryId::MobileRelayPort => {
-                    format!(
-                        "{} · h/l or ←/→ to change (phone app must match)",
-                        view.mobile_relay_port
-                    )
+                    if view.settings_relay_dirty {
+                        format!(
+                            "{} · pending · leave row or Esc to apply (shared by all sessions)",
+                            view.mobile_relay_port
+                        )
+                    } else {
+                        format!(
+                            "{} · h/l to cycle · applies on leave · one port for all sessions",
+                            view.mobile_relay_port
+                        )
+                    }
                 }
                 SettingsEntryId::MobileRelayLocalhost => {
                     if view.mobile_relay_allow_localhost {
@@ -10267,6 +10296,7 @@ mod tests {
                     true,
                     true,  // mobile_relay_allow_paste
                     false, // mobile_relay_allow_view_resize
+                    false, // settings_relay_dirty
                     true,  // ports_enabled
                     "toast",
                     false, // ports_auto_forward
@@ -10352,6 +10382,7 @@ mod tests {
                     true,
                     true,  // mobile_relay_allow_paste
                     false, // mobile_relay_allow_view_resize
+                    false, // settings_relay_dirty
                     true,  // ports_enabled
                     "toast",
                     false, // ports_auto_forward
@@ -11719,6 +11750,7 @@ mod tests {
             mobile_relay_allow_cgnat: true,
             mobile_relay_allow_paste: true,
             mobile_relay_allow_view_resize: false,
+            settings_relay_dirty: false,
             ports_enabled: true,
             ports_notify: "toast",
             ports_auto_forward: false,
