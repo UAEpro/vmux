@@ -1172,12 +1172,15 @@ pub enum PaneStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentStatus {
-    Unknown,
     Idle,
     Busy,
     Attention,
     Done,
     Error,
+    /// Unknown / future variants deserialize here so upgrades keep loading state.
+    /// Must stay last for `#[serde(other)]`.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
