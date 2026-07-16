@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout vmux
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -43,7 +43,7 @@ jobs:
         run: cargo build --locked
 
       - name: Checkout vmux-remote
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: UAEpro/vmux-remote
           path: vmux-remote

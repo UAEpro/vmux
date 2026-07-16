@@ -27,7 +27,7 @@ jobs:
     name: Check tag matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # A crates.io publish cannot be undone (only yanked), so refuse to start
       # a release whose tag disagrees with the version that would be published.
@@ -59,7 +59,7 @@ jobs:
       XDG_CONFIG_HOME: /tmp/vmux-xdg-config
       XDG_STATE_HOME: /tmp/vmux-xdg-state
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -87,7 +87,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -168,7 +168,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
