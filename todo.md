@@ -47,7 +47,7 @@ gates, reserved session stems.
 
 ## followups branch
 
-- UI splits: `theme.rs`, `settings_panel.rs`, `ports_panel.rs`
+- UI splits: `theme.rs`, `settings_panel.rs`, `ports_panel.rs`, `command_palette.rs`
 - `AgentStatus` `#[serde(other)]` for forward-compatible state
 - Optional `phone-contract.yml` workflow (manual dispatch) for vmux-remote e2e
 
