@@ -4812,10 +4812,19 @@ fn legacy_runtime_key(pane_id: &str) -> String {
     pane_id.to_string()
 }
 
+/// Upper bound on a pane's grid dimensions. `PaneSize` is `u16`, and a client
+/// (or a buggy/hostile phone view-size lease) can report up to 65535×65535.
+/// vt100's `set_size` eagerly allocates a `rows × cols` cell grid, so an
+/// unbounded value asks for billions of cells; the allocation fails and Rust's
+/// alloc-error handler aborts the whole daemon, killing every session. Clamp to
+/// a size far larger than any real terminal (4M cells here) so all resize /
+/// view-override paths inherit the bound before it reaches `set_size`.
+const MAX_PANE_DIM: u16 = 2000;
+
 fn sanitize_pane_size(size: PaneSize) -> PaneSize {
     PaneSize {
-        rows: size.rows.max(2),
-        cols: size.cols.max(2),
+        rows: size.rows.clamp(2, MAX_PANE_DIM),
+        cols: size.cols.clamp(2, MAX_PANE_DIM),
     }
 }
 
@@ -7359,6 +7368,19 @@ mod tests {
         assert_eq!(
             sanitize_pane_size(PaneSize { rows: 24, cols: 80 }),
             PaneSize { rows: 24, cols: 80 }
+        );
+        // Upper bound: a client-reported extreme (u16::MAX) must not reach
+        // vt100's set_size, which would allocate billions of cells and abort
+        // the daemon. Clamp to MAX_PANE_DIM.
+        assert_eq!(
+            sanitize_pane_size(PaneSize {
+                rows: u16::MAX,
+                cols: u16::MAX
+            }),
+            PaneSize {
+                rows: MAX_PANE_DIM,
+                cols: MAX_PANE_DIM
+            }
         );
     }
 
