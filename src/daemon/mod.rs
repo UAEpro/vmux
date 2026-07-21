@@ -4093,151 +4093,174 @@ impl Server {
     ) {
         // Hot path: update the vt100 parser + light metadata only. Heavy screen
         // strings are materialized lazily in snapshot().
-        let Some((light, notifications, clipboard_writes, auto_title, llm_screen, query_replies)) =
-            ({
-                let mut panes = self.panes.lock_or_recover();
-                let runtime = panes.get_mut(runtime_key);
-                runtime.and_then(|runtime| {
-                    if runtime.generation != generation {
-                        return None;
-                    }
-                    runtime.parser.process(bytes);
-                    runtime.terminal_modes.process(bytes);
-                    runtime.output_generation = runtime.output_generation.wrapping_add(1);
-                    let text = decode_utf8_stream(&mut runtime.pending, bytes);
-                    runtime.osc_tail.push_str(&text);
-                    let (osc, retain_from) = scan_osc_events(&runtime.osc_tail);
-                    let notifications = osc.notifications;
-                    let clipboard_writes = osc.clipboard_writes;
-                    if let Some(progress) = osc.progress {
-                        runtime.pane.progress = progress;
-                    }
-                    if let Some(raw) = osc.title_raw {
-                        runtime.osc_title_raw = raw;
-                    }
-                    if let Some(raw) = osc.progress_raw {
-                        runtime.osc_progress_raw = raw;
-                    }
-                    if retain_from > 0 {
-                        runtime.osc_tail.drain(..retain_from);
-                    }
-                    cap_osc_tail(&mut runtime.osc_tail);
-                    // Answer terminal queries (DA1/DSR/OSC 10-11) like a real
-                    // terminal. Only the writer Arc is captured here; the
-                    // potentially blocking PTY write happens after the panes lock
-                    // is released, same as send_text.
-                    runtime.query_tail.push_str(&text);
-                    let (queries, query_retain) = scan_terminal_queries(&runtime.query_tail);
-                    if query_retain > 0 {
-                        runtime.query_tail.drain(..query_retain);
-                    }
-                    cap_osc_tail(&mut runtime.query_tail);
-                    let query_replies = if queries.is_empty() {
+        let Some((
+            light,
+            notifications,
+            clipboard_writes,
+            auto_title,
+            llm_screen,
+            query_replies,
+            screen_attention_feed,
+        )) = ({
+            let mut panes = self.panes.lock_or_recover();
+            let runtime = panes.get_mut(runtime_key);
+            runtime.and_then(|runtime| {
+                if runtime.generation != generation {
+                    return None;
+                }
+                runtime.parser.process(bytes);
+                runtime.terminal_modes.process(bytes);
+                runtime.output_generation = runtime.output_generation.wrapping_add(1);
+                let text = decode_utf8_stream(&mut runtime.pending, bytes);
+                runtime.osc_tail.push_str(&text);
+                let (osc, retain_from) = scan_osc_events(&runtime.osc_tail);
+                let notifications = osc.notifications;
+                let clipboard_writes = osc.clipboard_writes;
+                if let Some(progress) = osc.progress {
+                    runtime.pane.progress = progress;
+                }
+                if let Some(raw) = osc.title_raw {
+                    runtime.osc_title_raw = raw;
+                }
+                if let Some(raw) = osc.progress_raw {
+                    runtime.osc_progress_raw = raw;
+                }
+                if retain_from > 0 {
+                    runtime.osc_tail.drain(..retain_from);
+                }
+                cap_osc_tail(&mut runtime.osc_tail);
+                // Answer terminal queries (DA1/DSR/OSC 10-11) like a real
+                // terminal. Only the writer Arc is captured here; the
+                // potentially blocking PTY write happens after the panes lock
+                // is released, same as send_text.
+                runtime.query_tail.push_str(&text);
+                let (queries, query_retain) = scan_terminal_queries(&runtime.query_tail);
+                if query_retain > 0 {
+                    runtime.query_tail.drain(..query_retain);
+                }
+                cap_osc_tail(&mut runtime.query_tail);
+                let query_replies =
+                    if queries.is_empty() {
                         None
                     } else {
                         runtime.writer.as_ref().map(Arc::clone).map(|writer| {
                             (writer, queries, runtime.parser.screen().cursor_position())
                         })
                     };
-                    // Name the tab after what the agent says it is doing. Whether a
-                    // pane counts as an agent pane is decided inside, from the
-                    // process tree — the pane command is just the shell.
-                    let (auto_title, llm_screen) = if self.agent_titles.enabled {
-                        self.agent_title_update(runtime, osc.title)
-                    } else {
-                        (None, None)
-                    };
-                    runtime.push_output(text.clone());
-                    runtime.pane.updated_at = unix_time();
-                    // Herdr-style authority: screen manifests win for known
-                    // agents (Claude/Codex/…). Hooks + PTY keywords only when
-                    // no manifest agent is running in this pane.
-                    let screen_authority =
-                        crate::detect::screen_is_status_authority(&runtime.pane.command);
-                    if screen_authority {
-                        let screen = runtime.parser.screen().contents();
-                        if let Some(detection) = crate::detect::detect_for_command(
-                            &runtime.pane.command,
-                            &screen,
-                            &runtime.osc_title_raw,
-                            &runtime.osc_progress_raw,
-                        ) {
-                            if let Some((next, pinned)) = crate::detect::merge_screen_status(
-                                runtime.pane.agent_status.clone(),
+                // Name the tab after what the agent says it is doing. Whether a
+                // pane counts as an agent pane is decided inside, from the
+                // process tree — the pane command is just the shell.
+                let (auto_title, llm_screen) = if self.agent_titles.enabled {
+                    self.agent_title_update(runtime, osc.title)
+                } else {
+                    (None, None)
+                };
+                runtime.push_output(text.clone());
+                runtime.pane.updated_at = unix_time();
+                // Herdr-style authority: screen manifests win for known
+                // agents (Claude/Codex/…). Hooks + PTY keywords only when
+                // no manifest agent is running in this pane.
+                let screen_authority =
+                    crate::detect::screen_is_status_authority(&runtime.pane.command);
+                // When screen status enters Attention, the session loop
+                // appends a feed card (and event for phone push).
+                let mut screen_attention_feed: Option<String> = None;
+                if screen_authority {
+                    let screen = runtime.parser.screen().contents();
+                    if let Some(detection) = crate::detect::detect_for_command(
+                        &runtime.pane.command,
+                        &screen,
+                        &runtime.osc_title_raw,
+                        &runtime.osc_progress_raw,
+                    ) {
+                        let previous = runtime.pane.agent_status.clone();
+                        if let Some((next, pinned)) =
+                            crate::detect::merge_screen_status(previous.clone(), &detection)
+                        {
+                            crate::detect::apply_screen_notification_banner(
+                                &mut runtime.pane,
+                                &previous,
+                                &next,
                                 &detection,
-                            ) {
-                                touch_agent_status(&mut runtime.pane, next, pinned);
+                            );
+                            if !matches!(previous, AgentStatus::Attention)
+                                && matches!(next, AgentStatus::Attention)
+                            {
+                                screen_attention_feed =
+                                    Some(crate::detect::screen_attention_message(&detection));
                             }
-                        }
-                    } else {
-                        let inferred = infer_agent_status(&text, &runtime.pane.command);
-                        let prev = runtime.pane.agent_status.clone();
-                        let (next, pinned) = merge_agent_status(
-                            prev.clone(),
-                            runtime.pane.agent_status_pinned,
-                            inferred,
-                        );
-                        if next != prev || pinned != runtime.pane.agent_status_pinned {
                             touch_agent_status(&mut runtime.pane, next, pinned);
+                        } else if !matches!(runtime.pane.agent_status, AgentStatus::Attention)
+                            && runtime.pane.notification_message.is_some()
+                        {
+                            // Drop stale banners when the live screen is no
+                            // longer blocked (status unchanged this frame).
+                            runtime.pane.notification_message = None;
+                            runtime.pane.notification_color = None;
                         }
                     }
-                    // OSC 9 desktop notifications still surface as attention
-                    // only when screen is not the authority (screen rules
-                    // already catch permission UIs).
-                    if !screen_authority {
-                        if let Some(message) = notifications.last() {
-                            if !is_non_actionable_attention(message) {
-                                touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
-                                runtime.pane.notification_color = Some("blue".to_string());
-                                runtime.pane.notification_message = Some(message.clone());
-                            }
-                        }
-                    } else if let Some(message) = notifications.last() {
-                        // Still record the banner message; do not override
-                        // screen-derived status.
+                } else {
+                    let inferred = infer_agent_status(&text, &runtime.pane.command);
+                    let prev = runtime.pane.agent_status.clone();
+                    let (next, pinned) = merge_agent_status(
+                        prev.clone(),
+                        runtime.pane.agent_status_pinned,
+                        inferred,
+                    );
+                    if next != prev || pinned != runtime.pane.agent_status_pinned {
+                        touch_agent_status(&mut runtime.pane, next, pinned);
+                    }
+                }
+                // OSC 9 desktop notifications: only for non-screen agents.
+                // Screen-authority panes own status + banner via manifests
+                // (setting a banner here would stick after idle and re-bell).
+                if !screen_authority {
+                    if let Some(message) = notifications.last() {
                         if !is_non_actionable_attention(message) {
+                            touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
                             runtime.pane.notification_color = Some("blue".to_string());
                             runtime.pane.notification_message = Some(message.clone());
                         }
                     }
-                    // Light fields only — no contents()/formatted/scrollback join here.
-                    let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
-                    runtime.pane.cursor_row = Some(cursor_row);
-                    runtime.pane.cursor_col = Some(cursor_col);
-                    let (screen_rows, screen_cols) = runtime.parser.screen().size();
-                    runtime.pane.screen_rows = Some(screen_rows);
-                    runtime.pane.screen_cols = Some(screen_cols);
-                    update_pane_terminal_modes(&mut runtime.pane, runtime.parser.screen());
-                    runtime.pane.alternate_scroll_mode = alternate_scroll_active(
-                        &runtime.pane.status,
-                        &runtime.terminal_modes,
-                        runtime.parser.screen(),
-                    );
-                    // Clone light metadata for session merge (empty heavy strings).
-                    // The last snapshot may have cached the heavy screen strings on
-                    // runtime.pane; lift them out before cloning so we don't copy
-                    // (then discard) up to ~16KB × 4 on every PTY chunk, then put
-                    // them back (moves, no copy).
-                    let output = std::mem::take(&mut runtime.pane.output);
-                    let output_formatted = std::mem::take(&mut runtime.pane.output_formatted);
-                    let scrollback = std::mem::take(&mut runtime.pane.scrollback);
-                    let scrollback_formatted =
-                        std::mem::take(&mut runtime.pane.scrollback_formatted);
-                    let light = runtime.pane.clone();
-                    runtime.pane.output = output;
-                    runtime.pane.output_formatted = output_formatted;
-                    runtime.pane.scrollback = scrollback;
-                    runtime.pane.scrollback_formatted = scrollback_formatted;
-                    Some((
-                        light,
-                        notifications,
-                        clipboard_writes,
-                        auto_title,
-                        llm_screen,
-                        query_replies,
-                    ))
-                })
+                }
+                // Light fields only — no contents()/formatted/scrollback join here.
+                let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
+                runtime.pane.cursor_row = Some(cursor_row);
+                runtime.pane.cursor_col = Some(cursor_col);
+                let (screen_rows, screen_cols) = runtime.parser.screen().size();
+                runtime.pane.screen_rows = Some(screen_rows);
+                runtime.pane.screen_cols = Some(screen_cols);
+                update_pane_terminal_modes(&mut runtime.pane, runtime.parser.screen());
+                runtime.pane.alternate_scroll_mode = alternate_scroll_active(
+                    &runtime.pane.status,
+                    &runtime.terminal_modes,
+                    runtime.parser.screen(),
+                );
+                // Clone light metadata for session merge (empty heavy strings).
+                // The last snapshot may have cached the heavy screen strings on
+                // runtime.pane; lift them out before cloning so we don't copy
+                // (then discard) up to ~16KB × 4 on every PTY chunk, then put
+                // them back (moves, no copy).
+                let output = std::mem::take(&mut runtime.pane.output);
+                let output_formatted = std::mem::take(&mut runtime.pane.output_formatted);
+                let scrollback = std::mem::take(&mut runtime.pane.scrollback);
+                let scrollback_formatted = std::mem::take(&mut runtime.pane.scrollback_formatted);
+                let light = runtime.pane.clone();
+                runtime.pane.output = output;
+                runtime.pane.output_formatted = output_formatted;
+                runtime.pane.scrollback = scrollback;
+                runtime.pane.scrollback_formatted = scrollback_formatted;
+                Some((
+                    light,
+                    notifications,
+                    clipboard_writes,
+                    auto_title,
+                    llm_screen,
+                    query_replies,
+                    screen_attention_feed,
+                ))
             })
+        })
         else {
             return;
         };
@@ -4290,39 +4313,24 @@ impl Server {
                     sync_tab_from_runtime_pane(pane, tab_id, &light);
                 }
             }
-            for message in notifications {
-                if is_non_actionable_attention(&message) {
-                    continue;
+            // Screen-manifest Attention → feed card (sidebar already shows 🙋).
+            // Deduped so a sticky permission dialog does not spam the panel.
+            if let Some(message) = screen_attention_feed {
+                if record_attention_notification(&mut session, pane_id, &message) {
+                    should_save = true;
                 }
-                let note = Notification {
-                    time: unix_time(),
-                    pane: Some(pane_id.to_string()),
-                    workspace: None,
-                    status: Some("attention".to_string()),
-                    color: Some("blue".to_string()),
-                    clear: false,
-                    message: message.clone(),
-                };
-                if !should_record_in_notification_feed(&note) {
-                    continue;
+            }
+            // OSC 9 desktop notifications → feed only for non-screen agents
+            // (Claude/Codex already get Attention from the screen path above).
+            if !crate::detect::screen_is_status_authority(&light.command) {
+                for message in notifications {
+                    if is_non_actionable_attention(&message) {
+                        continue;
+                    }
+                    if record_attention_notification(&mut session, pane_id, &message) {
+                        should_save = true;
+                    }
                 }
-                let event_message = message;
-                session.notifications.push(note);
-                push_event(
-                    &mut session,
-                    EventRecord {
-                        id: 0,
-                        time: unix_time(),
-                        kind: "notification".to_string(),
-                        pane: Some(pane_id.to_string()),
-                        workspace: None,
-                        status: Some("attention".to_string()),
-                        key: None,
-                        value: Some("blue".to_string()),
-                        message: event_message,
-                    },
-                );
-                should_save = true;
             }
             // Child OSC 52 → session clipboard. Attach UI mirrors source=osc52
             // into the host system clipboard on the next snapshot (herdr does
@@ -5486,6 +5494,57 @@ fn is_boilerplate_lifecycle_message(message: &str) -> bool {
             | "end_turn"
             | "turn complete"
     )
+}
+
+/// Append an attention card to the session feed + event log when it is new.
+/// Returns true when something was recorded (caller may schedule a save).
+fn record_attention_notification(session: &mut Session, pane_id: &str, message: &str) -> bool {
+    let note = Notification {
+        time: unix_time(),
+        pane: Some(pane_id.to_string()),
+        workspace: None,
+        status: Some("attention".to_string()),
+        color: Some("blue".to_string()),
+        clear: false,
+        message: message.to_string(),
+    };
+    if !should_record_in_notification_feed(&note) {
+        return false;
+    }
+    // Same-pane + same-message already at the head of the feed: no spam.
+    let duplicate = session
+        .notifications
+        .iter()
+        .rev()
+        .find(|prev| prev.pane.as_deref() == Some(pane_id))
+        .is_some_and(|prev| {
+            !prev.clear
+                && prev.status.as_deref() == Some("attention")
+                && prev.message == note.message
+        });
+    if duplicate {
+        return false;
+    }
+    session.notifications.push(note);
+    let len = session.notifications.len();
+    if len > 100 {
+        session.notifications.drain(0..len - 100);
+    }
+    push_event(
+        session,
+        EventRecord {
+            id: 0,
+            time: unix_time(),
+            kind: "notification".to_string(),
+            pane: Some(pane_id.to_string()),
+            workspace: None,
+            status: Some("attention".to_string()),
+            key: None,
+            value: Some("blue".to_string()),
+            message: message.to_string(),
+        },
+    );
+    true
 }
 
 /// Whether a notify should appear in the session notification feed / panel.
