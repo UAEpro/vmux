@@ -929,9 +929,10 @@ fn send_push_notification(
         "pane": event.get("pane").and_then(Value::as_str).unwrap_or(""),
     });
     ureq::post(&url)
-        .set("Authorization", &format!("Bearer {push_secret}"))
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(8))
+        .header("Authorization", format!("Bearer {push_secret}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .build()
         .send_json(payload)
         .with_context(|| format!("POST {gateway}"))?;
     Ok(())
