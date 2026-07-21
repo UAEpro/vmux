@@ -250,6 +250,15 @@ fn cleanup_stale_runtime(session: &str) -> Result<()> {
 
 /// How often the idle-decay sweep runs.
 const DECAY_TICK_SECS: u64 = 4;
+
+/// Upper bound on `Snapshot { wait_ms }` long-polls. Each waiting client
+/// parks one connection thread, so cap how long that can be.
+const SNAPSHOT_WAIT_CAP_MS: u64 = 30_000;
+
+/// 8-bit color components.
+type Rgb8 = (u8, u8, u8);
+/// Outer-terminal default (fg, bg) as reported by an attach client.
+type HostTheme = (Option<Rgb8>, Option<Rgb8>);
 /// An unpinned (heuristic) Busy spinner with no output for this long is demoted
 /// to Idle. Pinned (hook/CLI) Busy is exempt, so this does not affect a properly
 /// hook-driven agent that is thinking silently.
@@ -279,6 +288,11 @@ struct PaneRuntime {
     pending: Vec<u8>,
     // Accumulated decoded text used to detect OSC sequences that straddle reads.
     osc_tail: String,
+    // Accumulated decoded text used to detect terminal queries (DA1, DSR,
+    // OSC 10/11 color probes) that straddle reads. The daemon answers these on
+    // the PTY like a real terminal would; vt100 itself never replies, and a
+    // TUI probing an unresponsive terminal misdetects colors or stalls.
+    query_tail: String,
     // vt100 does not expose DEC private mode 1007 (alternate scroll), so keep
     // the one unsupported input mode the attach UI needs in a tiny sidecar
     // scanner. This lets fullscreen TUIs such as Codex receive wheel-as-arrow
@@ -540,11 +554,26 @@ struct Server {
     // a small phone terminal and a large desktop terminal can resize the same
     // panes back and forth on every refresh.
     pane_size_owner: Mutex<Option<String>>,
-    /// Wakes `wait` when a pane exits (instead of 50 ms polling only).
+    /// Wakes `wait` when a pane exits or an agent status changes (instead of
+    /// the 200 ms condvar re-check only).
     exit_notify: (Mutex<()>, std::sync::Condvar),
+    /// Wakes long-poll `Snapshot { wait_ms }` requests whenever `touch()`
+    /// bumps the generation, so attach UIs see output without timer polling.
+    generation_notify: (Mutex<()>, std::sync::Condvar),
     /// Automatic agent tab naming. Read once at start: changing it takes effect
     /// on the next daemon start (`vmux kill && vmux attach`).
     agent_titles: crate::config::AgentTitleSettings,
+    /// Whether `ui.theme` is a dark theme, read once at start. Fallback for
+    /// the OSC 10/11 default-color answers when no attach client has reported
+    /// its real terminal colors yet.
+    dark_theme: bool,
+    /// Outer-terminal default (fg, bg) reported by the most recent attach
+    /// client (`SetHostTheme`). Panes' OSC 10/11 probes answer with these so
+    /// agent-painted surfaces blend into what is actually on screen.
+    host_theme: Mutex<HostTheme>,
+    /// `ui.resume_agents`, read once at start: restored agent panes relaunch
+    /// with `--resume <hook-reported session id>` instead of a blank chat.
+    resume_agents: bool,
     /// Port detection / forwarding (read once at start).
     ports_settings: crate::config::PortsSettings,
     /// Relay port so the ports scanner can ignore it.
@@ -651,7 +680,11 @@ impl Server {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             pane_size_owner: Mutex::new(None),
             exit_notify: (Mutex::new(()), std::sync::Condvar::new()),
+            generation_notify: (Mutex::new(()), std::sync::Condvar::new()),
             agent_titles: config.agent_titles,
+            dark_theme: !matches!(config.ui.theme.as_str(), "daylight" | "solarized-light"),
+            host_theme: Mutex::new((None, None)),
+            resume_agents: config.ui.resume_agents,
             ports_settings: config.ports,
             relay_port: config.relay.port,
             port_registry: Mutex::new(PortRegistry::default()),
@@ -665,6 +698,8 @@ impl Server {
     fn touch(&self) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Wake long-poll snapshot clients. Cheap when nobody is waiting.
+        self.generation_notify.1.notify_all();
     }
 
     fn generation(&self) -> u64 {
@@ -1060,8 +1095,32 @@ impl Server {
                 full,
                 lean,
                 scrollback_panes,
+                wait_ms,
             } => {
-                let gen = self.generation();
+                let mut gen = self.generation();
+                // Long-poll: hold the (per-connection) thread until something
+                // changes so the attach UI renders PTY echo the moment it
+                // exists instead of on a polling tick.
+                if let (Some(since), Some(wait_ms)) = (since, wait_ms) {
+                    let deadline =
+                        Instant::now() + Duration::from_millis(wait_ms.min(SNAPSHOT_WAIT_CAP_MS));
+                    while gen == since
+                        && !self
+                            .shutting_down
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let (lock, cvar) = &self.generation_notify;
+                        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        // 200ms cap so a missed notify can never wedge a client.
+                        let wait = (deadline - now).min(Duration::from_millis(200));
+                        let _ = cvar.wait_timeout(guard, wait);
+                        gen = self.generation();
+                    }
+                }
                 if since == Some(gen) {
                     return Ok(Response::ok(serde_json::json!({
                         "unchanged": true,
@@ -1250,9 +1309,10 @@ impl Server {
                 pane,
                 workspace,
                 all,
+                status,
                 timeout_ms,
             } => {
-                let data = self.wait_panes(pane, workspace, all, timeout_ms)?;
+                let data = self.wait_panes(pane, workspace, all, status, timeout_ms)?;
                 Ok(Response::ok(data))
             }
             Request::NewWorkspace { name, cwd } => {
@@ -1439,9 +1499,23 @@ impl Server {
                 clear,
                 message,
                 title,
+                agent_session,
             } => {
                 let note = self.notify(pane, workspace, status, color, clear, message, title)?;
+                // The note carries the resolved pane id, so hook payloads that
+                // omit --pane still attach the session id to the right pane.
+                if let Some(agent_session) = agent_session {
+                    self.record_agent_session(note.pane.as_deref(), &agent_session);
+                }
                 Ok(Response::ok(note))
+            }
+            Request::SetHostTheme { fg, bg } => {
+                let parsed = (
+                    fg.as_deref().and_then(parse_hex_rgb),
+                    bg.as_deref().and_then(parse_hex_rgb),
+                );
+                *self.host_theme.lock_or_recover() = parsed;
+                Ok(Response::empty())
             }
             Request::Notifications { limit } => {
                 let data = self.notifications(limit)?;
@@ -1671,6 +1745,18 @@ impl Server {
                     .cloned()
                     .ok_or_else(|| anyhow!("unknown restored pane {pane_id}"))?
             };
+            // Native agent resume (herdr-style): if the agent's hooks reported
+            // a conversation id, relaunch the CLI resuming it instead of
+            // opening a blank conversation.
+            if self.resume_agents {
+                if let Some(session_id) = pane.agent_session.clone() {
+                    if let Some(resumed) = agent_resume_command(&pane.command, &session_id) {
+                        self.log(&format!("restore pane {pane_id}: resuming via {resumed:?}"))
+                            .ok();
+                        pane.command = resumed;
+                    }
+                }
+            }
             let old_output = pane.output.clone();
             let old_scrollback = pane.scrollback.clone();
             let old_scrollback_formatted = pane.scrollback_formatted.clone();
@@ -2000,6 +2086,12 @@ impl Server {
             builder.arg(arg);
         }
         builder.cwd(cwd);
+        // Pin the terminal identity instead of inheriting whatever TERM the
+        // daemon was started under (possibly unset when detached at boot, or a
+        // host-specific value over SSH). Without COLORTERM, truecolor-capable
+        // TUIs like Claude Code silently downgrade to 16/256 colors.
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
         builder.env("VMUX_SESSION", &self.session_name);
         builder.env("VMUX_WORKSPACE_ID", workspace);
         builder.env("VMUX_PANE_ID", &pane.id);
@@ -2057,6 +2149,7 @@ impl Server {
                 output_bytes: 0,
                 pending: Vec::new(),
                 osc_tail: String::new(),
+                query_tail: String::new(),
                 terminal_modes: TerminalModeTracker::default(),
                 parser: vt100::Parser::new(24, 80, 2000),
                 size: PaneSize { rows: 24, cols: 80 },
@@ -3053,9 +3146,29 @@ impl Server {
         pane: Option<String>,
         workspace: Option<String>,
         all: bool,
+        status: Option<Vec<String>>,
         timeout_ms: Option<u64>,
     ) -> Result<serde_json::Value> {
         let scoped = all || workspace.is_some();
+        // Parse the requested statuses up front so a typo fails immediately
+        // instead of silently waiting forever.
+        let wanted = status
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| {
+                        let parsed = parse_agent_status(name.trim());
+                        if matches!(parsed, AgentStatus::Unknown) {
+                            Err(anyhow!(
+                                "unknown status {name:?} (expected busy, attention, done, error, or idle)"
+                            ))
+                        } else {
+                            Ok(parsed)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let targets = self.wait_targets(pane, workspace, all)?;
         let started = Instant::now();
         loop {
@@ -3072,10 +3185,17 @@ impl Server {
                     })
                     .collect::<Result<Vec<_>>>()?
             };
-            if panes
-                .iter()
-                .all(|pane| matches!(pane.status, PaneStatus::Exited))
-            {
+            // A pane satisfies the wait when it reaches a wanted agent status,
+            // or exits — an exited pane can never change status again, so
+            // treating exit as terminal keeps callers from hanging forever.
+            let settled = |pane: &Pane| match &wanted {
+                Some(statuses) => {
+                    statuses.contains(&pane.agent_status)
+                        || matches!(pane.status, PaneStatus::Exited)
+                }
+                None => matches!(pane.status, PaneStatus::Exited),
+            };
+            if panes.iter().all(settled) {
                 if panes.len() == 1 && !scoped {
                     return Ok(serde_json::to_value(&panes[0])?);
                 }
@@ -3328,8 +3448,40 @@ impl Server {
         if let (Some(pane_id), Some(title)) = (target_pane.as_deref(), auto_title.as_deref()) {
             self.apply_auto_tab_title(pane_id, title);
         }
+        // Status may have changed: wake `wait --status` long-polls promptly
+        // instead of leaving them to the 200ms condvar re-check.
+        self.exit_notify.1.notify_all();
         self.save()?;
         Ok(note)
+    }
+
+    /// Remember the agent CLI's conversation id for a pane (from hook JSON via
+    /// `Request::Notify`). Saves only when the id actually changes — hooks
+    /// repeat it on every lifecycle event.
+    fn record_agent_session(&self, pane_id: Option<&str>, agent_session: &str) {
+        let Some(pane_id) = pane_id else {
+            return;
+        };
+        let changed = {
+            let mut session = self.session.lock_or_recover();
+            match session.panes.get_mut(pane_id) {
+                Some(pane) if pane.agent_session.as_deref() != Some(agent_session) => {
+                    pane.agent_session = Some(agent_session.to_string());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            let mut panes = self.panes.lock_or_recover();
+            for runtime in panes.values_mut() {
+                if runtime.pane.id == pane_id {
+                    runtime.pane.agent_session = Some(agent_session.to_string());
+                }
+            }
+            drop(panes);
+            self.save().ok();
+        }
     }
 
     fn clear_notifications(&self) -> Result<serde_json::Value> {
@@ -3914,83 +4066,127 @@ impl Server {
     ) {
         // Hot path: update the vt100 parser + light metadata only. Heavy screen
         // strings are materialized lazily in snapshot().
-        let Some((light, notifications, auto_title, llm_screen)) = ({
-            let mut panes = self.panes.lock_or_recover();
-            let runtime = panes.get_mut(runtime_key);
-            runtime.and_then(|runtime| {
-                if runtime.generation != generation {
-                    return None;
-                }
-                runtime.parser.process(bytes);
-                runtime.terminal_modes.process(bytes);
-                runtime.output_generation = runtime.output_generation.wrapping_add(1);
-                let text = decode_utf8_stream(&mut runtime.pending, bytes);
-                runtime.osc_tail.push_str(&text);
-                let (osc, retain_from) = scan_osc_events(&runtime.osc_tail);
-                let notifications = osc.notifications;
-                if let Some(progress) = osc.progress {
-                    runtime.pane.progress = progress;
-                }
-                if retain_from > 0 {
-                    runtime.osc_tail.drain(..retain_from);
-                }
-                cap_osc_tail(&mut runtime.osc_tail);
-                // Name the tab after what the agent says it is doing. Whether a
-                // pane counts as an agent pane is decided inside, from the
-                // process tree — the pane command is just the shell.
-                let (auto_title, llm_screen) = if self.agent_titles.enabled {
-                    self.agent_title_update(runtime, osc.title)
-                } else {
-                    (None, None)
-                };
-                runtime.push_output(text.clone());
-                runtime.pane.updated_at = unix_time();
-                let inferred = infer_agent_status(&text, &runtime.pane.command);
-                let prev = runtime.pane.agent_status.clone();
-                let (next, pinned) =
-                    merge_agent_status(prev.clone(), runtime.pane.agent_status_pinned, inferred);
-                if next != prev || pinned != runtime.pane.agent_status_pinned {
-                    touch_agent_status(&mut runtime.pane, next, pinned);
-                }
-                if let Some(message) = notifications.last() {
-                    if !is_non_actionable_attention(message) {
-                        touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
-                        runtime.pane.notification_color = Some("blue".to_string());
-                        runtime.pane.notification_message = Some(message.clone());
+        let Some((light, notifications, clipboard_writes, auto_title, llm_screen, query_replies)) =
+            ({
+                let mut panes = self.panes.lock_or_recover();
+                let runtime = panes.get_mut(runtime_key);
+                runtime.and_then(|runtime| {
+                    if runtime.generation != generation {
+                        return None;
                     }
-                }
-                // Light fields only — no contents()/formatted/scrollback join here.
-                let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
-                runtime.pane.cursor_row = Some(cursor_row);
-                runtime.pane.cursor_col = Some(cursor_col);
-                let (screen_rows, screen_cols) = runtime.parser.screen().size();
-                runtime.pane.screen_rows = Some(screen_rows);
-                runtime.pane.screen_cols = Some(screen_cols);
-                update_pane_terminal_modes(&mut runtime.pane, runtime.parser.screen());
-                runtime.pane.alternate_scroll_mode = alternate_scroll_active(
-                    &runtime.pane.status,
-                    &runtime.terminal_modes,
-                    runtime.parser.screen(),
-                );
-                // Clone light metadata for session merge (empty heavy strings).
-                // The last snapshot may have cached the heavy screen strings on
-                // runtime.pane; lift them out before cloning so we don't copy
-                // (then discard) up to ~16KB × 4 on every PTY chunk, then put
-                // them back (moves, no copy).
-                let output = std::mem::take(&mut runtime.pane.output);
-                let output_formatted = std::mem::take(&mut runtime.pane.output_formatted);
-                let scrollback = std::mem::take(&mut runtime.pane.scrollback);
-                let scrollback_formatted = std::mem::take(&mut runtime.pane.scrollback_formatted);
-                let light = runtime.pane.clone();
-                runtime.pane.output = output;
-                runtime.pane.output_formatted = output_formatted;
-                runtime.pane.scrollback = scrollback;
-                runtime.pane.scrollback_formatted = scrollback_formatted;
-                Some((light, notifications, auto_title, llm_screen))
+                    runtime.parser.process(bytes);
+                    runtime.terminal_modes.process(bytes);
+                    runtime.output_generation = runtime.output_generation.wrapping_add(1);
+                    let text = decode_utf8_stream(&mut runtime.pending, bytes);
+                    runtime.osc_tail.push_str(&text);
+                    let (osc, retain_from) = scan_osc_events(&runtime.osc_tail);
+                    let notifications = osc.notifications;
+                    let clipboard_writes = osc.clipboard_writes;
+                    if let Some(progress) = osc.progress {
+                        runtime.pane.progress = progress;
+                    }
+                    if retain_from > 0 {
+                        runtime.osc_tail.drain(..retain_from);
+                    }
+                    cap_osc_tail(&mut runtime.osc_tail);
+                    // Answer terminal queries (DA1/DSR/OSC 10-11) like a real
+                    // terminal. Only the writer Arc is captured here; the
+                    // potentially blocking PTY write happens after the panes lock
+                    // is released, same as send_text.
+                    runtime.query_tail.push_str(&text);
+                    let (queries, query_retain) = scan_terminal_queries(&runtime.query_tail);
+                    if query_retain > 0 {
+                        runtime.query_tail.drain(..query_retain);
+                    }
+                    cap_osc_tail(&mut runtime.query_tail);
+                    let query_replies = if queries.is_empty() {
+                        None
+                    } else {
+                        runtime.writer.as_ref().map(Arc::clone).map(|writer| {
+                            (writer, queries, runtime.parser.screen().cursor_position())
+                        })
+                    };
+                    // Name the tab after what the agent says it is doing. Whether a
+                    // pane counts as an agent pane is decided inside, from the
+                    // process tree — the pane command is just the shell.
+                    let (auto_title, llm_screen) = if self.agent_titles.enabled {
+                        self.agent_title_update(runtime, osc.title)
+                    } else {
+                        (None, None)
+                    };
+                    runtime.push_output(text.clone());
+                    runtime.pane.updated_at = unix_time();
+                    let inferred = infer_agent_status(&text, &runtime.pane.command);
+                    let prev = runtime.pane.agent_status.clone();
+                    let (next, pinned) = merge_agent_status(
+                        prev.clone(),
+                        runtime.pane.agent_status_pinned,
+                        inferred,
+                    );
+                    if next != prev || pinned != runtime.pane.agent_status_pinned {
+                        touch_agent_status(&mut runtime.pane, next, pinned);
+                    }
+                    if let Some(message) = notifications.last() {
+                        if !is_non_actionable_attention(message) {
+                            touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
+                            runtime.pane.notification_color = Some("blue".to_string());
+                            runtime.pane.notification_message = Some(message.clone());
+                        }
+                    }
+                    // Light fields only — no contents()/formatted/scrollback join here.
+                    let (cursor_row, cursor_col) = runtime.parser.screen().cursor_position();
+                    runtime.pane.cursor_row = Some(cursor_row);
+                    runtime.pane.cursor_col = Some(cursor_col);
+                    let (screen_rows, screen_cols) = runtime.parser.screen().size();
+                    runtime.pane.screen_rows = Some(screen_rows);
+                    runtime.pane.screen_cols = Some(screen_cols);
+                    update_pane_terminal_modes(&mut runtime.pane, runtime.parser.screen());
+                    runtime.pane.alternate_scroll_mode = alternate_scroll_active(
+                        &runtime.pane.status,
+                        &runtime.terminal_modes,
+                        runtime.parser.screen(),
+                    );
+                    // Clone light metadata for session merge (empty heavy strings).
+                    // The last snapshot may have cached the heavy screen strings on
+                    // runtime.pane; lift them out before cloning so we don't copy
+                    // (then discard) up to ~16KB × 4 on every PTY chunk, then put
+                    // them back (moves, no copy).
+                    let output = std::mem::take(&mut runtime.pane.output);
+                    let output_formatted = std::mem::take(&mut runtime.pane.output_formatted);
+                    let scrollback = std::mem::take(&mut runtime.pane.scrollback);
+                    let scrollback_formatted =
+                        std::mem::take(&mut runtime.pane.scrollback_formatted);
+                    let light = runtime.pane.clone();
+                    runtime.pane.output = output;
+                    runtime.pane.output_formatted = output_formatted;
+                    runtime.pane.scrollback = scrollback;
+                    runtime.pane.scrollback_formatted = scrollback_formatted;
+                    Some((
+                        light,
+                        notifications,
+                        clipboard_writes,
+                        auto_title,
+                        llm_screen,
+                        query_replies,
+                    ))
+                })
             })
-        }) else {
+        else {
             return;
         };
+        if let Some((writer, queries, cursor)) = query_replies {
+            let host_theme = *self.host_theme.lock_or_recover();
+            let mut writer = writer.lock_or_recover();
+            for query in &queries {
+                let _ = writer.write_all(&terminal_query_reply(
+                    query,
+                    cursor,
+                    self.dark_theme,
+                    host_theme,
+                ));
+            }
+            let _ = writer.flush();
+        }
         self.touch();
         // Both run outside the `panes` lock: renaming takes `session`, and the
         // summarizer shells out to another process.
@@ -4059,6 +4255,21 @@ impl Server {
                         message: event_message,
                     },
                 );
+                should_save = true;
+            }
+            // Child OSC 52 → session clipboard. Attach UI mirrors source=osc52
+            // into the host system clipboard on the next snapshot (herdr does
+            // the same via Osc52Forwarder).
+            for text in clipboard_writes {
+                if text.is_empty() {
+                    continue;
+                }
+                session.clipboard = Some(ClipboardItem {
+                    text,
+                    source_pane: Some(pane_id.to_string()),
+                    source: "osc52".to_string(),
+                    copied_at: unix_time(),
+                });
                 should_save = true;
             }
             let len = session.notifications.len();
@@ -5022,13 +5233,19 @@ fn resolve_pane_tab<'a>(pane: &'a Pane, selector: &str) -> Result<&'a PaneTab> {
     }
 }
 
+/// Attach-UI screen serialization: cell-accurate SGR, one line per row.
+///
+/// Deliberately does **not** use vt100's `rows_formatted`. That path emits
+/// cursor/erase CSI (`ESC [ K`, `ESC [ X`, absolute moves) for empty cells
+/// that still carry attributes — e.g. a TUI that sets a background colour and
+/// clears the rest of the line with EL. The attach UI's SGR decoder only
+/// understands `m` / `C` / `G`, so those erase sequences were silently dropped
+/// and agent status bars (Claude Code) rendered as partial-width grey strips
+/// against the pane wash. Herdr avoids this by painting every cell from its
+/// terminal grid; we match that contract by walking cells and emitting a space
+/// (with the cell's SGR) for every column.
 fn screen_contents_formatted(screen: &vt100::Screen) -> String {
-    let (_, cols) = screen.size();
-    screen
-        .rows_formatted(0, cols)
-        .map(|row| String::from_utf8_lossy(&row).into_owned())
-        .collect::<Vec<_>>()
-        .join("\n")
+    screen_contents_ansi(screen)
 }
 
 /// Build the styled scrollback history for a pane, oldest→newest, one grid row
@@ -5047,7 +5264,6 @@ fn screen_contents_formatted(screen: &vt100::Screen) -> String {
 /// unconditionally restored before returning (no early returns in between).
 fn screen_scrollback_formatted(parser: &mut vt100::Parser, row_cap: usize) -> String {
     let saved = parser.screen().scrollback();
-    let (_, cols) = parser.screen().size();
     // set_scrollback clamps to the history length, so requesting a huge offset
     // and reading it back reports how many history rows are actually retained.
     parser.screen_mut().set_scrollback(usize::MAX);
@@ -5056,9 +5272,9 @@ fn screen_scrollback_formatted(parser: &mut vt100::Parser, row_cap: usize) -> St
     let mut rows: Vec<String> = Vec::with_capacity(take.saturating_add(1));
     for offset in (1..=take).rev() {
         parser.screen_mut().set_scrollback(offset);
-        if let Some(row) = parser.screen().rows_formatted(0, cols).next() {
-            rows.push(String::from_utf8_lossy(&row).into_owned());
-        }
+        // Same cell walk as the live screen — never `rows_formatted` (see
+        // [`screen_contents_formatted`]).
+        rows.push(row_contents_ansi(parser.screen(), 0));
     }
     parser.screen_mut().set_scrollback(saved);
     let screen = screen_contents_formatted(parser.screen());
@@ -5098,6 +5314,49 @@ fn default_shell() -> String {
 
 mod browser;
 pub(crate) use browser::*;
+
+/// Rewrite a restored agent command so the relaunched CLI resumes the
+/// conversation `session_id` (herdr's "native agent resume"). Returns `None`
+/// when the command is not a resumable agent CLI. A previous `--resume <id>`
+/// (from an earlier restore) is replaced so successive restarts always track
+/// the newest reported session.
+fn agent_resume_command(command: &str, session_id: &str) -> Option<String> {
+    let argv = shell_words::split(command).ok()?;
+    let program = argv.first()?.rsplit('/').next()?.to_string();
+    let quoted = shell_words::quote(session_id).into_owned();
+    match program.as_str() {
+        "claude" => {
+            // Drop any prior --resume/--continue (and the id following
+            // --resume) before appending the fresh one.
+            let mut base: Vec<String> = Vec::new();
+            let mut skip_value = false;
+            for arg in &argv {
+                if skip_value {
+                    skip_value = false;
+                    continue;
+                }
+                if arg == "--resume" || arg == "-r" {
+                    skip_value = true;
+                    continue;
+                }
+                if arg == "--continue" || arg == "-c" {
+                    continue;
+                }
+                base.push(arg.clone());
+            }
+            Some(format!("{} --resume {quoted}", shell_words::join(&base)))
+        }
+        // Codex resumes via a subcommand; only rewrite the bare CLI or a
+        // previous `codex resume <id>` — anything else (exec, custom args)
+        // is left alone.
+        "codex" => match argv.len() {
+            1 => Some(format!("{} resume {quoted}", argv[0])),
+            3 if argv[1] == "resume" => Some(format!("{} resume {quoted}", argv[0])),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 fn parse_agent_status(status: &str) -> AgentStatus {
     match status {
@@ -5720,6 +5979,10 @@ struct OscEvents {
     /// ConEmu / Windows Terminal / Ghostty progress bar (OSC 9;4;…).
     /// `Some(None)` clears the bar; `Some(Some(n))` sets 0–100.
     progress: Option<Option<u8>>,
+    /// Clipboard writes from the child (OSC 52). vt100 drops these; we re-emit
+    /// them onto the session clipboard so the attach UI can mirror to the host
+    /// (herdr's Osc52Forwarder does the same for Ghostty).
+    clipboard_writes: Vec<String>,
 }
 
 /// Scan `buf` for the OSC sequences vmux acts on. Returns the events and the
@@ -5756,6 +6019,8 @@ fn scan_osc_events(buf: &str) -> (OscEvents, usize) {
             events.notifications.push(message);
         } else if let Some(title) = osc_window_title(payload) {
             events.title = Some(title);
+        } else if let Some(text) = osc_clipboard_write(payload) {
+            events.clipboard_writes.push(text);
         }
         idx = if st == Some(end) {
             after + end + 2
@@ -5763,6 +6028,64 @@ fn scan_osc_events(buf: &str) -> (OscEvents, usize) {
             after + end + 1
         };
     }
+}
+
+/// OSC 52 clipboard write: `52 ; <sel> ; <base64>`. Only system clipboard (`c`
+/// or empty selector); queries (`?`) are ignored — the daemon is not a paste
+/// source for agents that probe.
+fn osc_clipboard_write(payload: &str) -> Option<String> {
+    let rest = payload.strip_prefix("52;")?;
+    let (selector, data) = rest.split_once(';')?;
+    if !(selector.is_empty() || selector == "c") || data == "?" {
+        return None;
+    }
+    // Cap decode size so a malicious stream cannot inflate memory.
+    const MAX_B64: usize = 256 * 1024;
+    if data.len() > MAX_B64 {
+        return None;
+    }
+    let bytes = base64_decode_std(data)?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Standard base64 decode (padded). Returns `None` on invalid input.
+fn base64_decode_std(input: &str) -> Option<Vec<u8>> {
+    // Inline decoder — same alphabet as the UI encoder; avoids a new crate.
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    if cleaned.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4);
+    for chunk in cleaned.chunks(4) {
+        if chunk.len() < 2 {
+            return None;
+        }
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        out.push((a << 2) | (b >> 4));
+        if chunk.len() >= 3 {
+            let c = val(chunk[2])?;
+            out.push((b << 4) | (c >> 2));
+            if chunk.len() == 4 {
+                let d = val(chunk[3])?;
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// OSC 9;4 progress report (ConEmu / Windows Terminal / Ghostty / many CLIs).
@@ -5904,6 +6227,170 @@ fn cap_osc_tail(tail: &mut String) {
     tail.drain(..cut);
 }
 
+/// Terminal queries the daemon answers on the PTY, like a real terminal.
+/// vt100 models the screen but never writes responses, so before this a TUI
+/// probing its terminal (Claude Code and other agent UIs probe on startup)
+/// either misdetected colors or waited out an internal timeout.
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalQuery {
+    /// DA1 `ESC [ c` — primary device attributes.
+    DeviceAttributes,
+    /// DA2 `ESC [ > c` — secondary device attributes.
+    SecondaryDeviceAttributes,
+    /// DSR 5 `ESC [ 5 n` — operating status.
+    OperatingStatus,
+    /// DSR 6 `ESC [ 6 n` / DEC `ESC [ ? 6 n` — cursor position report.
+    CursorPosition { dec: bool },
+    /// OSC 10 `ESC ] 10 ; ? ST` — default foreground color.
+    ForegroundColor,
+    /// OSC 11 `ESC ] 11 ; ? ST` — default background color.
+    BackgroundColor,
+}
+
+/// Scan `buf` for terminal queries. Same contract as `scan_osc_events`:
+/// returns the queries found and the byte offset to retain from (start of a
+/// trailing unterminated sequence, or `buf.len()`).
+fn scan_terminal_queries(buf: &str) -> (Vec<TerminalQuery>, usize) {
+    let bytes = buf.as_bytes();
+    let mut queries = Vec::new();
+    let mut idx = 0;
+    while let Some(rel) = buf[idx..].find('\x1b') {
+        let start = idx + rel;
+        let Some(&kind) = bytes.get(start + 1) else {
+            // Bare trailing ESC: wait for the next read.
+            return (queries, start);
+        };
+        match kind {
+            b'[' => {
+                // CSI: parameters, then one final byte in 0x40..=0x7e.
+                let mut cursor = start + 2;
+                loop {
+                    let Some(&byte) = bytes.get(cursor) else {
+                        return (queries, start);
+                    };
+                    if (0x40..=0x7e).contains(&byte) {
+                        let params = &buf[start + 2..cursor];
+                        match byte {
+                            b'c' if params.is_empty() || params == "0" => {
+                                queries.push(TerminalQuery::DeviceAttributes);
+                            }
+                            b'c' if params == ">" || params == ">0" => {
+                                queries.push(TerminalQuery::SecondaryDeviceAttributes);
+                            }
+                            b'n' if params == "5" => {
+                                queries.push(TerminalQuery::OperatingStatus);
+                            }
+                            b'n' if params == "6" => {
+                                queries.push(TerminalQuery::CursorPosition { dec: false });
+                            }
+                            b'n' if params == "?6" => {
+                                queries.push(TerminalQuery::CursorPosition { dec: true });
+                            }
+                            _ => {}
+                        }
+                        idx = cursor + 1;
+                        break;
+                    }
+                    // Overlong parameter strings are never a query we answer.
+                    if cursor - start > 32 {
+                        idx = cursor;
+                        break;
+                    }
+                    cursor += 1;
+                }
+            }
+            b']' => {
+                let after = start + 2;
+                let bell = buf[after..].find('\x07');
+                let st = buf[after..].find("\x1b\\");
+                let end = match (bell, st) {
+                    (Some(bell), Some(st)) => Some(bell.min(st)),
+                    (Some(bell), None) => Some(bell),
+                    (None, Some(st)) => Some(st),
+                    (None, None) => None,
+                };
+                let Some(end) = end else {
+                    return (queries, start);
+                };
+                match &buf[after..after + end] {
+                    "10;?" => queries.push(TerminalQuery::ForegroundColor),
+                    "11;?" => queries.push(TerminalQuery::BackgroundColor),
+                    _ => {}
+                }
+                idx = if st == Some(end) {
+                    after + end + 2
+                } else {
+                    after + end + 1
+                };
+            }
+            _ => idx = start + 1,
+        }
+    }
+    (queries, buf.len())
+}
+
+/// Encode the reply a real terminal would write for `query`.
+/// `cursor` is the parser's post-chunk `(row, col)`, 0-based; CPR is 1-based.
+/// `(fg, bg)` are the default colors reported to OSC 10/11 probes — theme
+/// detection in agent TUIs (dark vs light) keys off the OSC 11 answer.
+/// Parse `#rrggbb` into components.
+fn parse_hex_rgb(value: &str) -> Option<Rgb8> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
+}
+
+/// XParseColor-style 16-bit reply component (`rgb:RRRR/GGGG/BBBB`).
+fn osc_rgb_reply(code: u8, (r, g, b): Rgb8) -> Vec<u8> {
+    format!(
+        "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+        u16::from(r) * 257,
+        u16::from(g) * 257,
+        u16::from(b) * 257,
+    )
+    .into_bytes()
+}
+
+fn terminal_query_reply(
+    query: &TerminalQuery,
+    cursor: (u16, u16),
+    dark_theme: bool,
+    host_theme: HostTheme,
+) -> Vec<u8> {
+    // Prefer the attach client's real terminal colors; fall back to a generic
+    // dark/light guess from the configured theme.
+    let (host_fg, host_bg) = host_theme;
+    let fg = host_fg.unwrap_or(if dark_theme {
+        (0xe5, 0xe5, 0xe5)
+    } else {
+        (0x1e, 0x1e, 0x1e)
+    });
+    let bg = host_bg.unwrap_or(if dark_theme {
+        (0x1e, 0x1e, 0x1e)
+    } else {
+        (0xff, 0xff, 0xff)
+    });
+    match query {
+        // VT220-class with ANSI color: a safe, ubiquitous answer.
+        TerminalQuery::DeviceAttributes => b"\x1b[?62;22c".to_vec(),
+        TerminalQuery::SecondaryDeviceAttributes => b"\x1b[>0;0;0c".to_vec(),
+        TerminalQuery::OperatingStatus => b"\x1b[0n".to_vec(),
+        TerminalQuery::CursorPosition { dec } => {
+            let (row, col) = cursor;
+            let prefix = if *dec { "\x1b[?" } else { "\x1b[" };
+            format!("{prefix}{};{}R", row + 1, col + 1).into_bytes()
+        }
+        TerminalQuery::ForegroundColor => osc_rgb_reply(10, fg),
+        TerminalQuery::BackgroundColor => osc_rgb_reply(11, bg),
+    }
+}
+
 #[cfg(test)]
 fn osc_notifications(text: &str) -> Vec<String> {
     scan_osc_events(text).0.notifications
@@ -5978,6 +6465,7 @@ struct SgrStyle {
     fg: vt100::Color,
     bg: vt100::Color,
     bold: bool,
+    dim: bool,
     italic: bool,
     underline: bool,
     inverse: bool,
@@ -5988,6 +6476,9 @@ fn push_sgr(out: &mut String, style: &SgrStyle) {
     out.push_str("\x1b[0");
     if style.bold {
         out.push_str(";1");
+    }
+    if style.dim {
+        out.push_str(";2");
     }
     if style.italic {
         out.push_str(";3");
@@ -6051,6 +6542,7 @@ pub(crate) fn row_contents_ansi(screen: &vt100::Screen, row: u16) -> String {
             fg: cell.fgcolor(),
             bg: cell.bgcolor(),
             bold: cell.bold(),
+            dim: cell.dim(),
             italic: cell.italic(),
             underline: cell.underline(),
             inverse: cell.inverse(),
@@ -6106,7 +6598,13 @@ fn parser_history_rows(parser: &mut vt100::Parser, lines: usize, ansi: bool) -> 
             }
             plain
         };
-        rows.push(row.trim_end().to_string());
+        // Never trim_end on the ANSI form: trailing spaces carry the cell's
+        // background colour (erase-to-end TUI bars). Plain text may trim.
+        if ansi {
+            rows.push(row);
+        } else {
+            rows.push(row.trim_end().to_string());
+        }
     }
     parser.screen_mut().set_scrollback(0);
     rows
@@ -6290,6 +6788,79 @@ mod tests {
         assert!(ansi.starts_with("hello"));
     }
 
+    /// Claude Code and other Ink/TUI apps set a bg colour then EL the rest of
+    /// the line. vt100's `rows_formatted` encodes those empty cells as `ESC [ K`
+    /// which the attach UI cannot paint; the cell walk must emit real spaces
+    /// carrying the bg SGR so status bars fill the full pane width.
+    #[test]
+    fn osc_clipboard_write_decodes_base64_system_clipboard() {
+        // "hello" in standard base64 is aGVsbG8=
+        assert_eq!(
+            osc_clipboard_write("52;c;aGVsbG8=").as_deref(),
+            Some("hello")
+        );
+        // Empty selector is also system clipboard.
+        assert_eq!(
+            osc_clipboard_write("52;;d29ybGQ=").as_deref(),
+            Some("world")
+        );
+        // Query (`?`) is not a write.
+        assert_eq!(osc_clipboard_write("52;c;?"), None);
+        // Primary selection selector is ignored.
+        assert_eq!(osc_clipboard_write("52;p;aGVsbG8="), None);
+        // Full scan path.
+        let (events, _) = scan_osc_events("\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(events.clipboard_writes, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn screen_contents_formatted_preserves_erase_to_end_background() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        // Grey bg + clear line + short label — classic agent status-bar shape.
+        parser.process(b"\x1b[48;2;55;55;55m\x1b[2K\x1b[Gshort");
+        let out = screen_contents_formatted(parser.screen());
+        let row0 = out.lines().next().expect("row0");
+        // No cursor/erase CSI — only SGR + cells.
+        assert!(
+            !row0.contains("\x1b[K") && !row0.contains("\x1b[0K") && !row0.contains("\x1b[1K"),
+            "must not emit EL sequences the UI drops: {row0:?}"
+        );
+        assert!(
+            row0.contains("\x1b[0;48;2;55;55;55m") || row0.contains("48;2;55;55;55"),
+            "grey bg must survive: {row0:?}"
+        );
+        // After stripping SGR, the visible row is full-width (spaces fill EL).
+        let visible: String = {
+            let mut plain = String::new();
+            let mut chars = row0.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '\x1b' {
+                    if matches!(chars.peek(), Some('[')) {
+                        chars.next();
+                        for next in chars.by_ref() {
+                            if ('@'..='~').contains(&next) {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                plain.push(ch);
+            }
+            plain
+        };
+        assert!(visible.starts_with("short"), "label missing: {visible:?}");
+        assert_eq!(
+            visible.chars().count(),
+            20,
+            "EL remainder must become spaces so the grey bar is full-width: {visible:?}"
+        );
+        assert!(
+            visible.chars().skip(5).all(|c| c == ' '),
+            "cells past the label must be spaces carrying the bg: {visible:?}"
+        );
+    }
+
     /// A disposable session name that removes its own runtime/state files.
     ///
     /// Daemon tests write to the *real* XDG dirs, so they must not collide with
@@ -6424,6 +6995,165 @@ mod tests {
             let pane = &session.panes["pane-1"];
             assert_eq!(pane.agent_status, AgentStatus::Attention);
         }
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn wait_panes_resolves_on_agent_status_and_rejects_unknown_status() {
+        let session = TestSession::new("wait-status");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            let mut pane = Pane::new(
+                "pane-1".to_string(),
+                "claude".to_string(),
+                SplitDirection::Right,
+            );
+            pane.status = PaneStatus::Running;
+            session.panes.insert("pane-1".to_string(), pane);
+        }
+
+        // A typo'd status must fail immediately, not wait forever.
+        let err = server
+            .wait_panes(
+                Some("pane-1".to_string()),
+                None,
+                false,
+                Some(vec!["dne".to_string()]),
+                Some(50),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown status"));
+
+        // A wait for done resolves when the status lands, well before timeout.
+        let waiter = {
+            let server = Arc::clone(&server);
+            thread::spawn(move || {
+                server.wait_panes(
+                    Some("pane-1".to_string()),
+                    None,
+                    false,
+                    Some(vec!["done".to_string()]),
+                    Some(10_000),
+                )
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        server
+            .notify(
+                Some("pane-1".to_string()),
+                None,
+                Some("done".to_string()),
+                None,
+                false,
+                "tests passed".to_string(),
+                None,
+            )
+            .unwrap();
+        let value = waiter.join().unwrap().unwrap();
+        assert_eq!(value["agent_status"], "done");
+
+        // Without --status the same call still waits for process exit.
+        let err = server
+            .wait_panes(Some("pane-1".to_string()), None, false, None, Some(100))
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn snapshot_long_poll_wakes_on_generation_bump() {
+        let session = TestSession::new("longpoll");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let gen = server.generation();
+        let waiter = {
+            let server = Arc::clone(&server);
+            thread::spawn(move || {
+                let started = Instant::now();
+                let response = server
+                    .dispatch(Request::Snapshot {
+                        since: Some(gen),
+                        full: false,
+                        lean: true,
+                        scrollback_panes: Vec::new(),
+                        wait_ms: Some(5_000),
+                    })
+                    .unwrap();
+                (response, started.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        server.touch();
+        let (response, elapsed) = waiter.join().unwrap();
+        // Woken by the bump, long before the 5s deadline.
+        assert!(elapsed < Duration::from_millis(2_000), "took {elapsed:?}");
+        let data = response.data.unwrap();
+        assert!(data.get("unchanged").is_none(), "expected changed: {data}");
+        assert_eq!(
+            data.get("generation").and_then(|v| v.as_u64()),
+            Some(server.generation())
+        );
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn agent_resume_command_rewrites_known_agents() {
+        assert_eq!(
+            agent_resume_command("claude", "abc-123").as_deref(),
+            Some("claude --resume abc-123")
+        );
+        assert_eq!(
+            agent_resume_command("claude --model opus", "abc").as_deref(),
+            Some("claude --model opus --resume abc")
+        );
+        // A stale --resume from the previous restore is replaced, not stacked.
+        assert_eq!(
+            agent_resume_command("claude --resume old-id", "new-id").as_deref(),
+            Some("claude --resume new-id")
+        );
+        assert_eq!(
+            agent_resume_command("codex", "abc").as_deref(),
+            Some("codex resume abc")
+        );
+        assert_eq!(
+            agent_resume_command("codex resume old", "new").as_deref(),
+            Some("codex resume new")
+        );
+        // Anything that is not a bare resumable agent CLI is left alone.
+        assert_eq!(agent_resume_command("codex exec ls", "abc"), None);
+        assert_eq!(agent_resume_command("bash", "abc"), None);
+        assert_eq!(agent_resume_command("", "abc"), None);
+    }
+
+    #[test]
+    fn record_agent_session_stores_id_once() {
+        let session = TestSession::new("agent-session");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut session = server.session.lock_or_recover();
+            let pane = Pane::new(
+                "pane-1".to_string(),
+                "claude".to_string(),
+                SplitDirection::Right,
+            );
+            session.panes.insert("pane-1".to_string(), pane);
+        }
+
+        server.record_agent_session(Some("pane-1"), "sess-42");
+        server.record_agent_session(Some("pane-1"), "sess-42");
+        {
+            let session = server.session.lock_or_recover();
+            assert_eq!(
+                session.panes["pane-1"].agent_session.as_deref(),
+                Some("sess-42")
+            );
+        }
+        // Unknown panes and missing ids are ignored, not errors.
+        server.record_agent_session(Some("pane-404"), "sess-x");
+        server.record_agent_session(None, "sess-x");
 
         fs::remove_file(server.state_path.clone()).ok();
     }
@@ -6908,6 +7638,7 @@ mod tests {
                     scrollback_cap: crate::config::default_scrollback_bytes(),
                     pending: Vec::new(),
                     osc_tail: String::new(),
+                    query_tail: String::new(),
                     terminal_modes: TerminalModeTracker::default(),
                     parser: vt100::Parser::new(24, 80, 1000),
                     size: PaneSize { cols: 80, rows: 24 },
@@ -7817,6 +8548,87 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
     }
 
     #[test]
+    fn scan_terminal_queries_finds_probes_and_retains_partials() {
+        let (queries, retain) =
+            scan_terminal_queries("hi\x1b[c\x1b[6n\x1b]11;?\x07\x1b[31mred\x1b]10;?");
+        assert_eq!(
+            queries,
+            vec![
+                TerminalQuery::DeviceAttributes,
+                TerminalQuery::CursorPosition { dec: false },
+                TerminalQuery::BackgroundColor,
+            ]
+        );
+        // The trailing unterminated OSC 10 probe is retained for the next read.
+        assert_eq!(retain, "hi\x1b[c\x1b[6n\x1b]11;?\x07\x1b[31mred".len());
+
+        // Ordinary output escapes are not queries and consume fully.
+        let (queries, retain) = scan_terminal_queries("\x1b[?25h\x1b[0;1;32mok\x1b[5D\x1b[2J");
+        assert!(queries.is_empty());
+        assert_eq!(retain, "\x1b[?25h\x1b[0;1;32mok\x1b[5D\x1b[2J".len());
+
+        let (queries, _) = scan_terminal_queries("\x1b[>c\x1b[5n\x1b[?6n");
+        assert_eq!(
+            queries,
+            vec![
+                TerminalQuery::SecondaryDeviceAttributes,
+                TerminalQuery::OperatingStatus,
+                TerminalQuery::CursorPosition { dec: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_query_replies_use_xterm_shapes() {
+        const NO_HOST: HostTheme = (None, None);
+        assert_eq!(
+            terminal_query_reply(&TerminalQuery::DeviceAttributes, (0, 0), true, NO_HOST),
+            b"\x1b[?62;22c".to_vec()
+        );
+        assert_eq!(
+            terminal_query_reply(&TerminalQuery::OperatingStatus, (0, 0), true, NO_HOST),
+            b"\x1b[0n".to_vec()
+        );
+        // CPR is 1-based.
+        assert_eq!(
+            terminal_query_reply(
+                &TerminalQuery::CursorPosition { dec: false },
+                (4, 9),
+                true,
+                NO_HOST
+            ),
+            b"\x1b[5;10R".to_vec()
+        );
+        let dark_bg = terminal_query_reply(&TerminalQuery::BackgroundColor, (0, 0), true, NO_HOST);
+        assert!(String::from_utf8(dark_bg).unwrap().contains("1e1e"));
+        let light_bg =
+            terminal_query_reply(&TerminalQuery::BackgroundColor, (0, 0), false, NO_HOST);
+        assert!(String::from_utf8(light_bg).unwrap().contains("ffff"));
+        // A reported host background overrides the theme guess, 16-bit scaled.
+        let host = (None, parse_hex_rgb("#16161e"));
+        let bg = terminal_query_reply(&TerminalQuery::BackgroundColor, (0, 0), true, host);
+        assert_eq!(
+            String::from_utf8(bg).unwrap(),
+            "\x1b]11;rgb:1616/1616/1e1e\x1b\\"
+        );
+    }
+
+    #[test]
+    fn row_contents_ansi_preserves_dim_and_inverse() {
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        parser.process(b"\x1b[2mfaint\x1b[0m \x1b[7mselected\x1b[0m");
+        let row = row_contents_ansi(parser.screen(), 0);
+        assert!(
+            row.contains(";2"),
+            "dim must survive serialization: {row:?}"
+        );
+        assert!(
+            row.contains(";7"),
+            "inverse must survive serialization: {row:?}"
+        );
+    }
+
+    #[test]
     fn screen_scrollback_formatted_captures_styled_history_in_order() {
         // Small screen so most lines scroll off into history.
         let mut parser = vt100::Parser::new(2, 40, 100);
@@ -7968,6 +8780,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 scrollback_cap: crate::config::default_scrollback_bytes(),
                 pending: Vec::new(),
                 osc_tail: String::new(),
+                query_tail: String::new(),
                 terminal_modes: TerminalModeTracker::default(),
                 parser: vt100::Parser::new(24, 80, 1000),
                 size: PaneSize { cols: 80, rows: 24 },
@@ -8059,6 +8872,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                     scrollback_cap: crate::config::default_scrollback_bytes(),
                     pending: Vec::new(),
                     osc_tail: String::new(),
+                    query_tail: String::new(),
                     terminal_modes: TerminalModeTracker::default(),
                     parser: vt100::Parser::new(24, 80, 1000),
                     size: PaneSize { cols: 80, rows: 24 },

@@ -350,15 +350,18 @@ fn main() -> Result<()> {
             pane,
             workspace,
             all,
+            status,
             timeout,
         } => {
             daemon::ensure_running(session)?;
+            let status = (!status.is_empty()).then_some(status);
             let response = protocol::request(
                 &paths::socket_path(session)?,
                 &protocol::Request::WaitPane {
                     pane,
                     workspace,
                     all,
+                    status,
                     timeout_ms: wait_timeout_ms(timeout),
                 },
             )?;
@@ -529,6 +532,7 @@ fn main() -> Result<()> {
                     clear: false,
                     message,
                     title: None,
+                    agent_session: None,
                 },
             )?;
             print_response(response)
@@ -552,6 +556,7 @@ fn main() -> Result<()> {
                     clear,
                     message,
                     title: None,
+                    agent_session: None,
                 },
             )?;
             print_response(response)
@@ -899,6 +904,11 @@ fn hook_event_request(
     // raw user prompt (Claude, Codex, Grok, Cursor, custom harnesses, …).
     // Daemon condenses and respects title_locked; OSC titles still override later.
     let title = hook_prompt_title(&event, payload.as_ref());
+    // The agent CLI's conversation id (Claude Code sends `session_id` in every
+    // hook payload). The daemon stores it so a restart can `--resume` it.
+    let agent_session = payload
+        .as_ref()
+        .and_then(|value| hook_payload_string(value, &["session_id", "sessionId"]));
     // Blank `--pane ""` (legacy empty LMUX_PANE_ID) must not become "unknown pane ".
     Ok(protocol::Request::Notify {
         pane: non_empty(pane),
@@ -908,6 +918,7 @@ fn hook_event_request(
         clear: false,
         message,
         title,
+        agent_session,
     })
 }
 
@@ -1794,6 +1805,7 @@ fn agent_command(session: &str, command: AgentCommand) -> Result<()> {
                     clear: false,
                     message,
                     title: None,
+                    agent_session: None,
                 },
             )?;
             print_response(response)
@@ -2234,6 +2246,7 @@ fn run_pane(
             pane: Some(pane_id.clone()),
             workspace: None,
             all: false,
+            status: None,
             timeout_ms: wait_timeout_ms(timeout),
         },
     )?;
@@ -2622,6 +2635,7 @@ fn smoke(keep: bool) -> Result<()> {
                 pane: Some(pane_id.clone()),
                 workspace: None,
                 all: false,
+                status: None,
                 timeout_ms: Some(3_000),
             },
         )?;
@@ -2659,6 +2673,7 @@ fn smoke(keep: bool) -> Result<()> {
                 clear: false,
                 message: "smoke notification".to_string(),
                 title: None,
+                agent_session: None,
             },
         )?;
         checks.push(smoke_check("notify", notify.ok));
@@ -3111,6 +3126,7 @@ fn events_follow_contains(session: &str, socket: &std::path::Path, pane_id: &str
             clear: false,
             message: "smoke follow event".to_string(),
             title: None,
+            agent_session: None,
         },
     )?;
     if !response.ok {
@@ -3503,6 +3519,7 @@ mod tests {
                 clear,
                 message,
                 title,
+                ..
             } => {
                 assert_eq!(pane.as_deref(), Some("pane-1"));
                 assert_eq!(workspace, None);

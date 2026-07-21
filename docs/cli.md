@@ -68,6 +68,8 @@ vmux send-image screenshot.png --pane pane-1
 vmux broadcast --scope workspace --enter "npm test"
 vmux run --command "npm test" --title tests --timeout 60
 vmux wait --workspace ws-2 --timeout 30
+# block until the agent needs you (or finishes / the pane exits)
+vmux wait --pane pane-1 --status attention,done,error --timeout 600
 vmux read-screen --pane pane-1 --limit-bytes 64000
 vmux search "needle"
 vmux identify --json

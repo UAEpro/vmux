@@ -54,9 +54,13 @@ pub(crate) struct ThemePalette {
     pub(crate) on_bright: Color,
     /// Background used to highlight a text selection in a pane.
     pub(crate) selection: Color,
-    /// Block-cursor fill (bright accent — never pure black on dark panes).
+    /// Optional painted-cursor fill (unused while the host terminal caret is
+    /// the active-pane marker — kept so themes stay complete if we re-offer a
+    /// drawn cursor mode later).
+    #[allow(dead_code)]
     pub(crate) cursor: Color,
-    /// Glyph color drawn on top of [`Self::cursor`].
+    /// Glyph colour for a painted cursor on top of [`Self::cursor`].
+    #[allow(dead_code)]
     pub(crate) on_cursor: Color,
 }
 

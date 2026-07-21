@@ -25,7 +25,7 @@ pub(crate) enum SettingsEntryId {
     Mouse,
     TabCloseButton,
     BellOnAttention,
-    SectionRelay,
+    ResumeAgents,
     MobileRelay,
     MobileRelayBind,
     MobileRelayPort,
@@ -33,12 +33,10 @@ pub(crate) enum SettingsEntryId {
     MobileRelayCgnat,
     MobileRelayPaste,
     MobileRelayViewResize,
-    SectionPorts,
     PortsEnabled,
     PortsNotify,
     PortsAutoForward,
     PortsPollSecs,
-    Section,
     HookShell,
     HookClaude,
     HookCodex,
@@ -46,154 +44,108 @@ pub(crate) enum SettingsEntryId {
     HookInstallAll,
 }
 
+/// One tab of the settings page. Replaces the old single flat list with
+/// `── section ──` header rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsTab {
+    Ui,
+    Relay,
+    Ports,
+    Hooks,
+}
+
+impl SettingsTab {
+    pub(crate) const ALL: [SettingsTab; 4] = [
+        SettingsTab::Ui,
+        SettingsTab::Relay,
+        SettingsTab::Ports,
+        SettingsTab::Hooks,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Ui => "ui",
+            SettingsTab::Relay => "relay",
+            SettingsTab::Ports => "ports",
+            SettingsTab::Hooks => "hooks",
+        }
+    }
+
+    /// A one-line description shown under the tab strip.
+    pub(crate) fn blurb(self) -> &'static str {
+        match self {
+            SettingsTab::Ui => "appearance and input",
+            SettingsTab::Relay => {
+                "one phone relay for all sessions · edits apply when you leave a row"
+            }
+            SettingsTab::Ports => "detect listeners in panes · vmux ports",
+            SettingsTab::Hooks => "agent status in the sidebar",
+        }
+    }
+
+    pub(crate) fn next(self) -> SettingsTab {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub(crate) fn prev(self) -> SettingsTab {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 pub(crate) struct SettingsEntry {
     pub(crate) id: SettingsEntryId,
     pub(crate) name: &'static str,
 }
 
-pub(crate) fn settings_entries() -> Vec<SettingsEntry> {
-    vec![
-        SettingsEntry {
-            id: SettingsEntryId::Theme,
-            name: "theme",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::WorkspaceLine,
-            name: "workspace line",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::Sidebar,
-            name: "sidebar",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::SidebarResponsive,
-            name: "responsive layout",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::SidebarFit,
-            name: "sidebar fit text",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::SidebarWidth,
-            name: "sidebar width",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::PrefixKey,
-            name: "prefix key",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::ScrollStep,
-            name: "scroll step",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::CursorBlink,
-            name: "cursor blink",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::CursorBlinkMs,
-            name: "blink period",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::StatusMarkers,
-            name: "status markers",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::DefaultShell,
-            name: "default shell",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::DefaultCwd,
-            name: "default cwd",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::Mouse,
-            name: "mouse",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::TabCloseButton,
-            name: "tab close ×",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::BellOnAttention,
-            name: "bell on attention",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::SectionRelay,
-            name: "── mobile relay ──",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::MobileRelay,
-            name: "mobile relay",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::MobileRelayBind,
-            name: "relay bind",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::MobileRelayPort,
-            name: "relay port",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::MobileRelayLocalhost,
-            name: "relay localhost",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::MobileRelayCgnat,
-            name: "relay CGNAT",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::MobileRelayPaste,
-            name: "paste page",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::MobileRelayViewResize,
-            name: "phone-fit resize",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::SectionPorts,
-            name: "── ports ──",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::PortsEnabled,
-            name: "port detection",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::PortsNotify,
-            name: "port notify",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::PortsAutoForward,
-            name: "auto-forward",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::PortsPollSecs,
-            name: "port scan interval",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::Section,
-            name: "── agent hooks ──",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::HookShell,
-            name: "shell hooks",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::HookClaude,
-            name: "claude code",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::HookCodex,
-            name: "codex",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::HookGrok,
-            name: "grok skill",
-        },
-        SettingsEntry {
-            id: SettingsEntryId::HookInstallAll,
-            name: "install all hooks",
-        },
-    ]
+pub(crate) fn settings_entries_for_tab(tab: SettingsTab) -> Vec<SettingsEntry> {
+    let rows: &[(SettingsEntryId, &'static str)] = match tab {
+        SettingsTab::Ui => &[
+            (SettingsEntryId::Theme, "theme"),
+            (SettingsEntryId::WorkspaceLine, "workspace line"),
+            (SettingsEntryId::Sidebar, "sidebar"),
+            (SettingsEntryId::SidebarResponsive, "responsive layout"),
+            (SettingsEntryId::SidebarFit, "sidebar fit text"),
+            (SettingsEntryId::SidebarWidth, "sidebar width"),
+            (SettingsEntryId::PrefixKey, "prefix key"),
+            (SettingsEntryId::ScrollStep, "scroll step"),
+            (SettingsEntryId::CursorBlink, "cursor blink"),
+            (SettingsEntryId::CursorBlinkMs, "blink period"),
+            (SettingsEntryId::StatusMarkers, "status markers"),
+            (SettingsEntryId::DefaultShell, "default shell"),
+            (SettingsEntryId::DefaultCwd, "default cwd"),
+            (SettingsEntryId::Mouse, "mouse"),
+            (SettingsEntryId::TabCloseButton, "tab close ×"),
+            (SettingsEntryId::BellOnAttention, "bell on attention"),
+            (SettingsEntryId::ResumeAgents, "resume agents"),
+        ],
+        SettingsTab::Relay => &[
+            (SettingsEntryId::MobileRelay, "mobile relay"),
+            (SettingsEntryId::MobileRelayBind, "relay bind"),
+            (SettingsEntryId::MobileRelayPort, "relay port"),
+            (SettingsEntryId::MobileRelayLocalhost, "relay localhost"),
+            (SettingsEntryId::MobileRelayCgnat, "relay CGNAT"),
+            (SettingsEntryId::MobileRelayPaste, "paste page"),
+            (SettingsEntryId::MobileRelayViewResize, "phone-fit resize"),
+        ],
+        SettingsTab::Ports => &[
+            (SettingsEntryId::PortsEnabled, "port detection"),
+            (SettingsEntryId::PortsNotify, "port notify"),
+            (SettingsEntryId::PortsAutoForward, "auto-forward"),
+            (SettingsEntryId::PortsPollSecs, "port scan interval"),
+        ],
+        SettingsTab::Hooks => &[
+            (SettingsEntryId::HookShell, "shell hooks"),
+            (SettingsEntryId::HookClaude, "claude code"),
+            (SettingsEntryId::HookCodex, "codex"),
+            (SettingsEntryId::HookGrok, "grok skill"),
+            (SettingsEntryId::HookInstallAll, "install all hooks"),
+        ],
+    };
+    rows.iter()
+        .map(|(id, name)| SettingsEntry { id: *id, name })
+        .collect()
 }
 
 pub(crate) struct SettingsView<'a> {
@@ -213,6 +165,7 @@ pub(crate) struct SettingsView<'a> {
     pub(crate) mouse: bool,
     pub(crate) tab_close_button: bool,
     pub(crate) bell_on_attention: bool,
+    pub(crate) resume_agents: bool,
     pub(crate) mobile_relay_enabled: bool,
     pub(crate) mobile_relay_bind: &'a str,
     pub(crate) mobile_relay_port: u16,
@@ -226,13 +179,14 @@ pub(crate) struct SettingsView<'a> {
     pub(crate) ports_notify: &'a str,
     pub(crate) ports_auto_forward: bool,
     pub(crate) ports_poll_secs: u64,
+    pub(crate) active_tab: SettingsTab,
     pub(crate) selected: usize,
 }
 
 pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>> {
     let hook_status = crate::agent_hooks::status_report();
     let theme = view.theme;
-    settings_entries()
+    settings_entries_for_tab(view.active_tab)
         .into_iter()
         .enumerate()
         .map(|(index, entry)| {
@@ -313,8 +267,12 @@ pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>>
                         "off".to_string()
                     }
                 }
-                SettingsEntryId::SectionRelay => {
-                    "one relay for all sessions · change applies when you leave the row".to_string()
+                SettingsEntryId::ResumeAgents => {
+                    if view.resume_agents {
+                        "on · claude --resume on restart (next daemon start)".to_string()
+                    } else {
+                        "off · restart opens a fresh conversation".to_string()
+                    }
                 }
                 SettingsEntryId::MobileRelay => {
                     let settings = crate::config::RelaySettings {
@@ -386,9 +344,6 @@ pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>>
                         "off · phone wraps only".to_string()
                     }
                 }
-                SettingsEntryId::SectionPorts => {
-                    "detect listeners in panes · vmux ports".to_string()
-                }
                 SettingsEntryId::PortsEnabled => {
                     if view.ports_enabled {
                         "on · scan pane process trees (next daemon start)".to_string()
@@ -414,7 +369,6 @@ pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>>
                         view.ports_poll_secs
                     )
                 }
-                SettingsEntryId::Section => "sidebar emoji for agents".to_string(),
                 SettingsEntryId::HookShell => {
                     hook_status_value(&hook_status, crate::agent_hooks::IntegrationKind::Shell)
                 }
@@ -440,12 +394,7 @@ pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>>
                 }
             };
             let marker = if active { "›" } else { " " };
-            let style = if matches!(
-                entry.id,
-                SettingsEntryId::Section | SettingsEntryId::SectionRelay
-            ) {
-                Style::default().fg(theme.palette().muted)
-            } else if active {
+            let style = if active {
                 selected_row_style(theme.palette())
             } else {
                 Style::default().fg(theme.palette().text)
@@ -458,12 +407,61 @@ pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>>
         .collect()
 }
 
+/// Which tab sits at `column` (0-based, relative to the panel content area)
+/// in the strip drawn by `settings_tab_strip`. Must mirror its span layout:
+/// a leading space, then ` {label} ` per tab joined by ` │ `.
+pub(crate) fn settings_tab_at(column: usize) -> Option<SettingsTab> {
+    let mut cursor = 1usize;
+    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
+        if index > 0 {
+            cursor += 3;
+        }
+        let width = tab.label().len() + 2;
+        if (cursor..cursor + width).contains(&column) {
+            return Some(tab);
+        }
+        cursor += width;
+    }
+    None
+}
+
+/// Rows rendered above the settings entries by `draw_settings` (tab strip,
+/// blurb, spacer). Keep in sync with `settings_tab_strip`'s line count.
+pub(crate) const SETTINGS_HEADER_ROWS: usize = 3;
+
+/// The `ui │ relay │ ports │ hooks` strip above the rows, plus the active
+/// tab's blurb.
+pub(crate) fn settings_tab_strip(active: SettingsTab, theme: UiTheme) -> Vec<Line<'static>> {
+    let palette = theme.palette();
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" │ ", Style::default().fg(palette.muted)));
+        }
+        let style = if tab == active {
+            selected_row_style(palette)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        spans.push(Span::styled(format!(" {} ", tab.label()), style));
+    }
+    vec![
+        Line::from(spans),
+        Line::from(Span::styled(
+            format!(" {}", active.blurb()),
+            Style::default().fg(palette.muted),
+        )),
+        Line::from(Span::raw("")),
+    ]
+}
+
 pub(crate) fn draw_settings(frame: &mut ratatui::Frame, area: Rect, view: SettingsView<'_>) {
     let palette = view.theme.palette();
-    let lines = settings_panel_lines(view);
+    let mut lines = settings_tab_strip(view.active_tab, view.theme);
+    lines.extend(settings_panel_lines(view));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(panel_block(" settings ", palette))
+            .block(panel_block(" settings · Tab switches page ", palette))
             .style(Style::default().fg(palette.text).bg(palette.surface))
             .wrap(Wrap { trim: false }),
         area,
