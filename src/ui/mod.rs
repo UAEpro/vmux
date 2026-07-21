@@ -3735,7 +3735,7 @@ fn draw(
     control_bar_scroll: usize,
 ) {
     let palette = theme.palette();
-    let term_w = frame.size().width;
+    let term_w = frame.area().width;
     let compact = sidebar_responsive && term_w < COMPACT_TERM_WIDTH;
     // Mobile / narrow: fully hide the rail; ☰ menu picks workspaces instead.
     let sidebar_width = if compact {
@@ -3746,10 +3746,10 @@ fn draw(
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(sidebar_width), Constraint::Min(10)])
-        .split(frame.size());
+        .split(frame.area());
 
     let Some(snapshot) = snapshot else {
-        frame.render_widget(Paragraph::new("connecting to vmux..."), frame.size());
+        frame.render_widget(Paragraph::new("connecting to vmux..."), frame.area());
         return;
     };
 
@@ -3893,7 +3893,7 @@ fn draw(
                     );
                 }
                 if let Some((x, y)) = host_cursor {
-                    frame.set_cursor(x, y);
+                    frame.set_cursor_position((x, y));
                 }
             }
         }
