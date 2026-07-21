@@ -2,7 +2,7 @@
 name = "vmux-tui"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "The Linux terminal born from the cmux revolution — agent-first TTY multiplexer"
 license = "MIT"
 authors = ["Mayed Abdulla <UAEpro@live.com>"]
@@ -30,13 +30,13 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-crossterm = "0.27"
+crossterm = "0.29"
 daemonize = "0.5"
 dirs = "5"
 getrandom = "0.2"
 libc = "0.2"
 portable-pty = "0.9"
-ratatui = "0.26"
+ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
