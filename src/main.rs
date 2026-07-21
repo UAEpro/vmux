@@ -2,6 +2,7 @@ mod agent_hooks;
 mod cli;
 mod config;
 mod daemon;
+mod detect;
 mod input;
 mod model;
 mod paths;
@@ -11,7 +12,7 @@ mod sync;
 mod ui;
 mod update;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -503,6 +504,13 @@ fn main() -> Result<()> {
             print_response(response)
         }
         Command::Hooks { command } => hooks_command(session, command),
+        Command::Detect {
+            agent,
+            file,
+            osc_title,
+            osc_progress,
+            json,
+        } => detect_command(&agent, file.as_deref(), &osc_title, &osc_progress, json),
         Command::SetProgress { value, pane } => {
             daemon::ensure_running(session)?;
             let response = protocol::request(
@@ -767,6 +775,69 @@ fn ports_command(session: &str, command: PortsCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn detect_command(
+    agent: &str,
+    file: Option<&str>,
+    osc_title: &str,
+    osc_progress: &str,
+    as_json: bool,
+) -> Result<()> {
+    let agent = crate::detect::ManifestAgent::parse(agent).ok_or_else(|| {
+        anyhow!("unknown agent {agent:?} (claude, codex, grok, cursor, gemini, opencode, amp)")
+    })?;
+    let screen = if let Some(path) = file {
+        fs::read_to_string(path).with_context(|| format!("read {path}"))?
+    } else {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    };
+    let detection = crate::detect::detect_agent(agent, &screen, osc_title, osc_progress);
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agent": detection.agent,
+                "state": match detection.state {
+                    crate::detect::DetectedState::Idle => "idle",
+                    crate::detect::DetectedState::Working => "working",
+                    crate::detect::DetectedState::Blocked => "blocked",
+                    crate::detect::DetectedState::Unknown => "unknown",
+                },
+                "vmux_status": match crate::detect::to_agent_status(detection.state) {
+                    model::AgentStatus::Busy => "busy",
+                    model::AgentStatus::Attention => "attention",
+                    model::AgentStatus::Done => "done",
+                    model::AgentStatus::Error => "error",
+                    model::AgentStatus::Idle => "idle",
+                    model::AgentStatus::Unknown => "unknown",
+                },
+                "matched_rule": detection.matched_rule,
+                "skip_state_update": detection.skip_state_update,
+                "visible_idle": detection.visible_idle,
+                "visible_blocker": detection.visible_blocker,
+                "visible_working": detection.visible_working,
+                "fallback_reason": detection.fallback_reason,
+            }))?
+        );
+    } else {
+        let state = match detection.state {
+            crate::detect::DetectedState::Idle => "idle",
+            crate::detect::DetectedState::Working => "working",
+            crate::detect::DetectedState::Blocked => "blocked",
+            crate::detect::DetectedState::Unknown => "unknown",
+        };
+        print!("{state}");
+        if let Some(rule) = &detection.matched_rule {
+            print!(" (rule={rule})");
+        } else if let Some(reason) = detection.fallback_reason {
+            print!(" (fallback={reason})");
+        }
+        println!();
+    }
+    Ok(())
 }
 
 fn hooks_command(session: &str, command: HooksCommand) -> Result<()> {

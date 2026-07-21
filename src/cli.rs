@@ -307,6 +307,33 @@ pub enum Command {
         )]
         timeout: Option<u64>,
     },
+    /// Explain herdr-style screen-manifest agent detection (offline).
+    ///
+    /// Reads screen text from stdin (or `--file`) and classifies idle / working
+    /// / blocked using the bundled per-agent TOML rules. Hooks are not consulted
+    /// — this is the same path the daemon uses as primary status for Claude,
+    /// Codex, and other screen-authority agents.
+    Detect {
+        /// Agent kind: claude, codex, grok, cursor, gemini, opencode, amp.
+        #[arg(long)]
+        agent: String,
+
+        /// Screen dump file (default: stdin).
+        #[arg(long)]
+        file: Option<String>,
+
+        /// OSC window title (optional; e.g. braille spinner for Claude working).
+        #[arg(long, default_value = "")]
+        osc_title: String,
+
+        /// OSC 9;4 progress body after `9;` (optional; e.g. `4;0`).
+        #[arg(long, default_value = "")]
+        osc_progress: String,
+
+        /// Emit JSON instead of a short human line.
+        #[arg(long)]
+        json: bool,
+    },
     Resize {
         #[arg(value_enum)]
         direction: SplitDirection,

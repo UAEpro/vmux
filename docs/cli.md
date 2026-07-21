@@ -117,6 +117,13 @@ vmux hooks install --agent codex    # ~/.codex/hooks.json
 vmux hooks install --agent grok     # ~/.grok/hooks/vmux.json (+ skill)
 vmux hooks install --agent shell
 
+# Screen-manifest agent detection (herdr-style primary status for Claude/Codex/…)
+# Status authority: screen rules first; hooks fill in when no manifest agent is running.
+# Offline explain (read screen dump from stdin or --file):
+printf '%s\n' ' ❯  ' | vmux detect --agent claude
+vmux detect --agent claude --file screen.txt --osc-title $'\u28FF thinking' --json
+# Local rule overrides: ~/.config/vmux/agent-detection/<agent>.toml
+
 eval "$(vmux hooks shell)"
 vmux hooks setup --dir ~/.config/vmux --rc ~/.bashrc
 echo '{"event":"needs-input","message":"waiting"}' | vmux hooks event --pane "$VMUX_PANE_ID"

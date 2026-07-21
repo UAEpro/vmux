@@ -288,6 +288,10 @@ struct PaneRuntime {
     pending: Vec<u8>,
     // Accumulated decoded text used to detect OSC sequences that straddle reads.
     osc_tail: String,
+    /// Latest OSC 0/2 window title payload (for screen-manifest detection).
+    osc_title_raw: String,
+    /// Latest OSC 9;4 progress payload after `9;` (e.g. `4;0`) for manifests.
+    osc_progress_raw: String,
     // Accumulated decoded text used to detect terminal queries (DA1, DSR,
     // OSC 10/11 color probes) that straddle reads. The daemon answers these on
     // the PTY like a real terminal would; vt100 itself never replies, and a
@@ -2149,6 +2153,8 @@ impl Server {
                 output_bytes: 0,
                 pending: Vec::new(),
                 osc_tail: String::new(),
+                osc_title_raw: String::new(),
+                osc_progress_raw: String::new(),
                 query_tail: String::new(),
                 terminal_modes: TerminalModeTracker::default(),
                 parser: vt100::Parser::new(24, 80, 2000),
@@ -2687,6 +2693,14 @@ impl Server {
     }
 
     fn mark_coding_agent_busy(&self, pane_id: &str, runtime_key: &str) {
+        // Screen-manifest agents (Claude/Codex/…) get status from the live UI,
+        // not from "user typed something". A prompt keystroke would otherwise
+        // stick 🔄 until Stop even when the screen already shows idle.
+        if let Some(session_pane) = self.session.lock_or_recover().panes.get(pane_id) {
+            if crate::detect::screen_is_status_authority(&session_pane.command) {
+                return;
+            }
+        }
         {
             let mut session = self.session.lock_or_recover();
             if let Some(pane) = session.panes.get_mut(pane_id) {
@@ -3355,15 +3369,24 @@ impl Server {
                 } else if skip_status {
                     // keep current status/banner
                 } else if let Some(status) = &status {
-                    if !should_skip_busy_after_settled(target, status, &message, has_new_turn_title)
+                    if !should_skip_hook_status_for_screen_authority(target, status)
+                        && !should_skip_busy_after_settled(
+                            target,
+                            status,
+                            &message,
+                            has_new_turn_title,
+                        )
                     {
                         apply_explicit_agent_status(target, status, color.as_deref(), &message);
                     }
                 } else if !message.is_empty() {
-                    // Bare notify without status = needs attention.
-                    touch_agent_status(target, AgentStatus::Attention, true);
-                    target.notification_color = color.clone().or_else(|| Some("blue".to_string()));
-                    target.notification_message = Some(message.clone());
+                    // Bare notify without status = needs attention (hooks path).
+                    if !crate::detect::screen_is_status_authority(&target.command) {
+                        touch_agent_status(target, AgentStatus::Attention, true);
+                        target.notification_color =
+                            color.clone().or_else(|| Some("blue".to_string()));
+                        target.notification_message = Some(message.clone());
+                    }
                 }
                 target.updated_at = unix_time();
             }
@@ -3417,12 +3440,14 @@ impl Server {
                 } else if skip_status {
                     // keep current status/banner
                 } else if let Some(status) = &status {
-                    if !should_skip_busy_after_settled(
-                        &runtime.pane,
-                        status,
-                        &message,
-                        has_new_turn_title,
-                    ) {
+                    if !should_skip_hook_status_for_screen_authority(&runtime.pane, status)
+                        && !should_skip_busy_after_settled(
+                            &runtime.pane,
+                            status,
+                            &message,
+                            has_new_turn_title,
+                        )
+                    {
                         apply_explicit_agent_status(
                             &mut runtime.pane,
                             status,
@@ -3430,7 +3455,9 @@ impl Server {
                             &message,
                         );
                     }
-                } else if !message.is_empty() {
+                } else if !message.is_empty()
+                    && !crate::detect::screen_is_status_authority(&runtime.pane.command)
+                {
                     touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
                     runtime.pane.notification_color =
                         color.clone().or_else(|| Some("blue".to_string()));
@@ -4085,6 +4112,12 @@ impl Server {
                     if let Some(progress) = osc.progress {
                         runtime.pane.progress = progress;
                     }
+                    if let Some(raw) = osc.title_raw {
+                        runtime.osc_title_raw = raw;
+                    }
+                    if let Some(raw) = osc.progress_raw {
+                        runtime.osc_progress_raw = raw;
+                    }
                     if retain_from > 0 {
                         runtime.osc_tail.drain(..retain_from);
                     }
@@ -4116,19 +4149,53 @@ impl Server {
                     };
                     runtime.push_output(text.clone());
                     runtime.pane.updated_at = unix_time();
-                    let inferred = infer_agent_status(&text, &runtime.pane.command);
-                    let prev = runtime.pane.agent_status.clone();
-                    let (next, pinned) = merge_agent_status(
-                        prev.clone(),
-                        runtime.pane.agent_status_pinned,
-                        inferred,
-                    );
-                    if next != prev || pinned != runtime.pane.agent_status_pinned {
-                        touch_agent_status(&mut runtime.pane, next, pinned);
+                    // Herdr-style authority: screen manifests win for known
+                    // agents (Claude/Codex/…). Hooks + PTY keywords only when
+                    // no manifest agent is running in this pane.
+                    let screen_authority =
+                        crate::detect::screen_is_status_authority(&runtime.pane.command);
+                    if screen_authority {
+                        let screen = runtime.parser.screen().contents();
+                        if let Some(detection) = crate::detect::detect_for_command(
+                            &runtime.pane.command,
+                            &screen,
+                            &runtime.osc_title_raw,
+                            &runtime.osc_progress_raw,
+                        ) {
+                            if let Some((next, pinned)) = crate::detect::merge_screen_status(
+                                runtime.pane.agent_status.clone(),
+                                &detection,
+                            ) {
+                                touch_agent_status(&mut runtime.pane, next, pinned);
+                            }
+                        }
+                    } else {
+                        let inferred = infer_agent_status(&text, &runtime.pane.command);
+                        let prev = runtime.pane.agent_status.clone();
+                        let (next, pinned) = merge_agent_status(
+                            prev.clone(),
+                            runtime.pane.agent_status_pinned,
+                            inferred,
+                        );
+                        if next != prev || pinned != runtime.pane.agent_status_pinned {
+                            touch_agent_status(&mut runtime.pane, next, pinned);
+                        }
                     }
-                    if let Some(message) = notifications.last() {
+                    // OSC 9 desktop notifications still surface as attention
+                    // only when screen is not the authority (screen rules
+                    // already catch permission UIs).
+                    if !screen_authority {
+                        if let Some(message) = notifications.last() {
+                            if !is_non_actionable_attention(message) {
+                                touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
+                                runtime.pane.notification_color = Some("blue".to_string());
+                                runtime.pane.notification_message = Some(message.clone());
+                            }
+                        }
+                    } else if let Some(message) = notifications.last() {
+                        // Still record the banner message; do not override
+                        // screen-derived status.
                         if !is_non_actionable_attention(message) {
-                            touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
                             runtime.pane.notification_color = Some("blue".to_string());
                             runtime.pane.notification_message = Some(message.clone());
                         }
@@ -5471,6 +5538,20 @@ fn should_skip_busy_after_settled(
     is_boilerplate_lifecycle_message(message)
 }
 
+/// Herdr-style: for agents with screen manifests (Claude/Codex/…), hooks are
+/// **not** the status authority — screen rules are. Still allow Stop→Done and
+/// Error so ✅/❌ work; ignore busy/attention/idle from hooks so they cannot
+/// fight the live UI (permission dialogs, spinners, prompt box).
+fn should_skip_hook_status_for_screen_authority(pane: &Pane, status: &str) -> bool {
+    if !crate::detect::screen_is_status_authority(&pane.command) {
+        return false;
+    }
+    matches!(
+        parse_agent_status(status),
+        AgentStatus::Busy | AgentStatus::Attention | AgentStatus::Idle | AgentStatus::Unknown
+    )
+}
+
 /// Apply a hook/CLI status so it sticks in the sidebar (pinned).
 ///
 /// Done/busy/error clear the pane notification banner so workspace_status shows
@@ -5976,9 +6057,13 @@ struct OscEvents {
     /// The window title the program last set (OSC 0 / 2). Only the final one in
     /// a read matters — agents rewrite the title as they work.
     title: Option<String>,
+    /// Raw OSC 0/2 payload (pre-condense) for screen-manifest matching.
+    title_raw: Option<String>,
     /// ConEmu / Windows Terminal / Ghostty progress bar (OSC 9;4;…).
     /// `Some(None)` clears the bar; `Some(Some(n))` sets 0–100.
     progress: Option<Option<u8>>,
+    /// Raw OSC 9;4 body after `9;` for manifests (e.g. `4;0` / `4;1;50`).
+    progress_raw: Option<String>,
     /// Clipboard writes from the child (OSC 52). vt100 drops these; we re-emit
     /// them onto the session clipboard so the attach UI can mirror to the host
     /// (herdr's Osc52Forwarder does the same for Ghostty).
@@ -6015,10 +6100,26 @@ fn scan_osc_events(buf: &str) -> (OscEvents, usize) {
         // produced feed spam ("4: 1" / "4: 0") and flipped panes to 🙋.
         if let Some(progress) = osc_progress_update(payload) {
             events.progress = Some(progress);
+            // Keep the raw `4;…` body for herdr-compatible OSC progress rules.
+            if let Some(rest) = payload.strip_prefix("9;4") {
+                let rest = rest.strip_prefix(';').unwrap_or(rest).trim();
+                events.progress_raw = Some(if rest.is_empty() {
+                    "4".to_string()
+                } else {
+                    format!("4;{rest}")
+                });
+            }
         } else if let Some(message) = osc_notification_message(payload) {
             events.notifications.push(message);
         } else if let Some(title) = osc_window_title(payload) {
             events.title = Some(title);
+            // Raw payload for screen manifests (braille spinner / ✳ markers).
+            if let Some(raw) = payload
+                .strip_prefix("0;")
+                .or_else(|| payload.strip_prefix("2;"))
+            {
+                events.title_raw = Some(raw.to_string());
+            }
         } else if let Some(text) = osc_clipboard_write(payload) {
             events.clipboard_writes.push(text);
         }
@@ -6950,9 +7051,11 @@ mod tests {
         let server = Arc::new(Server::load(session.as_str()).unwrap());
         {
             let mut session = server.session.lock_or_recover();
+            // Hook-authority agent (no screen manifest) — Claude/Codex status
+            // is screen-primary and ignores attention hooks by design.
             let mut pane = Pane::new(
                 "pane-1".to_string(),
-                "claude".to_string(),
+                "custom-agent".to_string(),
                 SplitDirection::Right,
             );
             touch_agent_status(&mut pane, AgentStatus::Done, true);
@@ -7160,15 +7263,17 @@ mod tests {
 
     #[test]
     fn late_busy_after_done_does_not_resurrect_spinner() {
-        // Repro: Grok Stop → ✅, then a late PreToolUse/PostToolUse with
+        // Repro: Stop → ✅, then a late PreToolUse/PostToolUse with
         // "agent working" (no UserPromptSubmit title) was flipping ✅ → 🔄.
+        // Uses a hook-authority agent (no screen manifest).
         let session = TestSession::new("late-busy");
         let server = Arc::new(Server::load(session.as_str()).unwrap());
         {
             let mut session = server.session.lock_or_recover();
+            // Coding agent without a screen manifest (hooks remain authority).
             let mut pane = Pane::new(
                 "pane-1".to_string(),
-                "grok".to_string(),
+                "aider".to_string(),
                 SplitDirection::Right,
             );
             touch_agent_status(&mut pane, AgentStatus::Done, true);
@@ -7251,9 +7356,15 @@ mod tests {
         {
             let mut session = server.session.lock_or_recover();
             for id in ["pane-1", "pane-2"] {
+                // Hook-authority pane (no screen manifest) so busy/done notify
+                // still updates live status for this unit test.
                 session.panes.insert(
                     id.to_string(),
-                    Pane::new(id.to_string(), "claude".to_string(), SplitDirection::Right),
+                    Pane::new(
+                        id.to_string(),
+                        "custom-agent".to_string(),
+                        SplitDirection::Right,
+                    ),
                 );
             }
         }
@@ -7638,6 +7749,8 @@ mod tests {
                     scrollback_cap: crate::config::default_scrollback_bytes(),
                     pending: Vec::new(),
                     osc_tail: String::new(),
+                    osc_title_raw: String::new(),
+                    osc_progress_raw: String::new(),
                     query_tail: String::new(),
                     terminal_modes: TerminalModeTracker::default(),
                     parser: vt100::Parser::new(24, 80, 1000),
@@ -8780,6 +8893,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                 scrollback_cap: crate::config::default_scrollback_bytes(),
                 pending: Vec::new(),
                 osc_tail: String::new(),
+                osc_title_raw: String::new(),
+                osc_progress_raw: String::new(),
                 query_tail: String::new(),
                 terminal_modes: TerminalModeTracker::default(),
                 parser: vt100::Parser::new(24, 80, 1000),
@@ -8872,6 +8987,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
                     scrollback_cap: crate::config::default_scrollback_bytes(),
                     pending: Vec::new(),
                     osc_tail: String::new(),
+                    osc_title_raw: String::new(),
+                    osc_progress_raw: String::new(),
                     query_tail: String::new(),
                     terminal_modes: TerminalModeTracker::default(),
                     parser: vt100::Parser::new(24, 80, 1000),
