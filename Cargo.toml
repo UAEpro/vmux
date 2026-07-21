@@ -2,7 +2,7 @@
 name = "vmux-tui"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "The Linux terminal born from the cmux revolution — agent-first TTY multiplexer"
 license = "MIT"
 authors = ["Mayed Abdulla <UAEpro@live.com>"]
