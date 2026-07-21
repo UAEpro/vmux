@@ -95,10 +95,15 @@
           "default": 1000,
           "description": "Half-period of the caret blink in milliseconds (on or off duration)."
         },
+        "resume_agents": {
+          "type": "boolean",
+          "default": true,
+          "description": "On daemon restart, relaunch agent CLIs resuming their hook-reported conversation (claude --resume <id>) instead of a blank chat."
+        },
         "status_markers": {
           "type": "string",
-          "enum": ["emoji", "ascii", "off"],
-          "default": "emoji",
+          "enum": ["dots", "emoji", "ascii", "off"],
+          "default": "dots",
           "description": "How agent status markers render in the sidebar."
         },
         "default_shell": {

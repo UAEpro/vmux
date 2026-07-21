@@ -32,6 +32,13 @@ pub enum Request {
         /// (the client is scrolled back in them).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scrollback_panes: Vec<String>,
+        /// Long-poll: when `since` matches the current generation, block up to
+        /// this many ms for a change instead of answering `unchanged`
+        /// immediately. Lets the attach UI receive PTY echo the moment it
+        /// exists rather than on a polling tick. Additive; old daemons and
+        /// clients simply never set it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
     },
     List,
     Agents,
@@ -221,6 +228,10 @@ pub enum Request {
         workspace: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         all: bool,
+        /// Agent statuses to wait for instead of process exit. A pane exiting
+        /// still ends the wait so callers cannot hang on a dead pane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
     },
@@ -288,6 +299,20 @@ pub enum Request {
         /// alternative to OSC terminal titles and the LLM fallback.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// The agent CLI's own conversation id (Claude Code `session_id` from
+        /// hook JSON). Stored on the pane so a daemon restart can relaunch the
+        /// agent with `--resume <id>` instead of a blank conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_session: Option<String>,
+    },
+    /// The attach client's outer-terminal default colors (`#rrggbb`), learned
+    /// via OSC 10/11 at startup. The daemon uses them to answer panes'
+    /// OSC 10/11 probes so agent TUIs paint surfaces that blend for real.
+    SetHostTheme {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fg: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bg: Option<String>,
     },
     Notifications {
         limit: usize,
@@ -475,6 +500,11 @@ fn read_timeout_for(request: &Request) -> Option<Duration> {
         Request::WaitPane {
             timeout_ms: None, ..
         } => None,
+        // Long-poll snapshots block on the daemon for up to wait_ms.
+        Request::Snapshot {
+            wait_ms: Some(wait_ms),
+            ..
+        } => Some(Duration::from_millis(*wait_ms) + LONG_POLL_SLACK),
         // Browser/url fetches shell out to curl (--max-time 30) on the daemon;
         // the client must outwait that deadline.
         Request::UrlSnapshot { .. }
@@ -495,6 +525,7 @@ pub fn snapshot_full() -> Request {
         full: true,
         lean: false,
         scrollback_panes: Vec::new(),
+        wait_ms: None,
     }
 }
 
@@ -595,6 +626,7 @@ mod tests {
             full: false,
             lean: false,
             scrollback_panes: Vec::new(),
+            wait_ms: None,
         })
         .unwrap();
         assert!(with_since.contains(r#""since":7"#));
@@ -602,6 +634,7 @@ mod tests {
         // Lean fields stay off the wire unless set (old daemons keep working).
         assert!(!with_since.contains("lean"));
         assert!(!with_since.contains("scrollback_panes"));
+        assert!(!with_since.contains("wait_ms"));
         // Legacy clients sending bare {"action":"snapshot"} still decode.
         let bare: Request = serde_json::from_str(r#"{"action":"snapshot"}"#).unwrap();
         match bare {
@@ -610,6 +643,7 @@ mod tests {
                 full,
                 lean,
                 scrollback_panes,
+                ..
             } => {
                 assert!(since.is_none());
                 assert!(full);
@@ -1121,6 +1155,7 @@ mod tests {
             pane: Some("pane-2".to_string()),
             workspace: None,
             all: false,
+            status: None,
             timeout_ms: Some(5000),
         })
         .unwrap();
@@ -1131,11 +1166,33 @@ mod tests {
     }
 
     #[test]
+    fn wait_pane_status_request_uses_socket_protocol_shape() {
+        let encoded = serde_json::to_string(&Request::WaitPane {
+            pane: Some("pane-2".to_string()),
+            workspace: None,
+            all: false,
+            status: Some(vec!["done".to_string(), "error".to_string()]),
+            timeout_ms: Some(5000),
+        })
+        .unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"action":"wait-pane","pane":"pane-2","status":["done","error"],"timeout_ms":5000}"#
+        );
+        // Old daemons must still decode requests without the field.
+        let legacy: Request =
+            serde_json::from_str(r#"{"action":"wait-pane","pane":"pane-2","timeout_ms":5000}"#)
+                .unwrap();
+        assert!(matches!(legacy, Request::WaitPane { status: None, .. }));
+    }
+
+    #[test]
     fn wait_workspace_request_uses_socket_protocol_shape() {
         let encoded = serde_json::to_string(&Request::WaitPane {
             pane: None,
             workspace: Some("ws-2".to_string()),
             all: false,
+            status: None,
             timeout_ms: Some(30000),
         })
         .unwrap();
@@ -1235,6 +1292,7 @@ mod tests {
             clear: false,
             message: "agents running".to_string(),
             title: None,
+            agent_session: None,
         })
         .unwrap();
         assert_eq!(
@@ -1250,6 +1308,7 @@ mod tests {
             clear: false,
             message: "agent working".to_string(),
             title: Some("fixing parser".to_string()),
+            agent_session: None,
         })
         .unwrap();
         assert_eq!(

@@ -14,9 +14,12 @@ use command_palette::{
 };
 mod theme;
 use ports_panel::{draw_ports, PortListRow};
+use settings_panel::{
+    draw_settings, settings_entries_for_tab, settings_tab_at, SettingsEntryId, SettingsTab,
+    SettingsView, SETTINGS_HEADER_ROWS,
+};
 #[cfg(test)]
-use settings_panel::settings_panel_lines;
-use settings_panel::{draw_settings, settings_entries, SettingsEntryId, SettingsView};
+use settings_panel::{settings_panel_lines, settings_tab_strip};
 use theme::{ThemePalette, UiTheme, UiWorkspaceSecondLine};
 
 use anyhow::{Context, Result};
@@ -38,6 +41,8 @@ use ratatui::Terminal;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Stdout, Write};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -69,9 +74,14 @@ pub fn attach(session: &str) -> Result<()> {
     // always restored, even if `Ui::new`, terminal init, an early RPC, or a
     // panic inside `run` bails out between here and normal teardown.
     let _guard = TerminalGuard::new(config.ui.mouse)?;
+    // Ask the real terminal for its default colors while raw mode is fresh.
+    // Forwarded to the daemon so agent TUIs asking "what is my background?"
+    // get the truth and their painted surfaces blend into the pane.
+    let host_colors = query_host_terminal_colors();
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend)?;
     let mut app = Ui::new(session.to_string(), terminal, config);
+    app.host_term_colors = host_colors;
     let result = app.run();
     // Restore the shell (drop the guard) before printing, so the notice lands on
     // the normal screen after detach rather than being cleared by the alt-screen.
@@ -83,6 +93,95 @@ pub fn attach(session: &str) -> Result<()> {
         );
     }
     result
+}
+
+/// The outer terminal's default colors, learned via OSC 10/11 at startup.
+#[derive(Debug, Clone, Default)]
+struct HostTermColors {
+    /// `#rrggbb` default foreground, when the terminal answered.
+    fg: Option<String>,
+    /// `#rrggbb` default background, when the terminal answered.
+    bg: Option<String>,
+}
+
+/// Query the real terminal for its default foreground/background (OSC 10/11),
+/// herdr-style. Must run in raw mode. A trailing DA1 probe bounds the read:
+/// every terminal answers `ESC [ ? … c`, so we stop there (or at a short
+/// deadline) instead of stealing user input.
+fn query_host_terminal_colors() -> HostTermColors {
+    let mut out = io::stdout();
+    if out
+        .write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c")
+        .is_err()
+        || out.flush().is_err()
+    {
+        return HostTermColors::default();
+    }
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as i32) };
+        if ready <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 512];
+        let read = unsafe { libc::read(0, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        if read <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read as usize]);
+        if da1_reply_present(&buf) {
+            break;
+        }
+    }
+    HostTermColors {
+        fg: parse_osc_color_reply(&buf, 10),
+        bg: parse_osc_color_reply(&buf, 11),
+    }
+}
+
+/// True when `buf` contains a DA1 reply (`ESC [ ? … c`).
+fn da1_reply_present(buf: &[u8]) -> bool {
+    let mut idx = 0;
+    while let Some(pos) = buf[idx..].windows(3).position(|w| w == b"\x1b[?") {
+        let start = idx + pos + 3;
+        if buf[start..].iter().take(24).any(|byte| *byte == b'c') {
+            return true;
+        }
+        idx = start;
+    }
+    false
+}
+
+/// Parse an `OSC {code} ; rgb:RRRR/GGGG/BBBB` reply out of raw terminal input,
+/// scaling each 1-4 hex-digit component to 8 bits. Returns `#rrggbb`.
+fn parse_osc_color_reply(buf: &[u8], code: u8) -> Option<String> {
+    let text = String::from_utf8_lossy(buf);
+    let marker = format!("]{code};rgb:");
+    let start = text.find(&marker)? + marker.len();
+    let tail = &text[start..];
+    let end = tail.find(['\u{7}', '\u{1b}']).unwrap_or(tail.len());
+    let mut parts = tail[..end].split('/');
+    let mut component = || -> Option<u8> {
+        let part = parts.next()?.trim();
+        if part.is_empty() || part.len() > 4 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u32::from_str_radix(part, 16).ok()?;
+        let max = (1u32 << (4 * part.len() as u32)) - 1;
+        Some(((value * 255 + max / 2) / max) as u8)
+    };
+    let (r, g, b) = (component()?, component()?, component()?);
+    Some(format!("#{r:02x}{g:02x}{b:02x}"))
 }
 
 /// RAII guard that owns the terminal's raw mode + alternate screen state. Its
@@ -100,7 +199,8 @@ impl TerminalGuard {
         execute!(
             io::stdout(),
             EnterAlternateScreen,
-            // Steady block; vmux software-blinks only the active pane caret.
+            // Host-terminal caret (SteadyBlock). Cell paint is no longer used
+            // for the active-pane caret — herdr-style, same colour as the font.
             SetCursorStyle::SteadyBlock,
         )?;
         execute!(io::stdout(), event::EnableBracketedPaste)?;
@@ -170,6 +270,7 @@ struct Ui {
     /// full palette is shown.
     command_filter: String,
     settings_selected: usize,
+    settings_tab: SettingsTab,
     context_selected: usize,
     hover_control: Option<ControlAction>,
     hover_pane_control: Option<PaneControlHit>,
@@ -198,6 +299,7 @@ struct Ui {
     mouse: bool,
     tab_close_button: bool,
     bell_on_attention: bool,
+    resume_agents: bool,
     /// Auto-hide sidebar on narrow terminals (burger + workspace picker).
     sidebar_responsive: bool,
     /// Selection index inside the ☰ workspace picker.
@@ -251,6 +353,12 @@ struct Ui {
     /// Scrolled panes sent with the last lean snapshot request; when the set
     /// changes, `since` is dropped so the daemon sends the new scrollback.
     last_scrollback_request: Vec<String>,
+    /// Outer terminal's default colors (OSC 10/11, queried at attach); sent to
+    /// the daemon so pane terminal-query replies report the truth.
+    host_term_colors: HostTermColors,
+    /// Last session clipboard we mirrored to the host system clipboard
+    /// (agents write OSC 52 into the PTY; the daemon stores it on the session).
+    last_mirrored_clipboard: Option<(u64, String)>,
     /// Set by any state-changing RPC (via `rpc()`) so the run loop refreshes
     /// immediately instead of waiting for the periodic tick. This covers
     /// keystroke echo latency as well as pane/workspace creation and layout
@@ -525,6 +633,7 @@ impl Ui {
             command_selected: 0,
             command_filter: String::new(),
             settings_selected: 0,
+            settings_tab: SettingsTab::Ui,
             context_selected: 0,
             hover_control: None,
             hover_pane_control: None,
@@ -534,6 +643,7 @@ impl Ui {
             rename_dialog: None,
             last_click: None,
             selection: None,
+            last_mirrored_clipboard: None,
             theme: UiTheme::from_name(&config.ui.theme),
             workspace_second_line: UiWorkspaceSecondLine::from_name(
                 &config.ui.workspace_second_line,
@@ -547,6 +657,7 @@ impl Ui {
             mouse: config.ui.mouse,
             tab_close_button: config.ui.tab_close_button,
             bell_on_attention: config.ui.bell_on_attention,
+            resume_agents: config.ui.resume_agents,
             sidebar_responsive: config.ui.sidebar_responsive,
             workspace_picker_selected: 0,
             mobile_relay_enabled: config.relay.enabled,
@@ -575,6 +686,7 @@ impl Ui {
             sidebar_active_seen: None,
             last_snapshot_data: None,
             last_scrollback_request: Vec::new(),
+            host_term_colors: HostTermColors::default(),
             snapshot_generation: None,
             pending_refresh: std::cell::Cell::new(false),
             last_typing_at: None,
@@ -586,44 +698,43 @@ impl Ui {
     }
 
     fn run(&mut self) -> Result<()> {
+        // Event-driven snapshots: a background thread long-polls the daemon
+        // (`Snapshot { wait_ms }`) so pane output is pushed to us the moment
+        // the generation changes, instead of being discovered on a 40-250 ms
+        // timer. The timer below survives only as a slow safety net.
+        let poll_shared = Arc::new(Mutex::new(SnapshotPollParams {
+            scrollback_panes: Vec::new(),
+            epoch: 0,
+        }));
+        let (snapshot_tx, snapshot_rx) = mpsc::channel::<protocol::Response>();
+        spawn_snapshot_poller(self.session.clone(), Arc::clone(&poll_shared), snapshot_tx);
+        let mut poller_scrollback: Vec<String> = Vec::new();
+
+        // Hand the daemon the outer terminal's true default colors (best
+        // effort) so panes answer agent color probes with reality.
+        if self.host_term_colors.fg.is_some() || self.host_term_colors.bg.is_some() {
+            let _ = self.request(&Request::SetHostTheme {
+                fg: self.host_term_colors.fg.clone(),
+                bg: self.host_term_colors.bg.clone(),
+            });
+        }
+
         let mut last_refresh = Instant::now() - Duration::from_secs(1);
         // Draw the first frame unconditionally; afterwards only redraw when
         // something actually changed (snapshot, an event, or a resize).
         let mut dirty = true;
-        let started = Instant::now();
-        let mut last_blink_phase = 0u8;
-        let mut was_typing_solid = false;
         // One extra refresh scheduled shortly after an Input RPC: the PTY echo
         // lands a few ms after the write, so the refresh fired immediately
         // after sending usually misses it and the character would otherwise
         // wait for the next periodic tick.
         let mut followup_refresh_at: Option<Instant> = None;
+        // Apply the configured host caret shape once; settings changes re-apply.
+        apply_host_cursor_style(self.cursor_blink);
         loop {
-            // Active-pane cursor: solid while typing; otherwise blink at configured rate.
-            // Inactive panes never show a caret.
-            const TYPING_SOLID_MS: u128 = 1000;
-            let blink_half_ms = self.cursor_blink_ms.max(200) as u128;
-            let typing_solid = self
-                .last_typing_at
-                .map(|t| t.elapsed().as_millis() < TYPING_SOLID_MS)
-                .unwrap_or(false);
-            if typing_solid != was_typing_solid {
-                was_typing_solid = typing_solid;
-                dirty = true;
-            }
-            let blink_phase = ((started.elapsed().as_millis() / blink_half_ms) % 2) as u8;
-            let cursor_blink_on = if !self.cursor_blink {
-                true // solid caret when blink disabled
-            } else {
-                typing_solid || blink_phase == 0
-            };
-            if self.cursor_blink && blink_phase != last_blink_phase {
-                last_blink_phase = blink_phase;
-                // Only redraw for blink when not holding solid for typing.
-                if !typing_solid {
-                    dirty = true;
-                }
-            }
+            // Host-terminal caret only (no painted accent block on the cell).
+            // Always "on" — the outer terminal draws a steady/blinking block
+            // in its own default colours (same as the font), herdr-style.
+            let cursor_blink_on = true;
 
             // Flush coalesced keystrokes after a short idle window.
             if self.should_flush_input_batch() {
@@ -652,18 +763,25 @@ impl Ui {
                 last_refresh = Instant::now();
             }
 
-            // Adaptive poll: faster while typing/active, slower when idle.
-            let active_recently = self
-                .last_typing_at
-                .map(|t| t.elapsed() < Duration::from_millis(800))
-                .unwrap_or(false)
-                || self.pending_refresh.get()
-                || !self.input_batch.is_empty();
-            let refresh_interval = if active_recently {
-                Duration::from_millis(40)
-            } else {
-                Duration::from_millis(250)
-            };
+            // Keep the poller's scrollback set in sync (a change forces one
+            // non-short-circuited fetch so newly scrolled panes get history).
+            let scrollback_now: Vec<String> = self.scroll_offsets.keys().cloned().collect();
+            if scrollback_now != poller_scrollback {
+                poller_scrollback = scrollback_now.clone();
+                let mut shared = poll_shared.lock().unwrap_or_else(|e| e.into_inner());
+                shared.scrollback_panes = scrollback_now;
+                shared.epoch = shared.epoch.wrapping_add(1);
+            }
+            // Drain snapshots pushed by the long-poll thread.
+            while let Ok(response) = snapshot_rx.try_recv() {
+                if self.apply_snapshot_response(response)? {
+                    dirty = true;
+                }
+                last_refresh = Instant::now();
+            }
+
+            // Slow safety-net poll in case the push thread misses something.
+            let refresh_interval = Duration::from_millis(1000);
             if last_refresh.elapsed() > refresh_interval {
                 self.flush_input_batch()?;
                 if self.refresh()? {
@@ -712,6 +830,7 @@ impl Ui {
                             &self.command_filter,
                             &self.prefix_label,
                             self.settings_selected,
+                            self.settings_tab,
                             self.context_selected,
                             self.context_pane.as_deref(),
                             self.hover_control,
@@ -733,6 +852,7 @@ impl Ui {
                             self.default_cwd.as_str(),
                             self.mouse,
                             self.bell_on_attention,
+                            self.resume_agents,
                             self.mobile_relay_enabled,
                             self.mobile_relay_bind.as_str(),
                             self.mobile_relay_port,
@@ -760,10 +880,13 @@ impl Ui {
 
             // While keystrokes are buffering (or an echo follow-up is due),
             // wake sooner so the 8 ms batch / 15 ms follow-up fires on time.
+            // The 15 ms cap otherwise bounds how long a pushed snapshot can sit
+            // in the channel before the loop drains and draws it (crossterm's
+            // poll cannot select on an mpsc channel).
             let poll_ms = if !self.input_batch.is_empty() || followup_refresh_at.is_some() {
                 8
             } else {
-                50
+                15
             };
             // Block for the first event (so the loop still ticks for the
             // periodic refresh), then drain everything already queued and draw
@@ -828,9 +951,16 @@ impl Ui {
                 full: true,
                 lean: true,
                 scrollback_panes: scrollback_panes.clone(),
+                wait_ms: None,
             },
         )?;
         self.last_scrollback_request = scrollback_panes;
+        self.apply_snapshot_response(response)
+    }
+
+    /// Apply a snapshot response (from a synchronous `refresh` or the
+    /// long-poll thread). Returns `true` when the visible session changed.
+    fn apply_snapshot_response(&mut self, response: protocol::Response) -> Result<bool> {
         if let Some(data) = response.data {
             if data
                 .get("unchanged")
@@ -865,6 +995,10 @@ impl Ui {
             if let Some(g) = gen {
                 self.snapshot_generation = Some(g);
             }
+            // Agents write OSC 52 into the PTY; the daemon stores the payload
+            // on session.clipboard. Mirror new items into the host clipboard
+            // (herdr does the same) so copy-inside-Claude actually lands.
+            self.mirror_session_clipboard_to_host();
             // Content length can shrink after exit/restart — keep offsets legal.
             self.clamp_all_scroll_offsets();
             self.maybe_bell_on_attention();
@@ -1022,6 +1156,8 @@ impl Ui {
                             self.flush_pending_relay_settings();
                             self.mode = UiMode::Panes;
                         }
+                        KeyCode::Tab => self.switch_settings_tab(self.settings_tab.next()),
+                        KeyCode::BackTab => self.switch_settings_tab(self.settings_tab.prev()),
                         KeyCode::Up | KeyCode::Char('k') => self.move_settings_selection(-1),
                         KeyCode::Down | KeyCode::Char('j') => self.move_settings_selection(1),
                         KeyCode::Left | KeyCode::Char('h') => self.adjust_selected_setting(-1)?,
@@ -1099,6 +1235,14 @@ impl Ui {
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     self.pane_size_control_requested = true;
+                    // Shift+click forces host text selection even when the
+                    // agent has mouse reporting on (tmux/herdr-style).
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if let Some(pane) = self.pane_at_position(mouse.column, mouse.row)? {
+                            self.start_selection(&pane, mouse.column, mouse.row)?;
+                            return Ok(false);
+                        }
+                    }
                     if self.handle_click(mouse.column, mouse.row)? {
                         return Ok(true);
                     }
@@ -1116,6 +1260,15 @@ impl Ui {
                         self.handle_sidebar_resize_drag(mouse.column)?;
                     } else if self.pane_resize_drag.is_some() {
                         self.handle_pane_resize_drag(mouse.column, mouse.row)?;
+                    } else if mouse.modifiers.contains(KeyModifiers::SHIFT)
+                        || self.selection.is_some()
+                    {
+                        // Keep extending a host selection (incl. Shift-started)
+                        // instead of forwarding motion into the agent.
+                        if let Some(selection) = self.selection.as_mut() {
+                            selection.end_col = mouse.column;
+                            selection.end_row = mouse.row;
+                        }
                     } else {
                         self.handle_drag(mouse.column, mouse.row)?;
                     }
@@ -1135,6 +1288,11 @@ impl Ui {
                     }
                     if self.sidebar_resize_drag {
                         self.finish_sidebar_resize()?;
+                    } else if self.selection.is_some()
+                        || mouse.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        // Host selection wins over mouse-report release.
+                        self.finish_selection()?;
                     } else if !self.forward_mouse_to_pane(
                         mouse.column,
                         mouse.row,
@@ -1602,6 +1760,7 @@ impl Ui {
             clear: false,
             message: message.to_string(),
             title: None,
+            agent_session: None,
         })
     }
 
@@ -1802,7 +1961,11 @@ impl Ui {
             self.flush_pending_relay_settings();
             self.mode = UiMode::Panes;
         } else {
-            self.settings_selected = self.settings_selected.min(settings_entries().len() - 1);
+            self.settings_selected = self.settings_selected.min(
+                settings_entries_for_tab(self.settings_tab)
+                    .len()
+                    .saturating_sub(1),
+            );
             self.mode = UiMode::Settings;
         }
     }
@@ -1941,54 +2104,31 @@ impl Ui {
         need.clamp(crate::config::SIDEBAR_MIN_WIDTH, max)
     }
 
+    fn switch_settings_tab(&mut self, tab: SettingsTab) {
+        // Leaving the relay tab applies pending relay edits, same as leaving
+        // a relay row.
+        self.flush_pending_relay_settings();
+        self.settings_tab = tab;
+        self.settings_selected = 0;
+    }
+
     fn move_settings_selection(&mut self, delta: isize) {
         // Leaving a row applies pending relay edits (one save + one restart).
         self.flush_pending_relay_settings();
-        let entries = settings_entries();
-        let count = entries.len();
+        let count = settings_entries_for_tab(self.settings_tab).len();
         if count == 0 {
             return;
         }
-        let mut current = self.settings_selected.min(count.saturating_sub(1));
-        // Skip non-interactive section headers when moving.
-        for _ in 0..count {
-            current = if delta.is_negative() {
-                current.saturating_sub(1)
-            } else {
-                current.saturating_add(1).min(count.saturating_sub(1))
-            };
-            if !matches!(
-                entries[current].id,
-                SettingsEntryId::Section
-                    | SettingsEntryId::SectionRelay
-                    | SettingsEntryId::SectionPorts
-            ) {
-                break;
-            }
-            if (delta.is_negative() && current == 0)
-                || (!delta.is_negative() && current + 1 >= count)
-            {
-                break;
-            }
-        }
-        // If we landed on a section (edge case), nudge off it.
-        if matches!(
-            entries[current].id,
-            SettingsEntryId::Section
-                | SettingsEntryId::SectionRelay
-                | SettingsEntryId::SectionPorts
-        ) {
-            if current + 1 < count {
-                current += 1;
-            } else {
-                current = current.saturating_sub(1);
-            }
-        }
-        self.settings_selected = current;
+        let current = self.settings_selected.min(count.saturating_sub(1));
+        self.settings_selected = if delta.is_negative() {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(count.saturating_sub(1))
+        };
     }
 
     fn adjust_selected_setting(&mut self, delta: isize) -> Result<()> {
-        let entries = settings_entries();
+        let entries = settings_entries_for_tab(self.settings_tab);
         let Some(entry) = entries.get(self.settings_selected) else {
             return Ok(());
         };
@@ -2044,6 +2184,7 @@ impl Ui {
             }
             SettingsEntryId::CursorBlink => {
                 self.cursor_blink = !self.cursor_blink;
+                apply_host_cursor_style(self.cursor_blink);
                 self.save_ui_config("ui.cursor_blink", &self.cursor_blink.to_string())?;
             }
             SettingsEntryId::CursorBlinkMs => {
@@ -2094,6 +2235,12 @@ impl Ui {
             SettingsEntryId::BellOnAttention => {
                 self.bell_on_attention = !self.bell_on_attention;
                 self.save_ui_config("ui.bell_on_attention", &self.bell_on_attention.to_string())?;
+            }
+            SettingsEntryId::ResumeAgents => {
+                self.resume_agents = !self.resume_agents;
+                self.save_ui_config("ui.resume_agents", &self.resume_agents.to_string())?;
+                *self.action_error.get_mut() =
+                    Some("ui.resume_agents applies on next daemon start".into());
             }
             SettingsEntryId::MobileRelay => {
                 self.mobile_relay_enabled = !self.mobile_relay_enabled;
@@ -2178,9 +2325,6 @@ impl Ui {
                 // Install / re-install agent hooks (Enter / l / h all install).
                 self.install_selected_agent_hooks(entry.id)?;
             }
-            SettingsEntryId::Section
-            | SettingsEntryId::SectionRelay
-            | SettingsEntryId::SectionPorts => {}
         }
         Ok(())
     }
@@ -2925,6 +3069,41 @@ impl Ui {
             }
             return Ok(false);
         }
+        // Settings: click a tab to switch page, click a row to select it,
+        // click the selected row again to change/install it.
+        if self.mode == UiMode::Settings {
+            let main = confirm_main_area(layout_cols, width, height);
+            if point_in_rect(main, column, row) {
+                let content_x = main.x.saturating_add(1);
+                let content_y = main.y.saturating_add(1);
+                if column >= content_x && row >= content_y {
+                    let rel_col = (column - content_x) as usize;
+                    let rel_row = (row - content_y) as usize;
+                    if rel_row == 0 {
+                        if let Some(tab) = settings_tab_at(rel_col) {
+                            self.switch_settings_tab(tab);
+                        }
+                    } else if rel_row >= SETTINGS_HEADER_ROWS {
+                        let index = rel_row - SETTINGS_HEADER_ROWS;
+                        if index < settings_entries_for_tab(self.settings_tab).len() {
+                            if self.settings_selected == index {
+                                self.adjust_selected_setting(1)?;
+                            } else {
+                                // Leaving a row applies pending relay edits.
+                                self.flush_pending_relay_settings();
+                                self.settings_selected = index;
+                            }
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+            // Clicks under the overlay must not reach hidden panes; only the
+            // control bar below stays live.
+            if row < height.saturating_sub(CONTROL_BAR_HEIGHT) {
+                return Ok(false);
+            }
+        }
         // Click the collapsed ☰ header to open the workspace picker.
         if layout_cols > 0 && self.sidebar_collapsed && column < layout_cols && row == 0 {
             self.toggle_workspace_picker();
@@ -3327,6 +3506,34 @@ impl Ui {
         Ok(())
     }
 
+    /// When a pane agent writes OSC 52, the daemon puts the payload on
+    /// `session.clipboard`. Mirror each new item into the host terminal /
+    /// system clipboard so copy-from-Claude works like herdr.
+    fn mirror_session_clipboard_to_host(&mut self) {
+        let Some(item) = self
+            .snapshot
+            .as_ref()
+            .and_then(|session| session.clipboard.as_ref())
+        else {
+            return;
+        };
+        // Only agent/app OSC 52 (and selection already copies itself). Avoid
+        // re-mirroring paste sources the UI itself wrote.
+        if item.source != "osc52" && item.source != "selection" {
+            return;
+        }
+        let key = (item.copied_at, item.text.clone());
+        if self.last_mirrored_clipboard.as_ref() == Some(&key) {
+            return;
+        }
+        // Selection already called copy_to_system_clipboard on finish; only
+        // need the OSC 52 path here.
+        if item.source == "osc52" && !item.text.is_empty() {
+            copy_to_system_clipboard(&item.text);
+        }
+        self.last_mirrored_clipboard = Some(key);
+    }
+
     fn finish_selection(&mut self) -> Result<()> {
         let Some(selection) = self.selection.clone() else {
             return Ok(());
@@ -3485,6 +3692,7 @@ fn draw(
     command_filter: &str,
     prefix_label: &str,
     settings_selected: usize,
+    settings_tab: SettingsTab,
     context_selected: usize,
     context_pane: Option<&str>,
     hover_control: Option<ControlAction>,
@@ -3506,6 +3714,7 @@ fn draw(
     default_cwd: &str,
     mouse: bool,
     bell_on_attention: bool,
+    resume_agents: bool,
     mobile_relay_enabled: bool,
     mobile_relay_bind: &str,
     mobile_relay_port: u16,
@@ -3695,6 +3904,7 @@ fn draw(
             notification_selected,
             hover_notification,
             palette,
+            status_markers,
         ),
         UiMode::Ports => draw_ports(
             frame,
@@ -3740,6 +3950,7 @@ fn draw(
                 mouse,
                 tab_close_button,
                 bell_on_attention,
+                resume_agents,
                 mobile_relay_enabled,
                 mobile_relay_bind,
                 mobile_relay_port,
@@ -3752,6 +3963,7 @@ fn draw(
                 ports_notify,
                 ports_auto_forward,
                 ports_poll_secs,
+                active_tab: settings_tab,
                 selected: settings_selected,
             },
         ),
@@ -3880,6 +4092,7 @@ const NOTIF_LIST_TOP: u16 = 2;
 /// Rows per card (header + message). Spacer between cards is separate.
 const NOTIF_CARD_ROWS: u16 = 2;
 
+#[allow(clippy::too_many_arguments)]
 fn draw_notifications(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -3887,6 +4100,7 @@ fn draw_notifications(
     selected: usize,
     hovered: Option<usize>,
     palette: ThemePalette,
+    status_markers: &str,
 ) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let notes = visible_notifications(snapshot);
@@ -3935,6 +4149,7 @@ fn draw_notifications(
                 state,
                 inner_width.max(24),
                 palette,
+                status_markers,
             ));
             // Spacing between cards (except after the last).
             if index + 1 < notes.len() {
@@ -4059,15 +4274,7 @@ fn draw_workspace_picker(
         let marker = if is_current { "●" } else { "○" };
         let pin = if ws.pinned { "📌 " } else { "" };
         let status = workspace_status_summary(snapshot, &ws.id, status_markers);
-        let label = format!(
-            " {marker} {pin}{}  {}",
-            ws.name,
-            if status.is_empty() {
-                String::new()
-            } else {
-                format!(" {status}")
-            }
-        );
+        let label = format!(" {marker} {pin}{}  ", ws.name);
         let style = if active {
             selected_row_style(palette)
         } else if is_current {
@@ -4078,7 +4285,19 @@ fn draw_workspace_picker(
         } else {
             Style::default().fg(palette.text).bg(palette.surface)
         };
-        lines.push(Line::from(Span::styled(label, style)));
+        if status.is_empty() {
+            lines.push(Line::from(Span::styled(label, style)));
+        } else {
+            // Status marker keeps its per-status color on top of the row style.
+            let status_style = Style::default()
+                .fg(status_marker_color(&status, palette))
+                .bg(style.bg.unwrap_or(palette.surface))
+                .add_modifier(Modifier::BOLD);
+            lines.push(Line::from(vec![
+                Span::styled(label, style),
+                Span::styled(format!(" {status}"), status_style),
+            ]));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -4113,25 +4332,13 @@ fn workspace_status_summary(snapshot: &Session, workspace_id: &str, markers: &st
             _ => {}
         }
     }
-    let ascii = markers.eq_ignore_ascii_case("ascii");
+    let (_, att_glyph, busy_glyph, done_glyph) = status_marker_glyphs(markers);
     if attention > 0 {
-        if ascii {
-            format!("?{attention}")
-        } else {
-            format!("🙋{attention}")
-        }
+        format!("{att_glyph}{attention}")
     } else if busy > 0 {
-        if ascii {
-            format!("*{busy}")
-        } else {
-            format!("🔄{busy}")
-        }
+        format!("{busy_glyph}{busy}")
     } else if done > 0 {
-        if ascii {
-            format!("+{done}")
-        } else {
-            format!("✅{done}")
-        }
+        format!("{done_glyph}{done}")
     } else {
         String::new()
     }
@@ -4665,7 +4872,7 @@ fn workspace_list_item(
     let second = if sidebar_collapsed {
         None
     } else {
-        workspace_second_line_text(snapshot, workspace, second_line)
+        workspace_second_line_text(snapshot, workspace, second_line, status_markers)
             .filter(|line| !line.is_empty())
             .map(|line| {
                 // Indent second line under the name (past the 2-char prefix).
@@ -4689,15 +4896,31 @@ fn workspace_list_item(
         .add_modifier(Modifier::BOLD);
     let hover_style = selected_row_style(palette);
 
+    // Active/hovered rows keep the row fill but still tint the status marker —
+    // dots carry their meaning in color, so they must stay colored on the
+    // currently selected workspace too.
+    let filled_row = |row_style: Style| -> Vec<Span<'static>> {
+        let mut spans: Vec<Span<'static>> = segments
+            .iter()
+            .filter(|(text, _)| !text.is_empty())
+            .map(|(text, seg)| {
+                let style = match seg {
+                    SidebarSeg::Status => Style::default()
+                        .fg(status_marker_color(&status, palette))
+                        .bg(row_style.bg.unwrap_or(palette.background))
+                        .add_modifier(Modifier::BOLD),
+                    _ => row_style,
+                };
+                Span::styled(text.clone(), style)
+            })
+            .collect();
+        pad_spans_to_width(&mut spans, usable_width, row_style);
+        spans
+    };
     let spans: Vec<Span<'static>> = if active {
-        let text: String = segments.into_iter().map(|(text, _)| text).collect();
-        vec![Span::styled(
-            pad_to_width(&text, usable_width),
-            active_style,
-        )]
+        filled_row(active_style)
     } else if hovered {
-        let text: String = segments.into_iter().map(|(text, _)| text).collect();
-        vec![Span::styled(pad_to_width(&text, usable_width), hover_style)]
+        filled_row(hover_style)
     } else {
         // Ordinary row: tint the pin and status marker so they read at a glance.
         let base = Style::default().fg(palette.text).bg(palette.background);
@@ -4783,6 +5006,7 @@ fn workspace_second_line_text(
     snapshot: &Session,
     workspace: &crate::model::Workspace,
     second_line: UiWorkspaceSecondLine,
+    status_markers: &str,
 ) -> Option<String> {
     match second_line {
         UiWorkspaceSecondLine::Path => Some(short_path(&workspace.cwd)),
@@ -4815,8 +5039,7 @@ fn workspace_second_line_text(
                 .into_iter()
                 .map(|id| id.to_string())
                 .collect();
-            // Status second-line uses emoji markers (config applies in sidebar chip).
-            let status = workspace_status(snapshot, &all_panes, "emoji");
+            let status = workspace_status(snapshot, &all_panes, status_markers);
             if status.is_empty() {
                 Some("idle".to_string())
             } else {
@@ -4845,15 +5068,20 @@ enum SidebarSeg {
 }
 
 /// Color for a workspace status marker so severity reads at a glance.
-/// Supports both emoji markers (❌🙋🔄✅) and legacy ASCII (!? * +).
+/// Supports dot markers (✖◉●○, the default), emoji (❌🙋🔄✅), and legacy
+/// ASCII (!? * +).
 fn status_marker_color(status: &str, palette: ThemePalette) -> Color {
-    if status.contains('❌') || status.starts_with('!') {
+    if status.contains('❌') || status.contains('✖') || status.starts_with('!') {
         palette.danger
-    } else if status.contains('🙋') || status.contains('⚠') || status.starts_with('?') {
+    } else if status.contains('🙋')
+        || status.contains('◉')
+        || status.contains('⚠')
+        || status.starts_with('?')
+    {
         palette.warning
-    } else if status.contains('🔄') || status.starts_with('*') {
+    } else if status.contains('🔄') || status.contains('●') || status.starts_with('*') {
         palette.command
-    } else if status.contains('✅') || status.starts_with('+') {
+    } else if status.contains('✅') || status.contains('○') || status.starts_with('+') {
         palette.success
     } else {
         palette.muted
@@ -5262,6 +5490,9 @@ struct WorkspaceTabChip {
     label: String,
     /// Column offset within `label` where the close `×` starts, if closable.
     close_start: Option<usize>,
+    /// The status marker embedded at the start of `label` (` {status} …`),
+    /// kept separately so the renderer can tint it per-status.
+    status: Option<String>,
 }
 
 fn workspace_tab_chips(
@@ -5282,6 +5513,7 @@ fn workspace_tab_chips(
             } else {
                 format!(" {status} {title}")
             };
+            let status = (!status.is_empty()).then_some(status);
             if can_close {
                 // " title × " — close glyph is always the last non-space character.
                 let head = format!("{body} ");
@@ -5290,12 +5522,14 @@ fn workspace_tab_chips(
                     tab_id: tab.id.clone(),
                     label: format!("{head}× "),
                     close_start: Some(close_start),
+                    status,
                 }
             } else {
                 WorkspaceTabChip {
                     tab_id: tab.id.clone(),
                     label: format!("{body} "),
                     close_start: None,
+                    status,
                 }
             }
         })
@@ -5317,6 +5551,11 @@ fn draw_workspace_tab_bar(
     let mut spans = Vec::new();
     for chip in workspace_tab_chips(snapshot, workspace, status_markers, tab_close_button) {
         let active = workspace.active_tab.as_deref() == Some(chip.tab_id.as_str());
+        let chip_bg = if active {
+            palette.active
+        } else {
+            palette.surface
+        };
         let style = if active {
             Style::default()
                 .fg(palette.on_accent)
@@ -5325,10 +5564,30 @@ fn draw_workspace_tab_bar(
         } else {
             Style::default().fg(palette.muted).bg(palette.surface)
         };
+        // Tint the leading status marker per-status (dots read by color), then
+        // hand the remainder of the label to the close-× split below.
+        let (rest, rest_offset) = match chip.status.as_deref() {
+            Some(status) if chip.label.starts_with(&format!(" {status}")) => {
+                spans.push(Span::styled(" ".to_string(), style));
+                spans.push(Span::styled(
+                    status.to_string(),
+                    Style::default()
+                        .fg(status_marker_color(status, palette))
+                        .bg(chip_bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let prefix = format!(" {status}");
+                (
+                    chip.label[prefix.len()..].to_string(),
+                    UnicodeWidthStr::width(prefix.as_str()),
+                )
+            }
+            _ => (chip.label.clone(), 0),
+        };
         // Paint close × in danger color when present so it's clickable-looking.
         if let Some(close_start) = chip.close_start {
-            let head: String = chip
-                .label
+            let close_start = close_start.saturating_sub(rest_offset);
+            let head: String = rest
                 .chars()
                 .scan(0usize, |col, ch| {
                     let start = *col;
@@ -5338,8 +5597,7 @@ fn draw_workspace_tab_bar(
                 .take_while(|(start, _)| *start < close_start)
                 .map(|(_, ch)| ch)
                 .collect();
-            let tail: String = chip
-                .label
+            let tail: String = rest
                 .chars()
                 .scan(0usize, |col, ch| {
                     let start = *col;
@@ -5350,20 +5608,13 @@ fn draw_workspace_tab_bar(
                 .map(|(_, ch)| ch)
                 .collect();
             spans.push(Span::styled(head, style));
-            let close_style = if active {
-                Style::default()
-                    .fg(palette.danger)
-                    .bg(palette.active)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(palette.danger)
-                    .bg(palette.surface)
-                    .add_modifier(Modifier::BOLD)
-            };
+            let close_style = Style::default()
+                .fg(palette.danger)
+                .bg(chip_bg)
+                .add_modifier(Modifier::BOLD);
             spans.push(Span::styled(tail, close_style));
         } else {
-            spans.push(Span::styled(chip.label, style));
+            spans.push(Span::styled(rest, style));
         }
         spans.push(Span::raw(" "));
     }
@@ -6169,8 +6420,8 @@ fn draw_single_pane(
                 Style::default().fg(palette.border),
             )
         };
-        // Outer chrome uses the base background; pane content uses surface_alt so
-        // the terminal body is slightly distinct from the surrounding chrome.
+        // Outer chrome keeps the theme background; the pane body deliberately
+        // does not (see Paragraph below).
         let block = Block::default()
             .title(Span::styled(title, title_style))
             .borders(Borders::ALL)
@@ -6188,8 +6439,17 @@ fn draw_single_pane(
             show_cursor,
         );
         frame.render_widget(block, area);
+        // Pane bodies render on the terminal's OWN default colors (herdr-style)
+        // instead of a theme surface: agents probe the terminal background
+        // (OSC 11), paint panels derived from the answer, and only blend when
+        // the cells around them really are that color. Theme colors stay on
+        // the chrome (borders, sidebar, bars). Never `surface_alt` here — that
+        // wash is what made Claude Code's native grey bands look unnatural.
+        // Clear first so a previous frame's theme cells cannot bleed through
+        // on short lines / empty rows.
+        frame.render_widget(Clear, content);
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(palette.text).bg(palette.surface_alt)),
+            Paragraph::new(text).style(Style::default().fg(Color::Reset).bg(Color::Reset)),
             content,
         );
         // Phone-fit: the PTY is being held smaller than this layout box by a
@@ -6663,18 +6923,21 @@ fn pane_lines_for_view(
     if let Some(selection) = selection.filter(|_| scroll_offset == 0) {
         lines = highlight_selection_lines(lines, selection, content_area, palette);
     }
-    // Active pane only: paint a bright block at the PTY cursor (caller gates blink).
-    if scroll_offset == 0 && cursor_blink_on {
-        apply_cursor_marker(
-            &mut lines,
-            pane.cursor_row,
-            pane.cursor_col,
-            pane.screen_rows,
-            view_height,
-            palette,
-        );
-    }
+    // Caret is the host terminal cursor (`frame.set_cursor`), not a painted
+    // cell. Keeping `cursor_blink_on` in the signature so call sites stay
+    // stable; it no longer affects cell styles.
+    let _ = (cursor_blink_on, palette);
     lines
+}
+
+/// DECSCUSR host caret: blinking block when enabled, steady otherwise.
+fn apply_host_cursor_style(blink: bool) {
+    let style = if blink {
+        SetCursorStyle::BlinkingBlock
+    } else {
+        SetCursorStyle::SteadyBlock
+    };
+    let _ = execute!(io::stdout(), style);
 }
 
 /// Map a PTY screen-row cursor into the pane content view (bottom-aligned live
@@ -6703,36 +6966,6 @@ fn cursor_view_row(
     Some(crow - first_visible)
 }
 
-/// Bright block-mark the cell under the PTY cursor (active pane only).
-fn apply_cursor_marker(
-    lines: &mut Vec<Line<'static>>,
-    cursor_row: Option<u16>,
-    cursor_col: Option<u16>,
-    screen_rows: Option<u16>,
-    view_height: usize,
-    palette: ThemePalette,
-) {
-    let (Some(crow), Some(ccol)) = (cursor_row, cursor_col) else {
-        return;
-    };
-    // Pad so trailing empty PTY rows (stripped from contents) still exist for
-    // a cursor sitting on a blank prompt line at the bottom of the screen.
-    while lines.len() < view_height {
-        lines.push(Line::from(""));
-    }
-    let Some(view_row) = cursor_view_row(crow, screen_rows, view_height, lines.len()) else {
-        return;
-    };
-    while lines.len() <= view_row {
-        lines.push(Line::from(""));
-    }
-    if view_row >= lines.len() {
-        return;
-    }
-    let line = std::mem::replace(&mut lines[view_row], Line::from(""));
-    lines[view_row] = invert_cell_at_column(line, ccol as usize, palette);
-}
-
 /// Absolute host-terminal position for the active pane's PTY caret, if visible.
 fn host_cursor_position(
     pane: &crate::model::Pane,
@@ -6754,76 +6987,6 @@ fn host_cursor_position(
         content.x.saturating_add(col),
         content.y.saturating_add(view_row as u16),
     ))
-}
-
-/// Reverse-video / block-mark the display cell at column `col` (0-based,
-/// unicode-width aware). Pads the line when the cursor sits past its end.
-fn invert_cell_at_column(line: Line<'static>, col: usize, palette: ThemePalette) -> Line<'static> {
-    let mut cells: Vec<(char, Style)> = Vec::new();
-    for span in line.spans {
-        let style = span.style;
-        for ch in span.content.chars() {
-            cells.push((ch, style));
-        }
-    }
-    let mut display_col = 0usize;
-    let mut cursor_idx = None;
-    for (idx, (ch, _)) in cells.iter().enumerate() {
-        let w = UnicodeWidthChar::width(*ch).unwrap_or(0).max(1);
-        if display_col == col || (display_col < col && display_col + w > col) {
-            cursor_idx = Some(idx);
-            break;
-        }
-        display_col += w;
-    }
-    if cursor_idx.is_none() {
-        while display_col < col {
-            cells.push((' ', Style::default()));
-            display_col += 1;
-        }
-        cells.push((' ', Style::default()));
-        cursor_idx = Some(cells.len() - 1);
-    }
-    let idx = cursor_idx.expect("cursor index set");
-    let (ch, _style) = cells[idx];
-    // Bright theme accent block — never reverse-video black (apps often use
-    // black fg which made the old swap-style caret invisible).
-    let paint_style = Style::default()
-        .fg(palette.on_cursor)
-        .bg(palette.cursor)
-        .add_modifier(Modifier::BOLD);
-    let paint_ch = if ch == ' ' || ch == '\t' { '█' } else { ch };
-    cells[idx] = (paint_ch, paint_style);
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut run_style: Option<Style> = None;
-    for (ch, style) in cells {
-        if run_style != Some(style) {
-            if let Some(prev) = run_style {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), prev));
-                }
-            }
-            run_style = Some(style);
-        }
-        buf.push(ch);
-    }
-    if let Some(prev) = run_style {
-        if !buf.is_empty() {
-            spans.push(Span::styled(buf, prev));
-        }
-    }
-    if spans.is_empty() {
-        spans.push(Span::styled(
-            "█".to_string(),
-            Style::default()
-                .fg(palette.active)
-                .bg(palette.surface_alt)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    Line::from(spans)
 }
 
 fn ansi_to_lines(text: &str) -> Vec<Line<'static>> {
@@ -6853,6 +7016,35 @@ fn ansi_to_lines(text: &str) -> Vec<Line<'static>> {
                                 let count = target.saturating_sub(col);
                                 plain.push_str(&" ".repeat(count));
                                 col = target;
+                            }
+                        } else if next == 'X' {
+                            // ECH — erase N cells with the current attributes
+                            // (TUIs use this for bg-coloured blanks). Emit
+                            // spaces so the style is painted.
+                            let count = csi_count(&sequence);
+                            plain.push_str(&" ".repeat(count));
+                            col = col.saturating_add(count);
+                        } else if next == 'K' {
+                            // EL — erase in line. Without a known terminal
+                            // width we cannot fill to the true edge; mark a
+                            // generous run of spaces under the current style
+                            // so status-bar backgrounds are not silently
+                            // dropped when a stale serializer still emits K.
+                            // Prefer the cell-accurate daemon path
+                            // (`row_contents_ansi`) which never needs this.
+                            let mode = sequence
+                                .split([';', ':'])
+                                .find_map(|p| p.parse::<u16>().ok())
+                                .unwrap_or(0);
+                            // 0/default: cursor→EOL; 1: start→cursor; 2: whole line.
+                            // We only expand forward (0/2); mode 1 is rare for TUIs.
+                            if mode == 0 || mode == 2 {
+                                const EL_PAD: usize = 512;
+                                let pad = EL_PAD.saturating_sub(col);
+                                if pad > 0 {
+                                    plain.push_str(&" ".repeat(pad));
+                                    col = col.saturating_add(pad);
+                                }
                             }
                         }
                         break;
@@ -7071,9 +7263,19 @@ fn apply_sgr(sequence: &str, mut style: Style) -> Style {
             2 => style = style.add_modifier(Modifier::DIM),
             3 => style = style.add_modifier(Modifier::ITALIC),
             4 => style = style.add_modifier(Modifier::UNDERLINED),
+            5 | 6 => style = style.add_modifier(Modifier::SLOW_BLINK),
+            // The daemon emits ;7 for every inverse cell; dropping it made
+            // selected menu rows and cursors in agent TUIs render unstyled.
+            7 => style = style.add_modifier(Modifier::REVERSED),
+            8 => style = style.add_modifier(Modifier::HIDDEN),
+            9 => style = style.add_modifier(Modifier::CROSSED_OUT),
             22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
             23 => style = style.remove_modifier(Modifier::ITALIC),
             24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            25 => style = style.remove_modifier(Modifier::SLOW_BLINK),
+            27 => style = style.remove_modifier(Modifier::REVERSED),
+            28 => style = style.remove_modifier(Modifier::HIDDEN),
+            29 => style = style.remove_modifier(Modifier::CROSSED_OUT),
             30..=37 => style = style.fg(ansi_index_color((codes[index] - 30) as u8)),
             39 => style = style.fg(Color::Reset),
             40..=47 => style = style.bg(ansi_index_color((codes[index] - 40) as u8)),
@@ -7588,6 +7790,75 @@ fn resize_drag_direction(
     }
 }
 
+/// Inputs the snapshot long-poll thread re-reads before every request.
+struct SnapshotPollParams {
+    /// Panes the user is scrolled back in (need scrollback strings).
+    scrollback_panes: Vec<String>,
+    /// Bumped whenever `scrollback_panes` changes; makes the poller drop its
+    /// `since` once so the next response is full rather than `unchanged`.
+    epoch: u64,
+}
+
+/// Long-poll `Snapshot { wait_ms }` loop on its own thread. Each response that
+/// carries data is pushed to the UI over `tx`; the daemon parks the request
+/// until its generation moves, so pane output arrives event-driven instead of
+/// on the UI's timer. Exits when the UI drops the receiver.
+fn spawn_snapshot_poller(
+    session: String,
+    shared: Arc<Mutex<SnapshotPollParams>>,
+    tx: mpsc::Sender<protocol::Response>,
+) {
+    std::thread::spawn(move || {
+        let Ok(socket) = paths::socket_path(&session) else {
+            return;
+        };
+        let mut since: Option<u64> = None;
+        let mut seen_epoch = 0u64;
+        loop {
+            let (scrollback_panes, epoch) = {
+                let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+                (shared.scrollback_panes.clone(), shared.epoch)
+            };
+            if epoch != seen_epoch {
+                seen_epoch = epoch;
+                since = None;
+            }
+            let request = Request::Snapshot {
+                since,
+                full: true,
+                lean: true,
+                scrollback_panes,
+                wait_ms: Some(25_000),
+            };
+            match protocol::request_with_retry(&socket, &request) {
+                Ok(response) => {
+                    let data = response.data.as_ref();
+                    if let Some(gen) = data
+                        .and_then(|data| data.get("generation"))
+                        .and_then(|gen| gen.as_u64())
+                    {
+                        since = Some(gen);
+                    }
+                    let unchanged = data
+                        .and_then(|data| data.get("unchanged"))
+                        .and_then(|flag| flag.as_bool())
+                        .unwrap_or(false);
+                    if !unchanged && tx.send(response).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    // Daemon briefly unreachable (restarting?): back off and
+                    // resync from scratch; the UI's safety-net poll surfaces a
+                    // hard failure to the user if it persists.
+                    since = None;
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+    });
+}
+
 fn point_in_rect(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x
         && column < area.x.saturating_add(area.width)
@@ -7630,17 +7901,31 @@ fn workspace_status(snapshot: &Session, pane_ids: &[String], markers: &str) -> S
             _ => {}
         }
     }
-    let ascii = markers.eq_ignore_ascii_case("ascii");
+    let (err_glyph, att_glyph, busy_glyph, done_glyph) = status_marker_glyphs(markers);
     if error > 0 {
-        status_marker(if ascii { "!" } else { "❌" }, error)
+        status_marker(err_glyph, error)
     } else if attention > 0 {
-        status_marker(if ascii { "?" } else { "🙋" }, attention)
+        status_marker(att_glyph, attention)
     } else if busy > 0 {
-        status_marker(if ascii { "*" } else { "🔄" }, busy)
+        status_marker(busy_glyph, busy)
     } else if done > 0 {
-        status_marker(if ascii { "+" } else { "✅" }, done)
+        status_marker(done_glyph, done)
     } else {
         String::new()
+    }
+}
+
+/// Marker glyphs for one `ui.status_markers` mode: (error, attention, busy,
+/// done). Dots are the default; every status gets a distinct glyph so
+/// monochrome contexts (workspace picker, tab chips) stay readable, and the
+/// colored contexts tint them via `status_marker_color`.
+fn status_marker_glyphs(markers: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    if markers.eq_ignore_ascii_case("ascii") {
+        ("!", "?", "*", "+")
+    } else if markers.eq_ignore_ascii_case("emoji") {
+        ("❌", "🙋", "🔄", "✅")
+    } else {
+        ("✖", "◉", "●", "○")
     }
 }
 
@@ -7751,7 +8036,7 @@ fn session_footer(snapshot: &Session, mode: UiMode, notification_selected: usize
             format!("{base} commands type to filter ↑/↓ select Enter run Esc clear/close ")
         }
         UiMode::Settings => {
-            format!("{base} settings j/k select h/l or Enter change/install Esc close ")
+            format!("{base} settings Tab page j/k select h/l or Enter change/install Esc close ")
         }
         UiMode::WorkspacePicker => {
             format!("{base} ☰ workspaces j/k select Enter open Esc close ")
@@ -7825,16 +8110,34 @@ fn visible_notifications(snapshot: &Session) -> Vec<&crate::model::Notification>
 fn notification_status_style(
     note: &crate::model::Notification,
     palette: ThemePalette,
+    markers: &str,
 ) -> (&'static str, Color) {
+    let (err_glyph, att_glyph, busy_glyph, done_glyph) = status_marker_glyphs(markers);
+    let emoji_mode = markers.eq_ignore_ascii_case("emoji");
+    let ascii_mode = markers.eq_ignore_ascii_case("ascii");
+    let idle_glyph = if emoji_mode {
+        "💤"
+    } else if ascii_mode {
+        "z"
+    } else {
+        "·"
+    };
+    let bell_glyph = if emoji_mode {
+        "🔔"
+    } else if ascii_mode {
+        "*"
+    } else {
+        "●"
+    };
     let status = note.status.as_deref().unwrap_or("");
     match status {
-        "busy" | "running" | "working" => ("🔄", palette.command),
+        "busy" | "running" | "working" => (busy_glyph, palette.command),
         "attention" | "needs-input" | "needs_input" | "waiting" | "blocked" | "approval" => {
-            ("🙋", palette.warning)
+            (att_glyph, palette.warning)
         }
-        "done" | "complete" => ("✅", palette.success),
-        "error" | "failed" => ("❌", palette.danger),
-        "idle" => ("💤", palette.muted),
+        "done" | "complete" => (done_glyph, palette.success),
+        "error" | "failed" => (err_glyph, palette.danger),
+        "idle" => (idle_glyph, palette.muted),
         _ => match note
             .color
             .as_deref()
@@ -7842,11 +8145,11 @@ fn notification_status_style(
             .to_ascii_lowercase()
             .as_str()
         {
-            "yellow" | "gold" => ("🔔", palette.warning),
-            "green" => ("🔔", palette.success),
-            "red" => ("🔔", palette.danger),
-            "blue" | "cyan" => ("🔔", palette.command),
-            _ => ("🔔", palette.active),
+            "yellow" | "gold" => (bell_glyph, palette.warning),
+            "green" => (bell_glyph, palette.success),
+            "red" => (bell_glyph, palette.danger),
+            "blue" | "cyan" => (bell_glyph, palette.command),
+            _ => (bell_glyph, palette.active),
         },
     }
 }
@@ -7934,8 +8237,9 @@ fn notification_card_lines(
     state: NotifCardState,
     width: usize,
     palette: ThemePalette,
+    status_markers: &str,
 ) -> Vec<Line<'static>> {
-    let (emoji, status_accent) = notification_status_style(note, palette);
+    let (emoji, status_accent) = notification_status_style(note, palette, status_markers);
     let (workspace, tab, agent) = notification_context_labels(snapshot, note);
     let (bg, fg) = notification_card_fill(state, palette);
     let selected = state == NotifCardState::Selected;
@@ -8032,7 +8336,7 @@ fn notification_panel_lines(snapshot: &Session, selected: usize) -> Vec<String> 
         .into_iter()
         .enumerate()
         .map(|(index, note)| {
-            let (emoji, _) = notification_status_style(note, UiTheme::Midnight.palette());
+            let (emoji, _) = notification_status_style(note, UiTheme::Midnight.palette(), "emoji");
             let (workspace, tab, agent) = notification_context_labels(snapshot, note);
             let marker = if index == selected { "›" } else { " " };
             format!(
@@ -8288,6 +8592,7 @@ mod tests {
                     "",
                     "Ctrl-b",
                     0,
+                    SettingsTab::Ui,
                     0,
                     None,
                     None,
@@ -8309,6 +8614,7 @@ mod tests {
                     "launch",
                     true,
                     false,
+                    false, // resume_agents
                     false,
                     "auto",
                     4399,
@@ -8374,6 +8680,7 @@ mod tests {
                     "",
                     "Ctrl-b",
                     0,
+                    SettingsTab::Ui,
                     0,
                     None,
                     None,
@@ -8395,6 +8702,7 @@ mod tests {
                     "launch",
                     true,
                     false,
+                    false, // resume_agents
                     false,
                     "auto",
                     4399,
@@ -9134,26 +9442,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_cursor_marker_paints_block_on_empty_cell() {
-        let palette = UiTheme::Midnight.palette();
-        let mut lines = vec![Line::from("hello"), Line::from("")];
-        apply_cursor_marker(&mut lines, Some(1), Some(0), Some(2), 2, palette);
-        let text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains('█') || text.contains(' '),
-            "expected cursor block on empty line, got {text:?}"
-        );
-        // Cursor style should differ from default (reversed / accent bg).
-        assert!(
-            lines[1]
-                .spans
-                .iter()
-                .any(|s| { s.style.bg.is_some() || s.style.add_modifier.contains(Modifier::BOLD) }),
-            "cursor cell should be styled"
-        );
-    }
-
-    #[test]
     fn cursor_view_row_maps_screen_coords_into_smaller_pane() {
         // PTY is 40 rows; pane shows bottom 10. Cursor on last screen row → view row 9.
         assert_eq!(cursor_view_row(39, Some(40), 10, 10), Some(9));
@@ -9164,28 +9452,21 @@ mod tests {
     }
 
     #[test]
-    fn apply_cursor_marker_handles_screen_taller_than_view() {
-        let palette = UiTheme::Midnight.palette();
-        // View only has 3 lines (already tailed); PTY screen is 10 rows; cursor at row 9.
-        let mut lines = vec![Line::from("a"), Line::from("b"), Line::from("c")];
-        apply_cursor_marker(&mut lines, Some(9), Some(0), Some(10), 3, palette);
-        let text: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.contains('█') || lines[2].spans.iter().any(|s| s.style.bg.is_some()),
-            "cursor at bottom of tall screen should paint on last view line, got {text:?}"
+    fn host_cursor_position_maps_pty_coords_into_content_rect() {
+        let mut pane = crate::model::Pane::new(
+            "p".to_string(),
+            "bash".to_string(),
+            crate::cli::SplitDirection::Right,
         );
-    }
-
-    #[test]
-    fn invert_cell_at_column_marks_character() {
-        let palette = UiTheme::Midnight.palette();
-        let line = Line::from("abc");
-        let painted = invert_cell_at_column(line, 1, palette);
-        let text: String = painted.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "abc");
-        // Middle cell should carry cursor styling.
-        assert!(painted.spans.iter().any(|s| s.content.as_ref() == "b"
-            && (s.style.bg.is_some() || s.style.add_modifier.contains(Modifier::BOLD))));
+        pane.cursor_row = Some(5);
+        pane.cursor_col = Some(3);
+        pane.screen_rows = Some(10);
+        let content = Rect::new(2, 4, 40, 6);
+        // Live window is bottom 6 of 10 rows → first_visible=4; row 5 → view 1.
+        // Host x = content.x + col = 2+3; y = content.y + view_row = 4+1.
+        assert_eq!(host_cursor_position(&pane, content, 0), Some((5, 5)));
+        // Scrolled back: host caret hidden.
+        assert_eq!(host_cursor_position(&pane, content, 1), None);
     }
 
     #[test]
@@ -9340,6 +9621,63 @@ mod tests {
         assert_eq!(lines[0].spans[1].style.fg, Some(Color::Red));
         assert_eq!(lines[0].spans[2].content.as_ref(), " normal");
         assert_eq!(lines[0].spans[2].style.fg, None);
+    }
+
+    #[test]
+    fn ansi_to_lines_expands_el_and_ech_as_styled_spaces() {
+        // vt100 rows_formatted emits ESC [ K for empty cells with bg; without
+        // expansion the grey status bar would stop mid-line (Claude Code).
+        let lines = ansi_to_lines("\x1b[48;2;55;55;55mshort\x1b[K");
+        assert_eq!(lines.len(), 1);
+        let total: usize = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert!(
+            total > 5,
+            "EL must expand into spaces under the current bg, got {total} cells: {:?}",
+            lines[0]
+        );
+        let has_grey_bg = lines[0]
+            .spans
+            .iter()
+            .any(|s| matches!(s.style.bg, Some(Color::Rgb(55, 55, 55))) && s.content.contains(' '));
+        assert!(
+            has_grey_bg,
+            "expanded spaces must keep the grey bg: {:?}",
+            lines[0]
+        );
+
+        let ech = ansi_to_lines("\x1b[48;2;1;2;3m\x1b[5Xdone");
+        let ech_spaces: usize = ech[0]
+            .spans
+            .iter()
+            .filter(|s| matches!(s.style.bg, Some(Color::Rgb(1, 2, 3))))
+            .map(|s| s.content.chars().filter(|c| *c == ' ').count())
+            .sum();
+        assert!(ech_spaces >= 5, "ECH must emit styled spaces: {:?}", ech[0]);
+    }
+
+    #[test]
+    fn ansi_to_lines_preserves_inverse_and_dim() {
+        // The daemon emits ;7 for every inverse cell (selected rows, block
+        // cursors in agent TUIs); dropping it rendered them as plain text.
+        let lines = ansi_to_lines("\x1b[0;7mselected\x1b[27m \x1b[2mfaint\x1b[22mnormal");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "selected");
+        assert!(lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert!(!lines[0].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert_eq!(lines[0].spans[2].content.as_ref(), "faint");
+        assert!(lines[0].spans[2].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(lines[0].spans[3].content.as_ref(), "normal");
+        assert!(!lines[0].spans[3].style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -9745,6 +10083,39 @@ mod tests {
     }
 
     #[test]
+    fn host_terminal_color_replies_parse_and_scale() {
+        // kitty/xterm style 16-bit reply, BEL-terminated, with DA1 after.
+        let raw = b"\x1b]10;rgb:e5e5/c7c7/8a8a\x07\x1b]11;rgb:1616/1717/2121\x1b\\\x1b[?62;22c";
+        assert_eq!(parse_osc_color_reply(raw, 10).as_deref(), Some("#e5c78a"));
+        assert_eq!(parse_osc_color_reply(raw, 11).as_deref(), Some("#161721"));
+        assert!(da1_reply_present(raw));
+        // 8-bit components scale through unchanged.
+        assert_eq!(
+            parse_osc_color_reply(b"\x1b]11;rgb:28/28/28\x07", 11).as_deref(),
+            Some("#282828")
+        );
+        // Garbage in, None out — never a panic, never a bogus color.
+        assert_eq!(parse_osc_color_reply(b"\x1b]11;rgb:zz/00/00\x07", 11), None);
+        assert_eq!(parse_osc_color_reply(b"no reply at all", 11), None);
+        assert!(!da1_reply_present(b"\x1b[31mred\x1b[0m"));
+    }
+
+    #[test]
+    fn status_marker_dots_mode_has_distinct_colorable_glyphs() {
+        assert_eq!(status_marker_glyphs("dots"), ("✖", "◉", "●", "○"));
+        assert_eq!(status_marker_glyphs("emoji"), ("❌", "🙋", "🔄", "✅"));
+        assert_eq!(status_marker_glyphs("ascii"), ("!", "?", "*", "+"));
+
+        // The reverse color map must tell the dot glyphs apart, or every
+        // status would tint the same in the sidebar.
+        let palette = UiTheme::Midnight.palette();
+        assert_eq!(status_marker_color("✖", palette), palette.danger);
+        assert_eq!(status_marker_color("◉2", palette), palette.warning);
+        assert_eq!(status_marker_color("●", palette), palette.command);
+        assert_eq!(status_marker_color("○3", palette), palette.success);
+    }
+
+    #[test]
     fn settings_panel_lines_include_theme_and_selection() {
         let lines = settings_panel_lines(SettingsView {
             theme: UiTheme::Daylight,
@@ -9763,6 +10134,7 @@ mod tests {
             mouse: true,
             tab_close_button: true,
             bell_on_attention: false,
+            resume_agents: true,
             mobile_relay_enabled: false,
             mobile_relay_bind: "auto",
             mobile_relay_port: 4399,
@@ -9775,6 +10147,7 @@ mod tests {
             ports_notify: "toast",
             ports_auto_forward: false,
             ports_poll_secs: 2,
+            active_tab: SettingsTab::Ui,
             selected: 0,
         });
 
@@ -9796,42 +10169,32 @@ mod tests {
             .contains("sidebar fit text"));
         assert!(lines[5].spans[0].content.as_ref().contains("sidebar width"));
         assert!(lines[5].spans[0].content.as_ref().contains("24"));
-        assert!(lines.iter().any(|line| {
-            line.spans
-                .first()
-                .map(|s| s.content.as_ref().contains("agent hooks"))
-                .unwrap_or(false)
-        }));
-        assert!(lines.iter().any(|line| {
-            line.spans
-                .first()
-                .map(|s| s.content.as_ref().contains("mobile relay"))
-                .unwrap_or(false)
-        }));
-        assert!(lines.iter().any(|line| {
-            line.spans
-                .first()
-                .map(|s| s.content.as_ref().contains("relay port"))
-                .unwrap_or(false)
-        }));
-        assert!(lines.iter().any(|line| {
-            line.spans
-                .first()
-                .map(|s| s.content.as_ref().contains("port detection"))
-                .unwrap_or(false)
-        }));
-        assert!(lines.iter().any(|line| {
-            line.spans
-                .first()
-                .map(|s| s.content.as_ref().contains("claude code"))
-                .unwrap_or(false)
-        }));
-        assert!(lines.iter().any(|line| {
-            line.spans
-                .first()
-                .map(|s| s.content.as_ref().contains("install all hooks"))
-                .unwrap_or(false)
-        }));
+        // Rows that used to sit under `── section ──` headers now live on
+        // their own tabs.
+        let names_for = |tab: SettingsTab| {
+            settings_entries_for_tab(tab)
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        };
+        let relay = names_for(SettingsTab::Relay);
+        assert!(relay.contains(&"mobile relay"));
+        assert!(relay.contains(&"relay port"));
+        let ports = names_for(SettingsTab::Ports);
+        assert!(ports.contains(&"port detection"));
+        let hooks = names_for(SettingsTab::Hooks);
+        assert!(hooks.contains(&"claude code"));
+        assert!(hooks.contains(&"install all hooks"));
+        // Tab strip names every page.
+        let strip = settings_tab_strip(SettingsTab::Ui, UiTheme::Daylight);
+        let strip_text: String = strip[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        for tab in SettingsTab::ALL {
+            assert!(strip_text.contains(tab.label()), "{strip_text}");
+        }
         assert_eq!(lines[0].spans[0].style.bg, Some(Color::Yellow));
     }
 
@@ -9846,6 +10209,7 @@ mod tests {
                 &session,
                 &session.workspaces[0],
                 UiWorkspaceSecondLine::Path,
+                "emoji",
             )
             .as_deref(),
             Some("~/code/vmux")
@@ -9864,6 +10228,7 @@ mod tests {
                 &session,
                 &session.workspaces[0],
                 UiWorkspaceSecondLine::Cursor,
+                "emoji",
             )
             .as_deref(),
             Some("cursor 3:5")

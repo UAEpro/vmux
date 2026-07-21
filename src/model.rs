@@ -981,6 +981,11 @@ pub struct Pane {
     /// Unix time when `agent_status` last changed.
     #[serde(default)]
     pub agent_status_at: u64,
+    /// The agent CLI's own conversation id, reported by its hooks (Claude Code
+    /// `session_id`). Lets a daemon restart relaunch the agent with
+    /// `--resume <id>` (`ui.resume_agents`) instead of a fresh conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
     #[serde(default)]
     pub progress: Option<u8>,
     #[serde(default)]
@@ -1056,6 +1061,7 @@ impl Pane {
             agent_status: infer_agent_status("", &command),
             agent_status_pinned: false,
             agent_status_at: now,
+            agent_session: None,
             progress: None,
             notification_color: None,
             notification_message: None,

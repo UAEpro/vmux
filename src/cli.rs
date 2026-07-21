@@ -294,6 +294,15 @@ pub enum Command {
 
         #[arg(
             long,
+            value_delimiter = ',',
+            help = "Wait for an agent status instead of process exit \
+                    (comma-separated: busy, attention, done, error, idle; \
+                    a pane exiting also ends the wait)"
+        )]
+        status: Vec<String>,
+
+        #[arg(
+            long,
             help = "Seconds to wait before giving up (default 300; 0 waits forever)"
         )]
         timeout: Option<u64>,

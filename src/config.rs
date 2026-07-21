@@ -196,6 +196,10 @@ pub struct UiConfig {
     /// Auto-hide the workspace sidebar on narrow terminals (burger + picker).
     #[serde(default = "default_true")]
     pub sidebar_responsive: bool,
+    /// On daemon restart, relaunch agent CLIs resuming their hook-reported
+    /// conversation (`claude --resume <id>`) instead of a blank chat.
+    #[serde(default = "default_true")]
+    pub resume_agents: bool,
 }
 
 impl Default for UiConfig {
@@ -218,6 +222,7 @@ impl Default for UiConfig {
             tab_close_button: true,
             bell_on_attention: false,
             sidebar_responsive: true,
+            resume_agents: true,
         }
     }
 }
@@ -270,7 +275,7 @@ fn default_cursor_blink_ms() -> u64 {
 }
 
 fn default_status_markers() -> String {
-    "emoji".to_string()
+    "dots".to_string()
 }
 
 fn default_default_cwd() -> String {
@@ -372,6 +377,9 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
         }
         "ui.sidebar_responsive" => {
             config.ui.sidebar_responsive = parse_bool(value)?;
+        }
+        "ui.resume_agents" => {
+            config.ui.resume_agents = parse_bool(value)?;
         }
         "relay.enabled" => {
             config.relay.enabled = parse_bool(value)?;
@@ -599,7 +607,7 @@ pub fn supported_workspace_second_lines() -> Vec<&'static str> {
 }
 
 pub fn supported_status_markers() -> Vec<&'static str> {
-    vec!["emoji", "ascii", "off"]
+    vec!["dots", "emoji", "ascii", "off"]
 }
 
 pub fn supported_default_cwds() -> Vec<&'static str> {
@@ -901,7 +909,7 @@ mod tests {
         assert_eq!(config.ui.workspace_second_line, "path");
         assert!(config.ui.cursor_blink);
         assert_eq!(config.ui.cursor_blink_ms, 1000);
-        assert_eq!(config.ui.status_markers, "emoji");
+        assert_eq!(config.ui.status_markers, "dots");
         assert_eq!(config.ui.default_cwd, "launch");
         assert!(config.ui.mouse);
         assert!(config.ui.tab_close_button);

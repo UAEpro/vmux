@@ -41,11 +41,12 @@ Or open [config.schema.json](config.schema.json) directly (`$id`:
 | `ui.scrollback_bytes` | `200000` | Output retained per pane (~2500 lines). Clamped 16 KB–5 MB. **Next daemon start** |
 | `ui.theme` | see below | Color theme |
 | `ui.workspace_second_line` | `path`, `branch`, … | Second line of each sidebar workspace row |
-| `ui.status_markers` | `emoji`, `ascii`, `off` | How agent status renders in the sidebar |
+| `ui.status_markers` | `dots` (default), `emoji`, `ascii`, `off` | How agent status renders in the sidebar: colored dots (✖ error, ◉ needs input, ● busy, ○ done), emoji (❌🙋🔄✅), ASCII, or hidden |
 | `ui.cursor_blink` | `true` / `false` | Soft-blink active caret while idle |
 | `ui.cursor_blink_ms` | `1000` | Half-period of caret blink (200–5000 ms) |
 | `ui.default_shell` | `zsh`, empty | Empty = `$SHELL` |
 | `ui.default_cwd` | `launch`, `home` | New pane/workspace directory |
+| `ui.resume_agents` | `true` / `false` | On daemon restart, relaunch agents resuming their conversation (`claude --resume <id>`, `codex resume <id>`) using the session id their hooks reported. Needs `vmux hooks install`. Applies on next daemon start |
 | `ui.mouse` | `true` / `false` | Capture mouse in attach UI |
 | `ui.tab_close_button` | `true` / `false` | Show × on tabs when more than one exists |
 | `ui.bell_on_attention` | `true` / `false` | Terminal bell on attention / needs-input |
