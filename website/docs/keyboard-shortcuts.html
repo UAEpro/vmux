@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Keyboard shortcuts — vmux docs</title>
+    <meta name="description" content="The full vmux prefix-key map, mouse actions, and command palette." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/keyboard-shortcuts.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script src="../assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell" style="margin-top: 40px">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html" aria-current="page">Keyboard shortcuts</a></li>
+              <li><a href="agents.html">Agent integrations</a></li>
+              <li><a href="phone-relay.html">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Guides</p>
+          <h1>Keyboard shortcuts</h1>
+          <p class="docs-lede">
+            One prefix chord drives everything in attach. Default is <kbd>Ctrl-b</kbd>, changeable with
+            <code>vmux config set ui.prefix_key Ctrl-a</code>.
+          </p>
+
+          <h2>Prefix-key map</h2>
+          <table>
+            <thead><tr><th>Keys</th><th>Action</th></tr></thead>
+            <tbody>
+              <tr><td><kbd>Ctrl-b</kbd> + arrow</td><td>Move focus between panes</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>z</kbd></td><td>Zoom the active pane</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>[</kbd> / <kbd>]</kbd></td><td>Previous / next tab</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>t</kbd></td><td>New tab</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>w</kbd></td><td>Workspace picker (<kbd>j</kbd>/<kbd>k</kbd> or arrows, <kbd>Enter</kbd> to switch, <kbd>Esc</kbd> to close)</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>B</kbd></td><td>Toggle the sidebar</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>u</kbd></td><td>Jump to whatever just notified you</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>P</kbd></td><td>Command palette</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>G</kbd></td><td>Agent status panel</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>A</kbd></td><td>Project actions (from <code>vmux.json</code>)</td></tr>
+              <tr><td><kbd>Ctrl-b</kbd> <kbd>o</kbd></td><td>Ports panel</td></tr>
+            </tbody>
+          </table>
+
+          <h2>Ports panel</h2>
+          <p>Once the ports panel is open (<kbd>Ctrl-b</kbd> <kbd>o</kbd>, or the command palette → <em>ports</em>):</p>
+          <table>
+            <thead><tr><th>Key</th><th>Action</th></tr></thead>
+            <tbody>
+              <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Select a port</td></tr>
+              <tr><td><kbd>Enter</kbd></td><td>Focus the owning pane</td></tr>
+              <tr><td><kbd>c</kbd></td><td>Copy the <code>ssh -L</code> command (OSC 52 + local clipboard tools)</td></tr>
+              <tr><td><kbd>f</kbd></td><td>Tailscale forward</td></tr>
+              <tr><td><kbd>x</kbd></td><td>Unforward</td></tr>
+              <tr><td><kbd>r</kbd></td><td>Rescan</td></tr>
+              <tr><td><kbd>Esc</kbd></td><td>Close</td></tr>
+            </tbody>
+          </table>
+          <p>More on ports: <a href="ports.html">Ports &amp; forwarding</a>.</p>
+
+          <h2>Mouse</h2>
+          <p>The mouse works too (<code>ui.mouse</code>, default on):</p>
+          <ul>
+            <li>Wheel to scroll back in a pane's history</li>
+            <li>Right-click a pane for copy, paste, split, and clear</li>
+          </ul>
+
+          <h2>Changing the prefix key</h2>
+          <pre><code>vmux config set ui.prefix_key Ctrl-a</code></pre>
+          <p>Every shortcut above shifts to whatever chord you set — the mapping does not change, only the prefix.</p>
+
+          <div class="docs-pager">
+            <a href="configuration.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Configuration</span></a>
+            <a class="docs-pager-next" href="agents.html"><span class="docs-pager-label">Next</span><span class="docs-pager-title">Agent integrations →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/README.md">Edit this page on GitHub</a></div>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

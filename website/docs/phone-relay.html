@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Phone relay &amp; remote — vmux docs</title>
+    <meta name="description" content="Drive a vmux session from your phone over Tailscale, and paste screenshots into an agent over SSH." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/phone-relay.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script src="../assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell" style="margin-top: 40px">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html">Keyboard shortcuts</a></li>
+              <li><a href="agents.html">Agent integrations</a></li>
+              <li><a href="phone-relay.html" aria-current="page">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Guides</p>
+          <h1>Phone relay &amp; remote</h1>
+          <p class="docs-lede">
+            <code>vmux relay</code> speaks the community
+            <a href="https://github.com/NewTurn2017/cmux-remote">Cmux Remote</a> HTTP and WebSocket protocol. Point
+            that iPhone app at your Tailscale IP and the relay port (default <strong>4399</strong>, configurable) and
+            you can drive vmux workspaces and panes from your phone.
+          </p>
+          <pre><code>iPhone (Cmux Remote)  ── Tailscale ──►  vmux relay :port  ── Unix socket ──►  vmux daemon
+                                         (default 4399)</code></pre>
+          <div class="docs-callout">
+            <p>This is a compatibility layer, not an official Manaflow product. Official cmux Mobile Connect is a
+            different stack and will not work with it. Protocol drift in the App Store app may require relay
+            updates.</p>
+          </div>
+          <p>
+            The relay is <strong>on by default</strong>. On <code>vmux attach</code>, a managed relay starts if it is
+            not already running (bind: Tailscale IP when available, otherwise localhost). Starting or stopping the
+            relay does not change how attach, the CLI, or the daemon behave beyond that process.
+          </p>
+
+          <h2>The port is not fixed</h2>
+          <p>
+            The historical Cmux Remote default is <strong>4399</strong>, and vmux uses that out of the box — but the
+            port is not hard-wired.
+          </p>
+          <table>
+            <thead><tr><th>How</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td>Config (managed relay / attach auto-start)</td><td><code>vmux config set relay.port 4400</code></td></tr>
+              <tr><td>CLI override</td><td><code>vmux relay serve --listen 100.x.y.z:4400</code></td></tr>
+              <tr><td><code>relay.json</code> <code>listen</code></td><td><code>"listen": "127.0.0.1:4400"</code></td></tr>
+            </tbody>
+          </table>
+          <p>Whatever you choose, the phone app (and paste-page URLs) must use the <strong>same</strong> port.</p>
+          <p>
+            The managed phone relay is <strong>machine-global</strong>, not per <code>vmux --session</code>. Session
+            <code>default</code> and session <code>dev</code> share the same config port and the same process — a
+            second attach sees "already running" and reuses it. That is intentional: the phone app points at one
+            host:port.
+          </p>
+
+          <h2>Settings</h2>
+          <p>
+            In <code>vmux attach</code>, open <strong>⚙ set</strong> and find the mobile relay section:
+          </p>
+          <table>
+            <thead><tr><th>Setting</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td>mobile relay</td><td><code>on</code> / <code>off</code> (default <strong>on</strong>)</td></tr>
+              <tr><td>relay bind</td><td><code>auto</code> (Tailscale if online, else localhost), <code>tailscale</code>, or <code>local</code></td></tr>
+              <tr><td>relay port</td><td>TCP port (default <code>4399</code>)</td></tr>
+              <tr><td>relay localhost</td><td>Allow device registration from <code>127.0.0.1</code>, for dev</td></tr>
+              <tr><td>paste page</td><td>Serve <code>/paste</code> for screenshot paste</td></tr>
+              <tr><td>phone-fit resize</td><td>Leased view-size overrides (<code>relay.allow_view_resize</code>)</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Changing relay port / bind / toggles stays <strong>pending</strong> until you move to another row or
+            close Settings — config is then saved once and the managed relay restarted once, no multi-second lag
+            while cycling ports. There is deliberately no "all interfaces" option: the relay refuses to bind
+            <code>0.0.0.0</code> or <code>::</code>.
+          </p>
+          <pre><code>vmux config set relay.enabled true       # default
+vmux config set relay.bind auto          # auto | tailscale | local
+vmux config set relay.port 4399
+vmux config set relay.allow_localhost false
+vmux config set relay.allow_paste true
+vmux config set relay.allow_view_resize false</code></pre>
+
+          <h2>Running it by hand</h2>
+          <pre><code>vmux relay serve
+vmux relay serve --listen 127.0.0.1:4400
+vmux relay serve --allow-localhost --listen 127.0.0.1:4399
+vmux relay status
+vmux relay devices list
+vmux relay devices revoke &lt;device_id&gt;</code></pre>
+
+          <h2>Pairing a phone</h2>
+          <ol>
+            <li>Install Cmux Remote, or another client that speaks the same wire protocol.</li>
+            <li>Run Tailscale on the phone and on the host, on the same tailnet.</li>
+            <li>On the host, run <code>vmux relay serve</code> (or attach with <code>relay.enabled</code>).</li>
+            <li>In the app, set host to your <code>tailscale ip -4</code> address and the relay port.</li>
+            <li>Pair, list workspaces, open a surface.</li>
+          </ol>
+          <pre><code>PORT=4399
+curl -s http://$(tailscale ip -4):${PORT}/v1/health
+# {"ok":true,"version":"…","backend":"vmux",…}</code></pre>
+
+          <h2>Phone-fit pane sizing</h2>
+          <p>
+            Off by default — a phone glancing at a pane must not resize it under whoever is at the desk.
+          </p>
+          <pre><code>vmux config set relay.allow_view_resize true</code></pre>
+          <p>
+            Once enabled, the PTY runs at <code>min(desktop layout, phone view)</code> per axis — tmux's "smallest
+            client wins", scoped to the one pane being viewed. The lease re-signs on every poll cycle and expires
+            ~10s after the phone vanishes, so the pane always returns to its desktop size by itself. The desktop
+            attach UI dims the pane's unused margin with a "sized by phone" note while an override is active.
+          </p>
+
+          <h2>Pasting screenshots over SSH</h2>
+          <p>
+            Claude Code's Ctrl+V image paste reads the clipboard of the machine it runs on. When you SSH into a box
+            running vmux, your screenshot is on your laptop — vmux bridges that two ways.
+          </p>
+          <p>
+            <strong>The paste page</strong> — nothing to install. With the relay running, open
+            <code>http://&lt;host&gt;:&lt;port&gt;/paste</code> in any browser on your tailnet and press
+            <kbd>Cmd+V</kbd>/<kbd>Ctrl+V</kbd> (or drop an image file). The relay saves the image on the host and
+            types its path into the active pane. Works from a phone too, photo picker included.
+          </p>
+          <p><strong><code>vmux send-image</code></strong> — for the terminal, pipes image bytes over SSH:</p>
+          <pre><code># macOS (brew install pngpaste)
+pngpaste - | ssh yourbox vmux send-image -
+
+# Linux: wl-paste --type image/png (Wayland) or
+#        xclip -selection clipboard -t image/png -o (X11)
+ssh yourbox vmux send-image - &lt; ~/Desktop/Screen*.png</code></pre>
+          <p>
+            For both, <code>--pane pane-2</code> / <code>?pane=pane-2</code> targets a specific pane and
+            <code>--enter</code> / <code>?enter=1</code> submits immediately. Uploads land in
+            <code>~/Downloads/vmux-remote/</code>, capped at 16 MiB.
+          </p>
+          <p>Turn the paste page off entirely (<code>/paste</code> and <code>/v1/paste</code> then 404):</p>
+          <pre><code>vmux config set relay.allow_paste false</code></pre>
+
+          <div class="docs-pager">
+            <a href="agents.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Agent integrations</span></a>
+            <a class="docs-pager-next" href="ports.html"><span class="docs-pager-label">Next</span><span class="docs-pager-title">Ports &amp; forwarding →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/relay.md">Edit this page on GitHub</a></div>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

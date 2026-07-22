@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Concepts — vmux docs</title>
+    <meta name="description" content="Session, workspace, tab, pane — how vmux is organized and how the UI stays live." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/concepts.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script src="../assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell" style="margin-top: 40px">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html" aria-current="page">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html">Keyboard shortcuts</a></li>
+              <li><a href="agents.html">Agent integrations</a></li>
+              <li><a href="phone-relay.html">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Introduction</p>
+          <h1>Concepts</h1>
+          <p class="docs-lede">
+            The whole model in one tree, plus how vmux keeps a client's screen in sync without ever polling
+            expensively.
+          </p>
+
+          <h2>Hierarchy</h2>
+          <pre><code>Session  (default, work, …)     one daemon, one socket, one state file
+ └── Workspace                  sidebar row: cwd, git branch, ports, agent status
+      └── Tab                   strip above the pane grid
+           └── Pane             one PTY process</code></pre>
+          <p>
+            A <strong>session</strong> is one running daemon with one socket and one state file — most people only
+            ever use <code>default</code>, but a second session (<code>vmux --session dev attach</code>) is a fully
+            separate workspace tree, useful for keeping a debug build away from real work.
+          </p>
+          <p>
+            A <strong>workspace</strong> is the unit you think in: a project. It has a directory, so a new pane opens
+            where you expect, and the sidebar shows its git branch, its listening ports (see
+            <a href="ports.html">Ports &amp; forwarding</a>), and its agent's status.
+          </p>
+          <p>
+            A <strong>tab</strong> is the strip above the pane grid inside a workspace — a place to group panes for
+            one thread of work (<code>main</code>, <code>tests</code>). Tabs holding a coding agent name themselves
+            automatically; see <a href="configuration.html#automatic-tab-names">automatic tab names</a>.
+          </p>
+          <p>A <strong>pane</strong> is one PTY process — a shell, an agent, a test runner, anything with a terminal.</p>
+
+          <h2>Agents report their own state</h2>
+          <p>
+            Panes running a coding agent surface a status in the sidebar, so you can tell at a glance which of six
+            running agents is actually waiting on you:
+          </p>
+          <table>
+            <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td>🔄 busy</td><td>The agent is actively working</td></tr>
+              <tr><td>🙋 needs input</td><td>It asked a question or is blocked on you</td></tr>
+              <tr><td>✅ done</td><td>It finished. Sticky — stays until you actually look at the pane</td></tr>
+              <tr><td>❌ failed</td><td>The pane process or the agent's task exited with an error</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Status comes from <a href="agents.html">agent hooks</a>, terminal OSC titles, or a manual
+            <code>vmux set-status</code> / <code>vmux notify</code> call — see the guide for how each source is
+            weighted.
+          </p>
+
+          <h2>Persistence and detach</h2>
+          <p>
+            Panes live inside a small background daemon, not inside your terminal. Closing SSH, shutting the laptop,
+            or losing the connection does not stop anything running in a pane — reattach later and it is where you
+            left it:
+          </p>
+          <pre><code>vmux sessions               # what is still running, and what is saved on disk
+vmux --session work attach  # reattach</code></pre>
+          <p>
+            Session state — including scrollback — is written to
+            <code>~/.local/state/&lt;session&gt;.json</code> under the XDG state directory. A corrupt file is moved
+            aside rather than deleted, so a bad write never silently erases a session.
+          </p>
+
+          <h2>How the UI stays live without polling hard</h2>
+          <p>
+            The daemon keeps a generation counter that increases on every meaningful change. The attach client polls
+            for a snapshot <em>since</em> the generation it last saw; if nothing moved, the daemon replies
+            <code>{ unchanged: true }</code> and the UI skips a repaint. That is why attach feels instant even though
+            it is just a client speaking a request/response protocol — the same protocol every CLI command uses,
+            which is also why scripts and agents can drive a workspace with no special access.
+          </p>
+          <p>
+            Full architectural detail, including lock ordering and the source map, lives in
+            <a href="architecture.html">Architecture</a>.
+          </p>
+
+          <h2>The daemon is authoritative</h2>
+          <p>
+            Attach is a dumb client: it renders a snapshot and sends RPCs. It keeps no layout or pane state of its
+            own. If you script vmux from an agent or a shell, you are using the exact same interface the attach UI
+            uses — nothing is held back for a "privileged" client.
+          </p>
+
+          <div class="docs-pager">
+            <a href="getting-started.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Getting started</span></a>
+            <a class="docs-pager-next" href="configuration.html"><span class="docs-pager-label">Next</span><span class="docs-pager-title">Configuration →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/architecture.md">Edit this page on GitHub</a></div>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

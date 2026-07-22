@@ -3,6 +3,17 @@
   <url><loc>https://vmux.sh/</loc><priority>1.0</priority></url>
   <url><loc>https://vmux.sh/remote.html</loc><priority>0.8</priority></url>
   <url><loc>https://vmux.sh/install.html</loc><priority>0.8</priority></url>
+  <url><loc>https://vmux.sh/docs/</loc><priority>0.9</priority></url>
+  <url><loc>https://vmux.sh/docs/getting-started.html</loc><priority>0.8</priority></url>
+  <url><loc>https://vmux.sh/docs/concepts.html</loc><priority>0.7</priority></url>
+  <url><loc>https://vmux.sh/docs/configuration.html</loc><priority>0.7</priority></url>
+  <url><loc>https://vmux.sh/docs/keyboard-shortcuts.html</loc><priority>0.6</priority></url>
+  <url><loc>https://vmux.sh/docs/agents.html</loc><priority>0.7</priority></url>
+  <url><loc>https://vmux.sh/docs/phone-relay.html</loc><priority>0.7</priority></url>
+  <url><loc>https://vmux.sh/docs/ports.html</loc><priority>0.6</priority></url>
+  <url><loc>https://vmux.sh/docs/cli.html</loc><priority>0.7</priority></url>
+  <url><loc>https://vmux.sh/docs/architecture.html</loc><priority>0.6</priority></url>
+  <url><loc>https://vmux.sh/docs/troubleshooting.html</loc><priority>0.6</priority></url>
   <url><loc>https://vmux.sh/support.html</loc><priority>0.5</priority></url>
   <url><loc>https://vmux.sh/privacy.html</loc><priority>0.4</priority></url>
 </urlset>

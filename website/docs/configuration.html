@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Configuration — vmux docs</title>
+    <meta name="description" content="Every vmux config key: UI, themes, relay, agent titles, and ports." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/configuration.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script src="../assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell" style="margin-top: 40px">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html" aria-current="page">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html">Keyboard shortcuts</a></li>
+              <li><a href="agents.html">Agent integrations</a></li>
+              <li><a href="phone-relay.html">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Guides</p>
+          <h1>Configuration</h1>
+          <p class="docs-lede">
+            Config is managed with <code>vmux config</code> and mirrored in the attach <strong>Settings</strong>
+            panel (<strong>⚙ set</strong>). Changes from either side apply to the running session unless noted.
+          </p>
+          <pre><code>vmux config show
+vmux config init                      # write defaults, install agent hooks
+vmux config set ui.prefix_key Ctrl-a</code></pre>
+          <p>
+            Path (XDG): typically <code>~/.config/vmux/config.json</code>. Editors and CI can validate against the
+            checked-in <a href="https://github.com/UAEpro/vmux/blob/main/docs/config.schema.json">JSON Schema</a>
+            (<code>$id</code>: <code>https://vmux.sh/docs/config.schema.json</code>), which documents
+            <code>ui.*</code>, <code>relay.*</code>, <code>agent_titles.*</code>, and <code>ports.*</code>.
+          </p>
+
+          <h2 id="ui">ui.*</h2>
+          <table>
+            <thead><tr><th>Key</th><th>Example</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code>ui.prefix_key</code></td><td><code>Ctrl-b</code>, <code>Ctrl-a</code></td><td>Prefix chord. Default <code>Ctrl-b</code>.</td></tr>
+              <tr><td><code>ui.sidebar_collapsed</code></td><td><code>true</code> / <code>false</code></td><td>Start with a compact sidebar</td></tr>
+              <tr><td><code>ui.sidebar_width</code></td><td><code>28</code></td><td>Expanded width (12–60). Max when <code>sidebar_fit</code> is on</td></tr>
+              <tr><td><code>ui.sidebar_fit</code></td><td><code>true</code> / <code>false</code></td><td>Fit width to workspace name text (default <strong>on</strong>)</td></tr>
+              <tr><td><code>ui.sidebar_responsive</code></td><td><code>true</code> / <code>false</code></td><td>Auto-hide sidebar on narrow terminals (default on)</td></tr>
+              <tr><td><code>ui.scroll_step</code></td><td><code>8</code></td><td>Lines per scroll step</td></tr>
+              <tr><td><code>ui.scrollback_bytes</code></td><td><code>200000</code></td><td>Output retained per pane (~2500 lines). Clamped 16 KB–5 MB. <strong>Next daemon start</strong></td></tr>
+              <tr><td><code>ui.theme</code></td><td>see <a href="#themes">Themes</a></td><td>Color theme</td></tr>
+              <tr><td><code>ui.workspace_second_line</code></td><td><code>path</code>, <code>branch</code>, …</td><td>Second line of each sidebar workspace row</td></tr>
+              <tr><td><code>ui.status_markers</code></td><td><code>dots</code> (default), <code>emoji</code>, <code>ascii</code>, <code>off</code></td><td>How agent status renders in the sidebar</td></tr>
+              <tr><td><code>ui.cursor_blink</code></td><td><code>true</code> / <code>false</code></td><td>Soft-blink active caret while idle</td></tr>
+              <tr><td><code>ui.cursor_blink_ms</code></td><td><code>1000</code></td><td>Half-period of caret blink (200–5000 ms)</td></tr>
+              <tr><td><code>ui.default_shell</code></td><td><code>zsh</code>, empty</td><td>Empty = <code>$SHELL</code></td></tr>
+              <tr><td><code>ui.default_cwd</code></td><td><code>launch</code>, <code>home</code></td><td>New pane/workspace directory</td></tr>
+              <tr><td><code>ui.resume_agents</code></td><td><code>true</code> / <code>false</code></td><td>On daemon restart, relaunch agents resuming their conversation (needs <code>vmux hooks install</code>). Applies on next daemon start</td></tr>
+              <tr><td><code>ui.mouse</code></td><td><code>true</code> / <code>false</code></td><td>Capture mouse in attach UI</td></tr>
+              <tr><td><code>ui.tab_close_button</code></td><td><code>true</code> / <code>false</code></td><td>Show × on tabs when more than one exists</td></tr>
+              <tr><td><code>ui.bell_on_attention</code></td><td><code>true</code> / <code>false</code></td><td>Terminal bell on attention / needs-input</td></tr>
+            </tbody>
+          </table>
+
+          <h2 id="relay">relay.*</h2>
+          <table>
+            <thead><tr><th>Key</th><th>Example</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code>relay.enabled</code></td><td><code>true</code> / <code>false</code></td><td>Auto-start phone relay on attach (default <strong>on</strong>)</td></tr>
+              <tr><td><code>relay.bind</code></td><td><code>auto</code>, <code>tailscale</code>, <code>local</code></td><td>Never binds <code>0.0.0.0</code></td></tr>
+              <tr><td><code>relay.port</code></td><td><code>4399</code></td><td>TCP port 1–65535 (default 4399). Also: <code>vmux relay serve --listen host:port</code></td></tr>
+              <tr><td><code>relay.allow_localhost</code></td><td><code>true</code> / <code>false</code></td><td>Allow device registration from loopback</td></tr>
+              <tr><td><code>relay.allow_tailnet_cgnat</code></td><td><code>true</code> / <code>false</code></td><td>Accept CGNAT peers without whois</td></tr>
+              <tr><td><code>relay.allow_paste</code></td><td><code>true</code> / <code>false</code></td><td>Browser paste page (<code>/paste</code>)</td></tr>
+              <tr><td><code>relay.allow_view_resize</code></td><td><code>true</code> / <code>false</code></td><td>Phone-fit leased pane resize (default off)</td></tr>
+            </tbody>
+          </table>
+          <p>Full relay behaviour: <a href="phone-relay.html">Phone relay &amp; remote</a>.</p>
+          <pre><code>vmux config set relay.port 4400
+vmux config set relay.bind auto
+vmux relay serve --listen 127.0.0.1:4400</code></pre>
+
+          <h2 id="agent-titles">agent_titles.*</h2>
+          <table>
+            <thead><tr><th>Key</th><th>Example</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code>agent_titles.enabled</code></td><td><code>true</code> / <code>false</code></td><td>Name tabs after agent work</td></tr>
+              <tr><td><code>agent_titles.llm_fallback</code></td><td><code>true</code> / <code>false</code></td><td>LLM last-resort titles</td></tr>
+              <tr><td><code>agent_titles.llm_command</code></td><td><code>claude -p</code></td><td>Reads prompt on stdin, prints a short title</td></tr>
+              <tr><td><code>agent_titles.llm_delay_ms</code></td><td><code>20000</code></td><td>Wait for free sources before LLM</td></tr>
+            </tbody>
+          </table>
+
+          <h2 id="ports">ports.*</h2>
+          <p>Workspace listening-port detection and forward helpers. See <a href="ports.html">Ports &amp; forwarding</a>.</p>
+          <table>
+            <thead><tr><th>Key</th><th>Example</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code>ports.enabled</code></td><td><code>true</code> / <code>false</code></td><td>Detect ports via <code>/proc</code> on Linux (default <strong>on</strong>)</td></tr>
+              <tr><td><code>ports.notify</code></td><td><code>toast</code>, <code>banner</code>, <code>off</code></td><td>How new ports surface in the UI</td></tr>
+              <tr><td><code>ports.auto_forward</code></td><td><code>true</code> / <code>false</code></td><td>Auto Tailscale-forward new ports (default <strong>off</strong>)</td></tr>
+              <tr><td><code>ports.forward_via</code></td><td><code>ask</code>, <code>tailscale</code>, <code>ssh</code></td><td>Preference (CLI auto-forward uses tailscale)</td></tr>
+              <tr><td><code>ports.poll_secs</code></td><td><code>2</code></td><td>Scan interval (1–60)</td></tr>
+              <tr><td><code>ports.ignore</code></td><td><code>5432,6379</code></td><td>Never surface these ports (comma-separated)</td></tr>
+              <tr><td><code>ports.ignore_processes</code></td><td><code>ssh,sshd</code></td><td>Ignore by <code>/proc</code> comm (comma-separated)</td></tr>
+              <tr><td><code>ports.ignore_ephemeral</code></td><td><code>true</code> / <code>false</code></td><td>Hide kernel ephemeral range (default on)</td></tr>
+              <tr><td><code>ports.ssh_host</code></td><td><code>user@host</code></td><td>Default host for <code>vmux ports ssh-cmd</code></td></tr>
+            </tbody>
+          </table>
+          <p>Takes effect on the next daemon start for poll interval and enable flag; ignore lists apply on the next scan after restart.</p>
+
+          <h2 id="automatic-tab-names">Automatic tab names</h2>
+          <p>
+            A tab holding <strong>any</strong> coding agent names itself after the work in it —
+            <code>fixing parser</code>, <code>auth middleware</code> — so a row of tabs reads as a list of what is in
+            flight. The same pipeline runs for Claude Code, Codex, Grok Build, Aider, Cursor, Gemini, and anything
+            else detected as a coding-agent process. Sources, in order (first usable label wins for that update):
+          </p>
+          <ol>
+            <li><strong>Terminal title (OSC 0/2)</strong> — free. Agents that retitle the terminal are read directly; the title is condensed to one or two words and kept current as the agent moves between tasks.</li>
+            <li><strong>Hook prompt</strong> — free. A <code>UserPromptSubmit</code> (or compatible) hook that pipes JSON into <code>vmux hooks event</code> carries the user prompt; vmux condenses it the same way. Install with <code>vmux hooks install</code>.</li>
+            <li><strong>Busy status message</strong> — free. Any agent or script can name its tab with <code>vmux set-status busy --message "fixing auth"</code> (boilerplate like <code>"agent working"</code> is ignored).</li>
+            <li><strong>LLM fallback</strong> — one short call via <code>agent_titles.llm_command</code> after <code>agent_titles.llm_delay_ms</code>, only when the pane is actually on a task and no free source produced a title. Disable with <code>agent_titles.llm_fallback false</code>.</li>
+          </ol>
+          <p>
+            Shells never rename tabs (<code>user@host</code>, paths). Renaming a tab yourself pins it — vmux will not
+            rename it again. Changes take effect on the next daemon start (<code>vmux stop</code>, then attach).
+          </p>
+          <pre><code>vmux config set agent_titles.enabled false     # off entirely</code></pre>
+
+          <h2 id="themes">Themes</h2>
+          <p>Fifteen built-in themes:</p>
+          <pre><code>midnight  daylight  contrast  nord  dracula  gruvbox  catppuccin
+solarized-dark  solarized-light  tokyo-night  forest  rose-pine
+ocean  ember  monokai</code></pre>
+          <pre><code>vmux config set ui.theme tokyo-night</code></pre>
+
+          <h2>Responsive layout</h2>
+          <p>
+            Below 90 columns, the workspace sidebar auto-hides so panes get the full width
+            (<code>ui.sidebar_responsive</code>, default on). When it is hidden, reach workspaces through the
+            <strong>📱 menu</strong> button on the control bar, or press <kbd>Ctrl-b</kbd> <kbd>w</kbd> for the picker
+            (<kbd>j</kbd>/<kbd>k</kbd> or arrows, <kbd>Enter</kbd> to switch, <kbd>Esc</kbd> to close).
+          </p>
+
+          <h2>Project actions</h2>
+          <p>A <code>vmux.json</code> in a project root defines named commands, which show up under <kbd>Ctrl-b</kbd> <kbd>A</kbd> and <code>vmux actions</code>:</p>
+          <pre><code>vmux actions list
+vmux actions run test</code></pre>
+
+          <h2>Update checks</h2>
+          <p>
+            vmux checks for a new release once a day and prints a notice. Disable it by setting
+            <code>VMUX_NO_UPDATE_CHECK=1</code>.
+          </p>
+
+          <div class="docs-pager">
+            <a href="concepts.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Concepts</span></a>
+            <a class="docs-pager-next" href="keyboard-shortcuts.html"><span class="docs-pager-label">Next</span><span class="docs-pager-title">Keyboard shortcuts →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/config.md">Edit this page on GitHub</a></div>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ports &amp; forwarding — vmux docs</title>
+    <meta name="description" content="Automatic detection of listening ports, SSH tunnels, and Tailscale forwards in vmux." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/ports.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css" />
+    <script src="../assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell" style="margin-top: 40px">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html">Keyboard shortcuts</a></li>
+              <li><a href="agents.html">Agent integrations</a></li>
+              <li><a href="phone-relay.html">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html" aria-current="page">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Guides</p>
+          <h1>Ports &amp; forwarding</h1>
+          <p class="docs-lede">
+            vmux watches processes under each pane and surfaces <strong>listening TCP ports</strong> they own — the
+            Vite server your agent just started, a local API on <code>3000</code>, whatever is bound. Detection feeds
+            the sidebar, notifications, CLI helpers, and optional Tailscale forwarding.
+          </p>
+          <div class="docs-callout">
+            <p><strong>Linux only</strong> for detection (reads <code>/proc/net/tcp{,6}</code> and
+            <code>/proc/&lt;pid&gt;/fd</code>). On macOS the ports list is empty. No <code>ss</code> dependency for
+            the main scanner.</p>
+          </div>
+
+          <h2>How detection works</h2>
+          <p>A dedicated background loop (default every <code>ports.poll_secs</code>, never the snapshot hot path):</p>
+          <ol>
+            <li>Collects each pane's root PID and walks descendants via a single <code>/proc</code> ppid map.</li>
+            <li>Reads listening sockets from <code>/proc/net/tcp</code> and <code>/proc/net/tcp6</code>.</li>
+            <li>Matches socket inodes to pane process trees.</li>
+            <li>Diffs opens/closes → <code>port-opened</code> / <code>port-closed</code> events, optional notification, and workspace sidebar chips (host, port, pids, process, pane).</li>
+          </ol>
+          <p>
+            <code>vmux ports list</code> triggers an opportunistic rescan so you are not stuck waiting for the next
+            tick. The relay listen port (<code>relay.port</code>, default 4399) is always ignored.
+          </p>
+          <pre><code>vmux config set ports.enabled true          # default
+vmux config set ports.poll_secs 2
+vmux config set ports.ignore 5432,6379      # never surface these
+vmux config set ports.ignore_processes ssh,sshd
+vmux config set ports.ignore_ephemeral true  # default: hide kernel ephemeral range</code></pre>
+          <p>Full key list: <a href="configuration.html#ports">Configuration → ports.*</a>. Array keys are comma-separated on the CLI; edit <code>config.json</code> for complex lists.</p>
+
+          <h2>CLI</h2>
+          <pre><code># List detected ports (optional workspace filter)
+vmux ports list
+vmux ports list --workspace ws-2 --json
+
+# Print an ssh -L one-liner (run this on your laptop)
+vmux ports ssh-cmd 5173
+vmux config set ports.ssh_host 'user@devbox'
+
+# Expose a detected port on the Tailscale interface (daemon TCP proxy)
+vmux ports forward 3000
+vmux ports forward 3000 --via tailscale
+
+# Stop that forward
+vmux ports unforward 3000</code></pre>
+          <table>
+            <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>ports list</code></td><td>Table of port / process / pane / workspace / host / forward URL</td></tr>
+              <tr><td><code>ports ssh-cmd &lt;port&gt;</code></td><td>Print <code>ssh -L port:127.0.0.1:port user@host</code> for local use</td></tr>
+              <tr><td><code>ports forward &lt;port&gt;</code></td><td>Bind <code>&lt;tailscale-ip&gt;:&lt;port&gt;</code> → <code>127.0.0.1:&lt;port&gt;</code> in the daemon</td></tr>
+              <tr><td><code>ports unforward &lt;port&gt;</code></td><td>Tear down a Tailscale forward</td></tr>
+            </tbody>
+          </table>
+          <p>
+            <strong>SSH path:</strong> <code>ssh-cmd</code> only prints a command — your <strong>local</strong>
+            <code>ssh</code> client must run it. The remote daemon cannot create <code>-L</code> forwards for you.
+          </p>
+          <p>
+            <strong>Tailscale path:</strong> <code>ports forward</code> starts an in-process proxy on the machine's
+            Tailscale IPv4. Requires <code>tailscale</code> online. Never binds <code>0.0.0.0</code>. Forwards are
+            runtime-only; pane exit and <code>unforward</code> stop them.
+          </p>
+
+          <h2>Security</h2>
+          <ul>
+            <li>Forwards never bind all interfaces — only the Tailscale IP.</li>
+            <li>The phone <a href="phone-relay.html">relay</a> is a separate surface and also refuses public binds. Don't confuse <code>relay.port</code> (default 4399) with application ports (3000, 5173, …).</li>
+            <li><code>auto_forward</code> defaults <strong>off</strong>.</li>
+            <li>Put noisy ports/processes in <code>ports.ignore</code> / <code>ports.ignore_processes</code>.</li>
+          </ul>
+
+          <h2>Sidebar and attach UI</h2>
+          <p>
+            When ports are present, the workspace detail row shows short labels (<code>:3000</code>). Open the panel
+            with the command palette → <em>ports</em>, or the prefix key — see
+            <a href="keyboard-shortcuts.html">Keyboard shortcuts</a> for the panel's keys.
+          </p>
+
+          <h2>Troubleshooting</h2>
+          <table>
+            <thead><tr><th>Symptom</th><th>Check</th></tr></thead>
+            <tbody>
+              <tr><td>No ports ever show</td><td>Linux? <code>ports.enabled</code>? Process listening under the pane tree?</td></tr>
+              <tr><td>Wrong / noisy ports</td><td><code>ignore</code> / <code>ignore_processes</code>; leave <code>ignore_ephemeral</code> on</td></tr>
+              <tr><td><code>ssh-cmd</code> host wrong</td><td><code>ports.ssh_host</code> or <code>$SSH_CONNECTION</code> / hostname</td></tr>
+              <tr><td>Forward fails</td><td><code>tailscale ip -4</code> works? Port already detected? <code>AddrInUse</code>?</td></tr>
+              <tr><td>Port gone after stop</td><td>Expected — forwards are not restored across daemon restart</td></tr>
+            </tbody>
+          </table>
+
+          <div class="docs-pager">
+            <a href="phone-relay.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Phone relay &amp; remote</span></a>
+            <a class="docs-pager-next" href="cli.html"><span class="docs-pager-label">Next</span><span class="docs-pager-title">CLI reference →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/ports.md">Edit this page on GitHub</a></div>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>
