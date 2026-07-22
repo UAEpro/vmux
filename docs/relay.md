@@ -146,6 +146,28 @@ curl -s http://$(tailscale ip -4):${PORT}/v1/health
 # {"ok":true,"version":"…","backend":"vmux",…}
 ```
 
+### macOS: GUI Tailscale app and `tailscale whois`
+
+Pairing identity comes from `tailscale whois`. The **GUI Tailscale app** (App
+Store / `Tailscale.app`) does not put a `tailscale` binary on `PATH`, so the
+relay falls back to `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
+automatically. If you want the CLI on `PATH` yourself, use an exec wrapper — a
+bare symlink to the app binary crashes it (the binary refuses to run outside
+its bundle path):
+
+```sh
+cat > ~/.local/bin/tailscale <<'EOF'
+#!/bin/sh
+exec /Applications/Tailscale.app/Contents/MacOS/Tailscale "$@"
+EOF
+chmod +x ~/.local/bin/tailscale
+```
+
+When whois cannot run at all, pairing fails with `peer not recognized`; the
+relay log (stderr) now records the underlying cause once per distinct failure
+(`tailscale` missing, non-zero exit, or non-JSON output from a mis-invoked GUI
+binary).
+
 ## Phone-fit pane sizing
 
 Off by default — a phone glancing at a pane must not resize it under whoever
