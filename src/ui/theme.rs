@@ -1,10 +1,311 @@
-//! Themes and workspace second-line display modes for the attach UI.
+//! Layout skins + color palettes for the attach UI.
+//!
+//! - **Layout** (`ui.layout`) changes structure and chrome treatment: sidebar
+//!   density, control-bar button style, pane frames, tab chips.
+//! - **Colors** (`ui.colors`, legacy `ui.theme`) only change the palette.
 
 use ratatui::style::Color;
+use ratatui::widgets::Borders;
 
+/// Screen **structure** (not colors). Selected via `ui.layout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiLayout {
+    /// Full chrome — box panes, labeled toolbar, classic sidebar fill.
+    Classic,
+    /// Dense IDE: icon toolbar, left-accent sidebar selection, tight spacing.
+    Compact,
+    /// Focus mode: only the active pane is framed; ghost chrome elsewhere.
+    Minimal,
+    /// Product UI: surface rail, pill buttons, left-edge active pane accent.
+    Flat,
+    /// Content-first: almost no chrome — text-only sidebar, bare icons, no frames.
+    Zen,
+}
+
+/// How the workspace rail is painted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarStyle {
+    /// Header " vmux ", right rule, full-row accent fill on active.
+    Classic,
+    /// Surface-tinted rail, left `▎` accent on active (no full-row paint).
+    Compact,
+    /// Soft surface rail, no rule; active = bold + surface_alt row.
+    Pill,
+    /// No rule, no fills — active is bold text only (zen).
+    Ghost,
+}
+
+/// How control-bar actions are presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlBarStyle {
+    /// Icon + full labels on a surface strip; session footer on row 2.
+    Labeled,
+    /// Equal-width icon tiles on a surface strip (dense / touch).
+    Icons,
+    /// Spaced surface_alt "pills" with short labels on the main background.
+    Pills,
+    /// Bare icons on the main background — no strip fill (zen).
+    Ghost,
+}
+
+/// How workspace tabs look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabBarStyle {
+    /// Solid fill chips (classic product tabs).
+    Chips,
+    /// Underline active tab; muted inactive text.
+    Underline,
+    /// Plain text; bold active, no fills.
+    Ghost,
+}
+
+/// How pane outer frames are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneFrameStyle {
+    /// Full box borders on every pane.
+    Box,
+    /// Full box only on the focused (or danger) pane.
+    ActiveBox,
+    /// Single left edge on the focused pane only (flat product).
+    LeftAccent,
+    /// No pane borders at all.
+    None,
+}
+
+/// Concrete metrics + style choices derived from [`UiLayout`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LayoutChrome {
+    /// Rows reserved at the bottom for control chrome (1 or 2).
+    pub control_bar_height: u16,
+    /// Draw the session status footer under the control buttons (classic only).
+    pub show_session_footer: bool,
+    /// Whether to draw the workspace tab strip when there is only one tab.
+    pub hide_tab_bar_when_single: bool,
+    /// Draw pane titles (can be restricted to the active pane).
+    pub show_pane_titles: bool,
+    /// If true, only the active pane gets a title.
+    pub titles_active_only: bool,
+    /// Corner split/close controls on panes.
+    pub show_pane_controls: bool,
+    /// 1-cell gap between split children.
+    pub split_gap: u16,
+    /// Sidebar list treatment.
+    pub sidebar_style: SidebarStyle,
+    /// Control-bar button treatment.
+    pub control_bar_style: ControlBarStyle,
+    /// Workspace tab strip treatment.
+    pub tab_bar_style: TabBarStyle,
+    /// Pane frame treatment.
+    pub pane_frame: PaneFrameStyle,
+    /// Dim horizontal rule above the control bar.
+    pub control_bar_separator: bool,
+    /// Sidebar header text when expanded (empty = no header branding).
+    pub sidebar_header: &'static str,
+}
+
+impl LayoutChrome {
+    /// Borders for a pane given focus / danger.
+    pub(crate) fn pane_borders(self, active: bool, danger: bool) -> Borders {
+        if danger {
+            return Borders::ALL;
+        }
+        match self.pane_frame {
+            PaneFrameStyle::Box => Borders::ALL,
+            PaneFrameStyle::ActiveBox => {
+                if active {
+                    Borders::ALL
+                } else {
+                    Borders::NONE
+                }
+            }
+            PaneFrameStyle::LeftAccent => {
+                if active {
+                    Borders::LEFT
+                } else {
+                    Borders::NONE
+                }
+            }
+            PaneFrameStyle::None => Borders::NONE,
+        }
+    }
+
+    /// Whether the sidebar paints a right edge rule.
+    pub(crate) fn sidebar_border(self) -> bool {
+        matches!(
+            self.sidebar_style,
+            SidebarStyle::Classic | SidebarStyle::Compact
+        )
+    }
+}
+
+impl UiLayout {
+    pub(crate) fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "compact" | "dense" => Self::Compact,
+            "minimal" | "focus" => Self::Minimal,
+            "flat" | "product" => Self::Flat,
+            "zen" | "immersive" => Self::Zen,
+            _ => Self::Classic,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Compact => "compact",
+            Self::Minimal => "minimal",
+            Self::Flat => "flat",
+            Self::Zen => "zen",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Compact => "Compact",
+            Self::Minimal => "Minimal",
+            Self::Flat => "Flat",
+            Self::Zen => "Zen",
+        }
+    }
+
+    /// Short blurb for settings / docs.
+    pub(crate) fn blurb(self) -> &'static str {
+        match self {
+            Self::Classic => "full boxes · labeled bar · filled sidebar",
+            Self::Compact => "dense icons · left accent rail · tight",
+            Self::Minimal => "frame active only · ghost chrome",
+            Self::Flat => "product rail · pill buttons · left accent",
+            Self::Zen => "content first · bare icons · no frames",
+        }
+    }
+
+    pub(crate) fn all() -> &'static [Self] {
+        &[
+            Self::Classic,
+            Self::Compact,
+            Self::Minimal,
+            Self::Flat,
+            Self::Zen,
+        ]
+    }
+
+    pub(crate) fn relative(self, delta: isize) -> Self {
+        let items = Self::all();
+        let current = items.iter().position(|item| *item == self).unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(items.len() as isize) as usize;
+        items[next]
+    }
+
+    pub(crate) fn chrome(self) -> LayoutChrome {
+        match self {
+            Self::Classic => LayoutChrome {
+                control_bar_height: 2,
+                show_session_footer: true,
+                hide_tab_bar_when_single: false,
+                show_pane_titles: true,
+                titles_active_only: false,
+                show_pane_controls: true,
+                split_gap: 0,
+                sidebar_style: SidebarStyle::Classic,
+                control_bar_style: ControlBarStyle::Labeled,
+                tab_bar_style: TabBarStyle::Chips,
+                pane_frame: PaneFrameStyle::Box,
+                control_bar_separator: false,
+                sidebar_header: " vmux ",
+            },
+            Self::Compact => LayoutChrome {
+                control_bar_height: 1,
+                show_session_footer: false,
+                hide_tab_bar_when_single: false,
+                show_pane_titles: true,
+                titles_active_only: false,
+                show_pane_controls: true,
+                split_gap: 0,
+                sidebar_style: SidebarStyle::Compact,
+                control_bar_style: ControlBarStyle::Icons,
+                tab_bar_style: TabBarStyle::Chips,
+                pane_frame: PaneFrameStyle::Box,
+                control_bar_separator: true,
+                sidebar_header: " · ",
+            },
+            Self::Minimal => LayoutChrome {
+                control_bar_height: 1,
+                show_session_footer: false,
+                hide_tab_bar_when_single: true,
+                show_pane_titles: true,
+                titles_active_only: true,
+                show_pane_controls: false,
+                split_gap: 0,
+                sidebar_style: SidebarStyle::Ghost,
+                control_bar_style: ControlBarStyle::Ghost,
+                tab_bar_style: TabBarStyle::Underline,
+                pane_frame: PaneFrameStyle::ActiveBox,
+                control_bar_separator: false,
+                sidebar_header: "",
+            },
+            Self::Flat => LayoutChrome {
+                control_bar_height: 1,
+                show_session_footer: false,
+                hide_tab_bar_when_single: true,
+                show_pane_titles: true,
+                titles_active_only: true,
+                show_pane_controls: false,
+                split_gap: 1,
+                sidebar_style: SidebarStyle::Pill,
+                control_bar_style: ControlBarStyle::Pills,
+                tab_bar_style: TabBarStyle::Underline,
+                pane_frame: PaneFrameStyle::LeftAccent,
+                control_bar_separator: true,
+                sidebar_header: "  ·  ",
+            },
+            Self::Zen => LayoutChrome {
+                control_bar_height: 1,
+                show_session_footer: false,
+                hide_tab_bar_when_single: true,
+                show_pane_titles: false,
+                titles_active_only: false,
+                show_pane_controls: false,
+                split_gap: 0,
+                sidebar_style: SidebarStyle::Ghost,
+                control_bar_style: ControlBarStyle::Ghost,
+                tab_bar_style: TabBarStyle::Ghost,
+                pane_frame: PaneFrameStyle::None,
+                control_bar_separator: false,
+                sidebar_header: "",
+            },
+        }
+    }
+
+    /// Tab strip height for the current workspace (0 when hidden).
+    pub(crate) fn tab_bar_height(self, tab_count: usize) -> u16 {
+        let chrome = self.chrome();
+        if tab_count == 0 {
+            return 0;
+        }
+        if chrome.hide_tab_bar_when_single && tab_count <= 1 {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+/// Color palette only (legacy name: "theme"). Selected via `ui.colors`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiTheme {
+    /// Default dark chrome — also available as `classic`.
     Midnight,
+    /// Flat product dark (Linear / Vercel-style slate + indigo).
+    Modern,
+    /// Warm low-contrast stone + soft accents for long sessions.
+    Soft,
+    /// Deep black with electric pink / cyan accents.
+    Neon,
+    /// Light warm paper / ink editorial.
+    Paper,
+    /// Near-monochrome zinc with a single cool accent.
+    Minimal,
     Daylight,
     Contrast,
     Nord,
@@ -67,6 +368,12 @@ pub(crate) struct ThemePalette {
 impl UiTheme {
     pub(crate) fn from_name(name: &str) -> Self {
         match name.trim().to_ascii_lowercase().as_str() {
+            "classic" | "midnight" => Self::Midnight,
+            "modern" | "flat" => Self::Modern,
+            "soft" | "warm-soft" => Self::Soft,
+            "neon" | "cyber" => Self::Neon,
+            "paper" | "editorial" => Self::Paper,
+            "minimal" | "mono" | "zinc" => Self::Minimal,
             "daylight" => Self::Daylight,
             "contrast" => Self::Contrast,
             "nord" => Self::Nord,
@@ -88,6 +395,11 @@ impl UiTheme {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Midnight => "midnight",
+            Self::Modern => "modern",
+            Self::Soft => "soft",
+            Self::Neon => "neon",
+            Self::Paper => "paper",
+            Self::Minimal => "minimal",
             Self::Daylight => "daylight",
             Self::Contrast => "contrast",
             Self::Nord => "nord",
@@ -107,7 +419,13 @@ impl UiTheme {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Midnight => "Midnight",
+            // Settings picker label; config key remains `midnight` (alias `classic`).
+            Self::Midnight => "Classic",
+            Self::Modern => "Modern",
+            Self::Soft => "Soft",
+            Self::Neon => "Neon",
+            Self::Paper => "Paper",
+            Self::Minimal => "Minimal",
             Self::Daylight => "Daylight",
             Self::Contrast => "Contrast",
             Self::Nord => "Nord",
@@ -128,6 +446,11 @@ impl UiTheme {
     pub(crate) fn all() -> &'static [Self] {
         &[
             Self::Midnight,
+            Self::Modern,
+            Self::Soft,
+            Self::Neon,
+            Self::Paper,
+            Self::Minimal,
             Self::Daylight,
             Self::Contrast,
             Self::Nord,
@@ -146,10 +469,10 @@ impl UiTheme {
     }
 
     pub(crate) fn relative(self, delta: isize) -> Self {
-        let themes = Self::all();
-        let current = themes.iter().position(|item| *item == self).unwrap_or(0);
-        let next = (current as isize + delta).rem_euclid(themes.len() as isize) as usize;
-        themes[next]
+        let items = Self::all();
+        let current = items.iter().position(|item| *item == self).unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(items.len() as isize) as usize;
+        items[next]
     }
 
     pub(crate) fn palette(self) -> ThemePalette {
@@ -172,6 +495,101 @@ impl UiTheme {
                 selection: Color::LightYellow,
                 cursor: Color::Rgb(120, 220, 255),
                 on_cursor: Color::Rgb(8, 12, 18),
+            },
+            Self::Modern => ThemePalette {
+                background: Color::Rgb(9, 9, 11),
+                surface: Color::Rgb(24, 24, 27),
+                surface_alt: Color::Rgb(39, 39, 42),
+                text: Color::Rgb(250, 250, 250),
+                muted: Color::Rgb(161, 161, 170),
+                border: Color::Rgb(63, 63, 70),
+                active: Color::Rgb(99, 102, 241),
+                hover: Color::Rgb(129, 140, 248),
+                danger: Color::Rgb(248, 113, 113),
+                success: Color::Rgb(52, 211, 153),
+                warning: Color::Rgb(251, 191, 36),
+                command: Color::Rgb(167, 139, 250),
+                on_accent: Color::Rgb(250, 250, 250),
+                on_bright: Color::Black,
+                selection: Color::Rgb(39, 39, 42),
+                cursor: Color::Rgb(99, 102, 241),
+                on_cursor: Color::Rgb(250, 250, 250),
+            },
+            Self::Soft => ThemePalette {
+                background: Color::Rgb(28, 25, 23),
+                surface: Color::Rgb(41, 37, 36),
+                surface_alt: Color::Rgb(68, 64, 60),
+                text: Color::Rgb(231, 229, 228),
+                muted: Color::Rgb(168, 162, 158),
+                border: Color::Rgb(87, 83, 78),
+                active: Color::Rgb(251, 146, 60),
+                hover: Color::Rgb(253, 186, 116),
+                danger: Color::Rgb(248, 113, 113),
+                success: Color::Rgb(134, 239, 172),
+                warning: Color::Rgb(253, 224, 71),
+                command: Color::Rgb(196, 181, 253),
+                on_accent: Color::Rgb(28, 25, 23),
+                on_bright: Color::Black,
+                selection: Color::Rgb(68, 64, 60),
+                cursor: Color::Rgb(251, 146, 60),
+                on_cursor: Color::Rgb(28, 25, 23),
+            },
+            Self::Neon => ThemePalette {
+                background: Color::Rgb(5, 5, 8),
+                surface: Color::Rgb(18, 18, 28),
+                surface_alt: Color::Rgb(32, 32, 48),
+                text: Color::Rgb(240, 240, 255),
+                muted: Color::Rgb(140, 140, 180),
+                border: Color::Rgb(60, 60, 100),
+                active: Color::Rgb(255, 0, 170),
+                hover: Color::Rgb(0, 255, 255),
+                danger: Color::Rgb(255, 60, 100),
+                success: Color::Rgb(0, 255, 160),
+                warning: Color::Rgb(255, 220, 0),
+                command: Color::Rgb(160, 100, 255),
+                on_accent: Color::Rgb(5, 5, 8),
+                on_bright: Color::Black,
+                selection: Color::Rgb(40, 20, 50),
+                cursor: Color::Rgb(0, 255, 255),
+                on_cursor: Color::Rgb(5, 5, 8),
+            },
+            Self::Paper => ThemePalette {
+                background: Color::Rgb(250, 248, 243),
+                surface: Color::Rgb(240, 236, 228),
+                surface_alt: Color::Rgb(230, 224, 212),
+                text: Color::Rgb(40, 36, 32),
+                muted: Color::Rgb(120, 112, 100),
+                border: Color::Rgb(200, 190, 175),
+                active: Color::Rgb(180, 80, 50),
+                hover: Color::Rgb(200, 110, 70),
+                danger: Color::Rgb(180, 50, 50),
+                success: Color::Rgb(60, 120, 80),
+                warning: Color::Rgb(180, 130, 40),
+                command: Color::Rgb(90, 80, 140),
+                on_accent: Color::Rgb(250, 248, 243),
+                on_bright: Color::White,
+                selection: Color::Rgb(230, 220, 200),
+                cursor: Color::Rgb(180, 80, 50),
+                on_cursor: Color::Rgb(250, 248, 243),
+            },
+            Self::Minimal => ThemePalette {
+                background: Color::Rgb(9, 9, 11),
+                surface: Color::Rgb(18, 18, 20),
+                surface_alt: Color::Rgb(28, 28, 32),
+                text: Color::Rgb(228, 228, 231),
+                muted: Color::Rgb(113, 113, 122),
+                border: Color::Rgb(39, 39, 42),
+                active: Color::Rgb(161, 161, 170),
+                hover: Color::Rgb(212, 212, 216),
+                danger: Color::Rgb(161, 161, 170),
+                success: Color::Rgb(161, 161, 170),
+                warning: Color::Rgb(161, 161, 170),
+                command: Color::Rgb(161, 161, 170),
+                on_accent: Color::Rgb(9, 9, 11),
+                on_bright: Color::Black,
+                selection: Color::Rgb(39, 39, 42),
+                cursor: Color::Rgb(228, 228, 231),
+                on_cursor: Color::Rgb(9, 9, 11),
             },
             Self::Daylight => ThemePalette {
                 background: Color::Rgb(238, 241, 245),
@@ -211,7 +629,6 @@ impl UiTheme {
                 cursor: Color::LightCyan,
                 on_cursor: Color::Black,
             },
-            // Nord-inspired cool blues/frost.
             Self::Nord => ThemePalette {
                 background: Color::Rgb(46, 52, 64),
                 surface: Color::Rgb(59, 66, 82),
@@ -231,7 +648,6 @@ impl UiTheme {
                 cursor: Color::Rgb(136, 192, 208),
                 on_cursor: Color::Rgb(46, 52, 64),
             },
-            // Dracula purple night.
             Self::Dracula => ThemePalette {
                 background: Color::Rgb(40, 42, 54),
                 surface: Color::Rgb(68, 71, 90),
@@ -251,7 +667,6 @@ impl UiTheme {
                 cursor: Color::Rgb(248, 248, 242),
                 on_cursor: Color::Rgb(40, 42, 54),
             },
-            // Gruvbox dark warm earth.
             Self::Gruvbox => ThemePalette {
                 background: Color::Rgb(40, 40, 40),
                 surface: Color::Rgb(60, 56, 54),
@@ -271,7 +686,6 @@ impl UiTheme {
                 cursor: Color::Rgb(250, 189, 47),
                 on_cursor: Color::Rgb(40, 40, 40),
             },
-            // Catppuccin Mocha.
             Self::Catppuccin => ThemePalette {
                 background: Color::Rgb(30, 30, 46),
                 surface: Color::Rgb(49, 50, 68),
@@ -348,7 +762,6 @@ impl UiTheme {
                 cursor: Color::Rgb(192, 202, 245),
                 on_cursor: Color::Rgb(26, 27, 38),
             },
-            // Soft green evergreen.
             Self::Forest => ThemePalette {
                 background: Color::Rgb(35, 42, 35),
                 surface: Color::Rgb(45, 55, 45),
@@ -387,7 +800,6 @@ impl UiTheme {
                 cursor: Color::Rgb(224, 222, 244),
                 on_cursor: Color::Rgb(25, 23, 36),
             },
-            // Deep ocean teal.
             Self::Ocean => ThemePalette {
                 background: Color::Rgb(10, 22, 34),
                 surface: Color::Rgb(16, 34, 52),
@@ -407,7 +819,6 @@ impl UiTheme {
                 cursor: Color::Rgb(64, 196, 196),
                 on_cursor: Color::Rgb(10, 22, 34),
             },
-            // Warm ember / sepia night.
             Self::Ember => ThemePalette {
                 background: Color::Rgb(28, 18, 14),
                 surface: Color::Rgb(42, 28, 22),
@@ -427,7 +838,6 @@ impl UiTheme {
                 cursor: Color::Rgb(255, 180, 100),
                 on_cursor: Color::Rgb(28, 18, 14),
             },
-            // Classic Monokai.
             Self::Monokai => ThemePalette {
                 background: Color::Rgb(39, 40, 34),
                 surface: Color::Rgb(50, 51, 45),
@@ -459,7 +869,7 @@ impl UiWorkspaceSecondLine {
             "id" => Self::Id,
             "status" => Self::Status,
             "cursor" => Self::Cursor,
-            "none" => Self::None,
+            "none" | "off" | "hidden" => Self::None,
             _ => Self::Path,
         }
     }
@@ -481,7 +891,7 @@ impl UiWorkspaceSecondLine {
             Self::Path => "Path",
             Self::Details => "Details",
             Self::Branch => "Branch",
-            Self::Id => "ID",
+            Self::Id => "Id",
             Self::Status => "Status",
             Self::Cursor => "Cursor",
             Self::None => "None",

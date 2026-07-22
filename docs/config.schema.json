@@ -25,7 +25,7 @@
         },
         "sidebar_fit": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Fit sidebar width to workspace name text (up to sidebar_width)."
         },
         "prefix_key": {
@@ -47,10 +47,21 @@
           "default": 200000,
           "description": "Bytes of raw output retained per pane for scrollback and persistence. Takes effect on the next daemon start."
         },
-        "theme": {
+        "layout": {
+          "type": "string",
+          "enum": ["classic", "compact", "minimal", "flat", "zen"],
+          "default": "classic",
+          "description": "Screen structure (chrome density, borders, titles). Independent of colors."
+        },
+        "colors": {
           "type": "string",
           "enum": [
             "midnight",
+            "modern",
+            "soft",
+            "neon",
+            "paper",
+            "minimal",
             "daylight",
             "contrast",
             "nord",
@@ -67,7 +78,34 @@
             "monokai"
           ],
           "default": "midnight",
-          "description": "Color theme for the attach UI."
+          "description": "Color palette only. Prefer this over ui.theme."
+        },
+        "theme": {
+          "type": "string",
+          "enum": [
+            "midnight",
+            "modern",
+            "soft",
+            "neon",
+            "paper",
+            "minimal",
+            "daylight",
+            "contrast",
+            "nord",
+            "dracula",
+            "gruvbox",
+            "catppuccin",
+            "solarized-dark",
+            "solarized-light",
+            "tokyo-night",
+            "forest",
+            "rose-pine",
+            "ocean",
+            "ember",
+            "monokai"
+          ],
+          "default": "midnight",
+          "description": "Legacy alias of ui.colors. Still accepted and mirrored when either key is set."
         },
         "workspace_second_line": {
           "type": "string",

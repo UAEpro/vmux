@@ -1,6 +1,6 @@
 //! Settings panel: rows, values, and draw.
 
-use super::theme::{UiTheme, UiWorkspaceSecondLine};
+use super::theme::{UiLayout, UiTheme, UiWorkspaceSecondLine};
 use super::{panel_block, selected_row_style};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -9,7 +9,10 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsEntryId {
-    Theme,
+    /// Screen structure (classic / compact / minimal / flat / zen).
+    Layout,
+    /// Color palette only.
+    Colors,
     WorkspaceLine,
     Sidebar,
     SidebarResponsive,
@@ -102,7 +105,8 @@ pub(crate) struct SettingsEntry {
 pub(crate) fn settings_entries_for_tab(tab: SettingsTab) -> Vec<SettingsEntry> {
     let rows: &[(SettingsEntryId, &'static str)] = match tab {
         SettingsTab::Ui => &[
-            (SettingsEntryId::Theme, "theme"),
+            (SettingsEntryId::Layout, "layout"),
+            (SettingsEntryId::Colors, "colors"),
             (SettingsEntryId::WorkspaceLine, "workspace line"),
             (SettingsEntryId::Sidebar, "sidebar"),
             (SettingsEntryId::SidebarResponsive, "responsive layout"),
@@ -150,6 +154,7 @@ pub(crate) fn settings_entries_for_tab(tab: SettingsTab) -> Vec<SettingsEntry> {
 
 pub(crate) struct SettingsView<'a> {
     pub(crate) theme: UiTheme,
+    pub(crate) layout: UiLayout,
     pub(crate) workspace_second_line: UiWorkspaceSecondLine,
     pub(crate) sidebar_collapsed: bool,
     pub(crate) sidebar_responsive: bool,
@@ -192,7 +197,10 @@ pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>>
         .map(|(index, entry)| {
             let active = index == view.selected;
             let value = match entry.id {
-                SettingsEntryId::Theme => theme.label().to_string(),
+                SettingsEntryId::Layout => {
+                    format!("{} · {}", view.layout.label(), view.layout.blurb())
+                }
+                SettingsEntryId::Colors => theme.label().to_string(),
                 SettingsEntryId::WorkspaceLine => view.workspace_second_line.label().to_string(),
                 SettingsEntryId::Sidebar => {
                     if view.sidebar_collapsed {

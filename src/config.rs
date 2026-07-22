@@ -150,7 +150,7 @@ pub struct UiConfig {
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u16,
     /// Fit sidebar width to workspace name text (up to `sidebar_width` max).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub sidebar_fit: bool,
     #[serde(default = "default_prefix_key")]
     pub prefix_key: String,
@@ -165,6 +165,13 @@ pub struct UiConfig {
     /// the next daemon start.
     #[serde(default = "default_scrollback_bytes")]
     pub scrollback_bytes: usize,
+    /// Color palette (`midnight`, `modern`, `nord`, …). Empty → fall back to `theme`.
+    #[serde(default)]
+    pub colors: String,
+    /// Layout skin: `classic` | `compact` | `minimal` | `flat` | `zen`.
+    #[serde(default = "default_layout")]
+    pub layout: String,
+    /// Deprecated alias of `colors`. Old configs only set this key.
     #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default = "default_workspace_second_line")]
@@ -207,10 +214,12 @@ impl Default for UiConfig {
         Self {
             sidebar_collapsed: false,
             sidebar_width: default_sidebar_width(),
-            sidebar_fit: false,
+            sidebar_fit: true,
             prefix_key: default_prefix_key(),
             scroll_step: default_scroll_step(),
             scrollback_bytes: default_scrollback_bytes(),
+            colors: String::new(),
+            layout: default_layout(),
             theme: default_theme(),
             workspace_second_line: default_workspace_second_line(),
             cursor_blink: true,
@@ -239,7 +248,18 @@ impl LmuxConfig {
         // ceiling keeps a runaway pane's retained output bounded.
         self.ui.scrollback_bytes = self.ui.scrollback_bytes.clamp(16_000, 5_000_000);
         self.ui.sidebar_width = clamp_sidebar_width(self.ui.sidebar_width);
-        self.ui.theme = normalize_theme(&self.ui.theme);
+        // Prefer explicit `colors`; else legacy `theme`.
+        let colors_src = if !self.ui.colors.trim().is_empty() {
+            self.ui.colors.clone()
+        } else if !self.ui.theme.trim().is_empty() {
+            self.ui.theme.clone()
+        } else {
+            default_theme()
+        };
+        self.ui.colors = normalize_theme(&colors_src);
+        // Keep theme mirrored so old tools reading ui.theme stay correct.
+        self.ui.theme = self.ui.colors.clone();
+        self.ui.layout = normalize_layout(&self.ui.layout);
         self.ui.workspace_second_line =
             normalize_workspace_second_line(&self.ui.workspace_second_line);
         self.ui.cursor_blink_ms = self.ui.cursor_blink_ms.clamp(200, 5000);
@@ -315,15 +335,26 @@ pub fn set_value(config: &mut LmuxConfig, key: &str, value: &str) -> Result<()> 
                 .parse::<usize>()
                 .map_err(|_| anyhow!("ui.scrollback_bytes must be a positive integer"))?;
         }
-        "ui.theme" => {
+        "ui.theme" | "ui.colors" => {
             let normalized = value.trim().to_ascii_lowercase();
             if !supported_themes().contains(&normalized.as_str()) {
                 return Err(anyhow!(
-                    "ui.theme must be one of {}",
+                    "ui.colors must be one of {}",
                     supported_themes().join(", ")
                 ));
             }
+            config.ui.colors = normalized.clone();
             config.ui.theme = normalized;
+        }
+        "ui.layout" => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if !supported_layouts().contains(&normalized.as_str()) {
+                return Err(anyhow!(
+                    "ui.layout must be one of {}",
+                    supported_layouts().join(", ")
+                ));
+            }
+            config.ui.layout = normalized;
         }
         "ui.workspace_second_line" => {
             let normalized = value.trim().to_ascii_lowercase();
@@ -576,13 +607,23 @@ pub fn default_theme() -> String {
     "midnight".to_string()
 }
 
+pub fn default_layout() -> String {
+    "classic".to_string()
+}
+
 pub fn default_workspace_second_line() -> String {
     "path".to_string()
 }
 
+/// Color palette names (`ui.colors` / legacy `ui.theme`).
 pub fn supported_themes() -> Vec<&'static str> {
     vec![
         "midnight",
+        "modern",
+        "soft",
+        "neon",
+        "paper",
+        "minimal",
         "daylight",
         "contrast",
         "nord",
@@ -598,6 +639,23 @@ pub fn supported_themes() -> Vec<&'static str> {
         "ember",
         "monokai",
     ]
+}
+
+/// Layout skins (`ui.layout`) — structure only, not colors.
+pub fn supported_layouts() -> Vec<&'static str> {
+    vec!["classic", "compact", "minimal", "flat", "zen"]
+}
+
+pub fn normalize_layout(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "compact" | "dense" => "compact".to_string(),
+        "minimal" | "focus" => "minimal".to_string(),
+        "flat" | "product" => "flat".to_string(),
+        "zen" | "immersive" => "zen".to_string(),
+        "classic" | "default" => "classic".to_string(),
+        _ => default_layout(),
+    }
 }
 
 pub fn supported_workspace_second_lines() -> Vec<&'static str> {
@@ -1025,10 +1083,35 @@ mod tests {
         let mut config = LmuxConfig::default();
         assert!(set_value(&mut config, "ui.sidebar_collapsed", "maybe").is_err());
         assert!(set_value(&mut config, "ui.prefix_key", "Ctrl-UnknownKey").is_err());
-        assert!(set_value(&mut config, "ui.theme", "neon").is_err());
+        assert!(set_value(&mut config, "ui.theme", "not-a-palette").is_err());
+        assert!(set_value(&mut config, "ui.layout", "not-a-layout").is_err());
         assert!(set_value(&mut config, "ui.status_markers", "icons").is_err());
         assert!(set_value(&mut config, "ui.default_cwd", "root").is_err());
         assert!(set_value(&mut config, "missing", "value").is_err());
+    }
+
+    #[test]
+    fn layout_and_colors_keys_round_trip() {
+        let mut config = LmuxConfig::default();
+        assert_eq!(config.ui.layout, "classic");
+        set_value(&mut config, "ui.layout", "flat").unwrap();
+        assert_eq!(config.ui.layout, "flat");
+        set_value(&mut config, "ui.colors", "neon").unwrap();
+        assert_eq!(config.ui.colors, "neon");
+        assert_eq!(config.ui.theme, "neon"); // mirrored for legacy readers
+                                             // Legacy ui.theme still sets colors.
+        set_value(&mut config, "ui.theme", "modern").unwrap();
+        assert_eq!(config.ui.colors, "modern");
+        assert_eq!(config.ui.theme, "modern");
+        // Aliases normalize.
+        let mut c2 = LmuxConfig::default();
+        c2.ui.layout = "product".to_string();
+        c2.ui.colors = String::new();
+        c2.ui.theme = "MIDNIGHT".to_string();
+        let n = c2.normalized();
+        assert_eq!(n.ui.layout, "flat");
+        assert_eq!(n.ui.colors, "midnight");
+        assert_eq!(n.ui.theme, "midnight");
     }
 
     #[test]

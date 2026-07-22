@@ -190,7 +190,8 @@ vmux config show
 vmux config init
 vmux config set ui.prefix_key Ctrl-a
 vmux config set ui.sidebar_collapsed true
-vmux config set ui.theme contrast
+vmux config set ui.colors contrast
+vmux config set ui.layout flat
 vmux config set relay.port 4399
 vmux actions list
 vmux actions run test
