@@ -225,31 +225,36 @@ fn tailscale_whois_output(peer: &str) -> Option<std::process::Output> {
     };
     match run("tailscale") {
         Ok(output) => Some(output),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(target_os = "macos")]
-            match run(MACOS_APP_TAILSCALE) {
-                Ok(output) => return Some(output),
-                Err(app_err) => {
-                    whois_warn_once(&format!(
-                        "`tailscale` not on PATH and {MACOS_APP_TAILSCALE} failed ({app_err}); \
-                         peers cannot be verified — see docs/relay.md"
-                    ));
-                    return None;
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                whois_warn_once(
-                    "`tailscale` not found on PATH; peers cannot be verified — see docs/relay.md",
-                );
-                None
-            }
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => tailscale_path_fallback(peer),
         Err(err) => {
             whois_warn_once(&format!("failed to run `tailscale`: {err}"));
             None
         }
     }
+}
+
+/// PATH lookup failed: on macOS, retry via the GUI app's bundled binary.
+#[cfg(target_os = "macos")]
+fn tailscale_path_fallback(peer: &str) -> Option<std::process::Output> {
+    match std::process::Command::new(MACOS_APP_TAILSCALE)
+        .args(["whois", "--json", peer])
+        .output()
+    {
+        Ok(output) => Some(output),
+        Err(app_err) => {
+            whois_warn_once(&format!(
+                "`tailscale` not on PATH and {MACOS_APP_TAILSCALE} failed ({app_err}); \
+                 peers cannot be verified — see docs/relay.md"
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tailscale_path_fallback(_peer: &str) -> Option<std::process::Output> {
+    whois_warn_once("`tailscale` not found on PATH; peers cannot be verified — see docs/relay.md");
+    None
 }
 
 pub(crate) fn try_tailscale_whois(peer: &str) -> Option<PeerIdentity> {
