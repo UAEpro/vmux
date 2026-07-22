@@ -196,15 +196,87 @@ pub(crate) fn resolve_peer_identity(
     ))
 }
 
-pub(crate) fn try_tailscale_whois(peer: &str) -> Option<PeerIdentity> {
-    let output = std::process::Command::new("tailscale")
+/// The macOS GUI Tailscale app does not install a `tailscale` on PATH, and its
+/// bundled binary aborts unless exec'd by its real in-bundle path (a bare
+/// symlink crashes it) — so probe this location when PATH lookup fails.
+#[cfg(target_os = "macos")]
+const MACOS_APP_TAILSCALE: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+
+/// Log a whois diagnostic once per distinct message. Registration retries hit
+/// this path on every attempt; without dedup a misconfigured host would spam
+/// the relay log for each tap of "Pair this device".
+fn whois_warn_once(msg: &str) -> bool {
+    use crate::sync::MutexExt;
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let fresh = seen.lock_or_recover().insert(msg.to_string());
+    if fresh {
+        eprintln!("relay: tailscale whois: {msg}");
+    }
+    fresh
+}
+
+fn tailscale_whois_output(peer: &str) -> Option<std::process::Output> {
+    let run = |bin: &str| {
+        std::process::Command::new(bin)
+            .args(["whois", "--json", peer])
+            .output()
+    };
+    match run("tailscale") {
+        Ok(output) => Some(output),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => tailscale_path_fallback(peer),
+        Err(err) => {
+            whois_warn_once(&format!("failed to run `tailscale`: {err}"));
+            None
+        }
+    }
+}
+
+/// PATH lookup failed: on macOS, retry via the GUI app's bundled binary.
+#[cfg(target_os = "macos")]
+fn tailscale_path_fallback(peer: &str) -> Option<std::process::Output> {
+    match std::process::Command::new(MACOS_APP_TAILSCALE)
         .args(["whois", "--json", peer])
         .output()
-        .ok()?;
+    {
+        Ok(output) => Some(output),
+        Err(app_err) => {
+            whois_warn_once(&format!(
+                "`tailscale` not on PATH and {MACOS_APP_TAILSCALE} failed ({app_err}); \
+                 peers cannot be verified — see docs/relay.md"
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tailscale_path_fallback(_peer: &str) -> Option<std::process::Output> {
+    whois_warn_once("`tailscale` not found on PATH; peers cannot be verified — see docs/relay.md");
+    None
+}
+
+pub(crate) fn try_tailscale_whois(peer: &str) -> Option<PeerIdentity> {
+    let output = tailscale_whois_output(peer)?;
     if !output.status.success() {
+        whois_warn_once(&format!(
+            "`tailscale whois {peer}` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
         return None;
     }
-    let v: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let v: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(_) => {
+            whois_warn_once(
+                "`tailscale whois` exited 0 but stdout was not JSON (the macOS GUI Tailscale \
+                 binary does this when invoked via a symlink — see docs/relay.md)",
+            );
+            return None;
+        }
+    };
     // tailscale whois --json shape varies; try common fields.
     let user = v
         .pointer("/UserProfile/LoginName")
@@ -248,5 +320,18 @@ pub(crate) fn is_tailscale_cgnat(ip: IpAddr) -> bool {
             o[0] == 100 && (o[1] & 0xC0) == 64
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whois_warn_once_logs_each_distinct_message_once() {
+        assert!(whois_warn_once("test: first"));
+        assert!(!whois_warn_once("test: first"));
+        assert!(whois_warn_once("test: second"));
+        assert!(!whois_warn_once("test: second"));
     }
 }
