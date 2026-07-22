@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -188,7 +188,7 @@ solarized-dark  solarized-light  tokyo-night  forest  rose-pine
 ocean  ember  monokai</code></pre>
           <pre><code>vmux config set ui.theme tokyo-night</code></pre>
 
-          <h2>Responsive layout</h2>
+          <h2 id="responsive-layout">Responsive layout</h2>
           <p>
             Below 90 columns, the workspace sidebar auto-hides so panes get the full width
             (<code>ui.sidebar_responsive</code>, default on). When it is hidden, reach workspaces through the
@@ -196,12 +196,12 @@ ocean  ember  monokai</code></pre>
             (<kbd>j</kbd>/<kbd>k</kbd> or arrows, <kbd>Enter</kbd> to switch, <kbd>Esc</kbd> to close).
           </p>
 
-          <h2>Project actions</h2>
+          <h2 id="project-actions">Project actions</h2>
           <p>A <code>vmux.json</code> in a project root defines named commands, which show up under <kbd>Ctrl-b</kbd> <kbd>A</kbd> and <code>vmux actions</code>:</p>
           <pre><code>vmux actions list
 vmux actions run test</code></pre>
 
-          <h2>Update checks</h2>
+          <h2 id="update-checks">Update checks</h2>
           <p>
             vmux checks for a new release once a day and prints a notice. Disable it by setting
             <code>VMUX_NO_UPDATE_CHECK=1</code>.
@@ -213,6 +213,20 @@ vmux actions run test</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/config.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#ui">ui.*</a></li>
+              <li><a href="#relay">relay.*</a></li>
+              <li><a href="#agent-titles">agent_titles.*</a></li>
+              <li><a href="#ports">ports.*</a></li>
+              <li><a href="#automatic-tab-names">Automatic tab names</a></li>
+              <li><a href="#themes">Themes</a></li>
+              <li><a href="#responsive-layout">Responsive layout</a></li>
+              <li><a href="#project-actions">Project actions</a></li>
+              <li><a href="#update-checks">Update checks</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

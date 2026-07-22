@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -81,7 +81,7 @@
             expensively.
           </p>
 
-          <h2>Hierarchy</h2>
+          <h2 id="hierarchy">Hierarchy</h2>
           <pre><code>Session  (default, work, …)     one daemon, one socket, one state file
  └── Workspace                  sidebar row: cwd, git branch, ports, agent status
       └── Tab                   strip above the pane grid
@@ -103,7 +103,7 @@
           </p>
           <p>A <strong>pane</strong> is one PTY process — a shell, an agent, a test runner, anything with a terminal.</p>
 
-          <h2>Agents report their own state</h2>
+          <h2 id="agents-report-their-own-state">Agents report their own state</h2>
           <p>
             Panes running a coding agent surface a status in the sidebar, so you can tell at a glance which of six
             running agents is actually waiting on you:
@@ -123,7 +123,7 @@
             weighted.
           </p>
 
-          <h2>Persistence and detach</h2>
+          <h2 id="persistence-and-detach">Persistence and detach</h2>
           <p>
             Panes live inside a small background daemon, not inside your terminal. Closing SSH, shutting the laptop,
             or losing the connection does not stop anything running in a pane — reattach later and it is where you
@@ -137,7 +137,7 @@ vmux --session work attach  # reattach</code></pre>
             aside rather than deleted, so a bad write never silently erases a session.
           </p>
 
-          <h2>How the UI stays live without polling hard</h2>
+          <h2 id="how-the-ui-stays-live-without-polling-hard">How the UI stays live without polling hard</h2>
           <p>
             The daemon keeps a generation counter that increases on every meaningful change. The attach client polls
             for a snapshot <em>since</em> the generation it last saw; if nothing moved, the daemon replies
@@ -150,7 +150,7 @@ vmux --session work attach  # reattach</code></pre>
             <a href="architecture.html">Architecture</a>.
           </p>
 
-          <h2>The daemon is authoritative</h2>
+          <h2 id="the-daemon-is-authoritative">The daemon is authoritative</h2>
           <p>
             Attach is a dumb client: it renders a snapshot and sends RPCs. It keeps no layout or pane state of its
             own. If you script vmux from an agent or a shell, you are using the exact same interface the attach UI
@@ -163,6 +163,16 @@ vmux --session work attach  # reattach</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/architecture.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#hierarchy">Hierarchy</a></li>
+              <li><a href="#agents-report-their-own-state">Agents report their own state</a></li>
+              <li><a href="#persistence-and-detach">Persistence and detach</a></li>
+              <li><a href="#how-the-ui-stays-live-without-polling-hard">How the UI stays live without polling hard</a></li>
+              <li><a href="#the-daemon-is-authoritative">The daemon is authoritative</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -81,7 +81,7 @@
             <code>vmux config set ui.prefix_key Ctrl-a</code>.
           </p>
 
-          <h2>Prefix-key map</h2>
+          <h2 id="prefix-key-map">Prefix-key map</h2>
           <table>
             <thead><tr><th>Keys</th><th>Action</th></tr></thead>
             <tbody>
@@ -99,7 +99,7 @@
             </tbody>
           </table>
 
-          <h2>Ports panel</h2>
+          <h2 id="ports-panel">Ports panel</h2>
           <p>Once the ports panel is open (<kbd>Ctrl-b</kbd> <kbd>o</kbd>, or the command palette → <em>ports</em>):</p>
           <table>
             <thead><tr><th>Key</th><th>Action</th></tr></thead>
@@ -115,14 +115,14 @@
           </table>
           <p>More on ports: <a href="ports.html">Ports &amp; forwarding</a>.</p>
 
-          <h2>Mouse</h2>
+          <h2 id="mouse">Mouse</h2>
           <p>The mouse works too (<code>ui.mouse</code>, default on):</p>
           <ul>
             <li>Wheel to scroll back in a pane's history</li>
             <li>Right-click a pane for copy, paste, split, and clear</li>
           </ul>
 
-          <h2>Changing the prefix key</h2>
+          <h2 id="changing-the-prefix-key">Changing the prefix key</h2>
           <pre><code>vmux config set ui.prefix_key Ctrl-a</code></pre>
           <p>Every shortcut above shifts to whatever chord you set — the mapping does not change, only the prefix.</p>
 
@@ -132,6 +132,15 @@
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/README.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#prefix-key-map">Prefix-key map</a></li>
+              <li><a href="#ports-panel">Ports panel</a></li>
+              <li><a href="#mouse">Mouse</a></li>
+              <li><a href="#changing-the-prefix-key">Changing the prefix key</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

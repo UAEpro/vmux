@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -95,7 +95,7 @@
             relay does not change how attach, the CLI, or the daemon behave beyond that process.
           </p>
 
-          <h2>The port is not fixed</h2>
+          <h2 id="the-port-is-not-fixed">The port is not fixed</h2>
           <p>
             The historical Cmux Remote default is <strong>4399</strong>, and vmux uses that out of the box — but the
             port is not hard-wired.
@@ -116,7 +116,7 @@
             host:port.
           </p>
 
-          <h2>Settings</h2>
+          <h2 id="settings">Settings</h2>
           <p>
             In <code>vmux attach</code>, open <strong>⚙ set</strong> and find the mobile relay section:
           </p>
@@ -144,7 +144,7 @@ vmux config set relay.allow_localhost false
 vmux config set relay.allow_paste true
 vmux config set relay.allow_view_resize false</code></pre>
 
-          <h2>Running it by hand</h2>
+          <h2 id="running-it-by-hand">Running it by hand</h2>
           <pre><code>vmux relay serve
 vmux relay serve --listen 127.0.0.1:4400
 vmux relay serve --allow-localhost --listen 127.0.0.1:4399
@@ -152,7 +152,7 @@ vmux relay status
 vmux relay devices list
 vmux relay devices revoke &lt;device_id&gt;</code></pre>
 
-          <h2>Pairing a phone</h2>
+          <h2 id="pairing-a-phone">Pairing a phone</h2>
           <ol>
             <li>Install Cmux Remote, or another client that speaks the same wire protocol.</li>
             <li>Run Tailscale on the phone and on the host, on the same tailnet.</li>
@@ -164,7 +164,7 @@ vmux relay devices revoke &lt;device_id&gt;</code></pre>
 curl -s http://$(tailscale ip -4):${PORT}/v1/health
 # {"ok":true,"version":"…","backend":"vmux",…}</code></pre>
 
-          <h2>Phone-fit pane sizing</h2>
+          <h2 id="phone-fit-pane-sizing">Phone-fit pane sizing</h2>
           <p>
             Off by default — a phone glancing at a pane must not resize it under whoever is at the desk.
           </p>
@@ -176,7 +176,7 @@ curl -s http://$(tailscale ip -4):${PORT}/v1/health
             attach UI dims the pane's unused margin with a "sized by phone" note while an override is active.
           </p>
 
-          <h2>Pasting screenshots over SSH</h2>
+          <h2 id="pasting-screenshots-over-ssh">Pasting screenshots over SSH</h2>
           <p>
             Claude Code's Ctrl+V image paste reads the clipboard of the machine it runs on. When you SSH into a box
             running vmux, your screenshot is on your laptop — vmux bridges that two ways.
@@ -208,6 +208,17 @@ ssh yourbox vmux send-image - &lt; ~/Desktop/Screen*.png</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/relay.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#the-port-is-not-fixed">The port is not fixed</a></li>
+              <li><a href="#settings">Settings</a></li>
+              <li><a href="#running-it-by-hand">Running it by hand</a></li>
+              <li><a href="#pairing-a-phone">Pairing a phone</a></li>
+              <li><a href="#phone-fit-pane-sizing">Phone-fit pane sizing</a></li>
+              <li><a href="#pasting-screenshots-over-ssh">Pasting screenshots over SSH</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -82,7 +82,7 @@
             <code>vmux --help</code> or <code>vmux &lt;command&gt; --help</code> for the authoritative flags.
           </p>
 
-          <h2>Layout and panes</h2>
+          <h2 id="layout-and-panes">Layout and panes</h2>
           <pre><code>vmux new-pane --direction right --command "claude" --title backend --workspace ws-2
 vmux split right --command "claude" --title backend
 vmux focus right
@@ -106,7 +106,7 @@ vmux prune --workspace ws-2</code></pre>
             desktop sizes.
           </p>
 
-          <h2>Workspaces and tabs</h2>
+          <h2 id="workspaces-and-tabs">Workspaces and tabs</h2>
           <pre><code>vmux workspace new --name agents --command "claude"
 vmux workspace pin ws-2
 vmux workspace move ws-2 --position 1
@@ -118,7 +118,7 @@ vmux tab rename tab-2 --title integration
 vmux tab close tab-2</code></pre>
           <p><code>pane-tab</code> is deprecated. Use <code>vmux tab</code>.</p>
 
-          <h2>Agents and scripting</h2>
+          <h2 id="agents-and-scripting">Agents and scripting</h2>
           <pre><code>vmux agent new --command "claude" --title backend --workspace ws-2
 vmux agent team --agents codex,claude --cwd "$PWD"
 vmux agent list
@@ -145,7 +145,7 @@ vmux events --since 120 --follow --interval-ms 500</code></pre>
           <p>Panes export discovery variables, so a process can find its own place in the tree without being told:</p>
           <pre><code>VMUX_SESSION  VMUX_WORKSPACE_ID  VMUX_PANE_ID  VMUX_SURFACE_ID  VMUX_SOCKET_PATH</code></pre>
 
-          <h2>Notifications and events</h2>
+          <h2 id="notifications-and-events">Notifications and events</h2>
           <pre><code>vmux notify --message "build finished"
 vmux notify --pane pane-1 --status done --color green --message "agent done"
 vmux notifications --limit 10
@@ -159,7 +159,7 @@ vmux set-progress 75</code></pre>
           <pre><code>printf '\033]9;needs input\a'
 printf '\033]777;notify;Claude;waiting for approval\a'</code></pre>
 
-          <h2>Hooks</h2>
+          <h2 id="hooks">Hooks</h2>
           <p>Full guide: <a href="agents.html">Agent integrations</a>.</p>
           <pre><code>vmux hooks install                  # all detected agents
 vmux hooks status
@@ -174,7 +174,7 @@ eval "$(vmux hooks shell)"
 vmux hooks setup --dir ~/.config/vmux --rc ~/.bashrc
 echo '{"event":"needs-input","message":"waiting"}' | vmux hooks event --pane "$VMUX_PANE_ID"</code></pre>
 
-          <h2>Browser, markdown, remote</h2>
+          <h2 id="browser-markdown-remote">Browser, markdown, remote</h2>
           <pre><code>vmux open-url https://example.com
 vmux browser snapshot https://example.com
 vmux browser screenshot https://example.com
@@ -183,7 +183,7 @@ vmux markdown open README.md
 vmux remote ssh user@host --command "claude"
 vmux remote tmux user@host --session work</code></pre>
 
-          <h2>Ports</h2>
+          <h2 id="ports">Ports</h2>
           <p>Listening ports owned by pane processes. Full guide: <a href="ports.html">Ports &amp; forwarding</a>.</p>
           <pre><code>vmux ports list
 vmux ports list --workspace ws-2 --json
@@ -192,7 +192,7 @@ vmux config set ports.ssh_host 'user@devbox'
 vmux ports forward 3000 --via tailscale
 vmux ports unforward 3000</code></pre>
 
-          <h2>Relay</h2>
+          <h2 id="relay">Relay</h2>
           <p>Default port <strong>4399</strong>, change anytime. Full guide: <a href="phone-relay.html">Phone relay &amp; remote</a>.</p>
           <pre><code>vmux config set relay.port 4400
 vmux relay serve
@@ -202,7 +202,7 @@ vmux relay status
 vmux relay devices list
 vmux relay devices revoke &lt;device_id&gt;</code></pre>
 
-          <h2>Config, actions, skills</h2>
+          <h2 id="config-actions-skills">Config, actions, skills</h2>
           <pre><code>vmux config show
 vmux config init
 vmux config set ui.prefix_key Ctrl-a
@@ -218,7 +218,7 @@ vmux skills install vmux-control --dir .vmux/skills</code></pre>
             <kbd>Ctrl-b</kbd> <kbd>A</kbd>. See <a href="configuration.html">Configuration</a>.
           </p>
 
-          <h2>Session ops</h2>
+          <h2 id="session-ops">Session ops</h2>
           <pre><code>vmux daemon                 # start the daemon without attaching
 vmux sessions               # running and persisted sessions
 vmux --session work attach  # reattach, e.g. after an SSH drop
@@ -240,7 +240,7 @@ vmux stop</code></pre>
           </table>
           <p>Session state is persisted separately, in <code>~/.local/state/vmux/</code>.</p>
 
-          <h2>Full command surface</h2>
+          <h2 id="full-command-surface">Full command surface</h2>
           <pre><code>attach  daemon  new-pane  split  run  open-url  url-snapshot  url-links
 browser  agent  remote  markdown  actions  skills  config  ports  relay
 send  send-key  send-image  broadcast  read-screen  search  clear-pane
@@ -257,6 +257,22 @@ status  sessions  logs  doctor  smoke  stop</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/cli.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#layout-and-panes">Layout and panes</a></li>
+              <li><a href="#workspaces-and-tabs">Workspaces and tabs</a></li>
+              <li><a href="#agents-and-scripting">Agents and scripting</a></li>
+              <li><a href="#notifications-and-events">Notifications and events</a></li>
+              <li><a href="#hooks">Hooks</a></li>
+              <li><a href="#browser-markdown-remote">Browser, markdown, remote</a></li>
+              <li><a href="#ports">Ports</a></li>
+              <li><a href="#relay">Relay</a></li>
+              <li><a href="#config-actions-skills">Config, actions, skills</a></li>
+              <li><a href="#session-ops">Session ops</a></li>
+              <li><a href="#full-command-surface">Full command surface</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

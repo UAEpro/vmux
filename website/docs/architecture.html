@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -81,7 +81,7 @@
             just want to know why it feels this fast.
           </p>
 
-          <h2>Processes</h2>
+          <h2 id="processes">Processes</h2>
           <pre><code>┌──────────────────┐   JSON-RPC over    ┌──────────────────────────┐
 │  vmux CLI        │   Unix socket      │  vmux daemon             │
 │  vmux attach UI  │ ─────────────────► │  owns PTYs, layout,      │
@@ -110,14 +110,14 @@
             pid/log files live under <code>$XDG_RUNTIME_DIR/vmux</code> (or <code>/tmp/vmux-$UID/vmux</code>).
           </p>
 
-          <h2>Hierarchy</h2>
+          <h2 id="hierarchy">Hierarchy</h2>
           <pre><code>Session  (default, work, …)     one daemon, one socket, one state file
  └── Workspace                  sidebar row: cwd, git branch, ports, agent status
       └── Tab                   strip above the pane grid
            └── Pane             one PTY process</code></pre>
           <p>Plain-language version with examples: <a href="concepts.html">Concepts</a>.</p>
 
-          <h2>Snapshots and repaints</h2>
+          <h2 id="snapshots-and-repaints">Snapshots and repaints</h2>
           <ul>
             <li><code>Server.generation</code> is bumped on every meaningful session/runtime change.</li>
             <li>Clients poll <code>Snapshot { since }</code>. If nothing moved, the daemon returns <code>{ unchanged: true, generation }</code> and the UI skips a repaint.</li>
@@ -136,7 +136,7 @@
             <a href="ports.html">Ports &amp; forwarding</a>.
           </p>
 
-          <h2>Locks</h2>
+          <h2 id="locks">Locks</h2>
           <p>
             The daemon is a struct of <strong>independent</strong> mutexes (session, panes, workspace metadata, …),
             not one big lock. Holding the session lock and the panes lock at the same time is forbidden — take one,
@@ -144,14 +144,14 @@
             handler thread cannot brick the daemon or relay.
           </p>
 
-          <h2>Config surface</h2>
+          <h2 id="config-surface">Config surface</h2>
           <p>
             User config covers <code>ui.*</code>, <code>relay.*</code>, <code>agent_titles.*</code>, and
             <code>ports.*</code> — full reference at <a href="configuration.html">Configuration</a>, JSON Schema at
             <a href="https://github.com/UAEpro/vmux/blob/main/docs/config.schema.json">config.schema.json</a>.
           </p>
 
-          <h2>Source map</h2>
+          <h2 id="source-map">Source map</h2>
           <pre><code>src/
   main.rs           entry point
   cli.rs            clap commands
@@ -176,6 +176,17 @@
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/architecture.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#processes">Processes</a></li>
+              <li><a href="#hierarchy">Hierarchy</a></li>
+              <li><a href="#snapshots-and-repaints">Snapshots and repaints</a></li>
+              <li><a href="#locks">Locks</a></li>
+              <li><a href="#config-surface">Config surface</a></li>
+              <li><a href="#source-map">Source map</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -81,7 +81,7 @@
             <a href="architecture.html">Architecture</a> and <a href="configuration.html">Configuration</a>.
           </p>
 
-          <h2>Attach fails</h2>
+          <h2 id="attach-fails">Attach fails</h2>
           <p><strong>Symptom:</strong> <code>vmux attach</code> errors, hangs, or exits immediately.</p>
           <table>
             <thead><tr><th>Check</th><th>What to do</th></tr></thead>
@@ -96,7 +96,7 @@
 vmux status
 vmux logs --lines 200</code></pre>
 
-          <h2>Phantom sessions in <code>vmux sessions</code></h2>
+          <h2 id="phantom-sessions-in-vmux-sessions">Phantom sessions in <code>vmux sessions</code></h2>
           <p><strong>Symptom:</strong> names like <code>update-check</code> or <code>relay-devices</code> appear as sessions.</p>
           <p>
             Those are daemon state files that live next to session JSON under <code>~/.local/state/vmux/</code>.
@@ -104,7 +104,7 @@ vmux logs --lines 200</code></pre>
             create a real session with one of those names.
           </p>
 
-          <h2>Relay will not pair / phone cannot connect</h2>
+          <h2 id="relay-will-not-pair-phone-cannot-connect">Relay will not pair / phone cannot connect</h2>
           <p>See also <a href="phone-relay.html">Phone relay &amp; remote</a>.</p>
           <ol>
             <li>Tailscale up on <strong>both</strong> phone and host, same tailnet.</li>
@@ -122,7 +122,7 @@ vmux relay serve --listen 127.0.0.1:4400</code></pre>
           </ol>
           <p>The relay <strong>never</strong> binds <code>0.0.0.0</code> / <code>::</code>. LAN-wide exposure is intentionally unsupported — use Tailscale.</p>
 
-          <h2>Agent hooks not updating the sidebar</h2>
+          <h2 id="agent-hooks-not-updating-the-sidebar">Agent hooks not updating the sidebar</h2>
           <ol>
             <li><code>vmux hooks status</code> — incomplete installs are reported.</li>
             <li>Reinstall: <code>vmux hooks install</code> (or <code>--agent claude|codex|grok|shell</code>).</li>
@@ -136,7 +136,7 @@ vmux notify --status done --message "tests passed"</code></pre>
           </ol>
           <p>Automatic tab titles need <code>agent_titles.enabled</code> (default on) and a daemon restart after config changes.</p>
 
-          <h2>Scrollback missing or shorter than expected</h2>
+          <h2 id="scrollback-missing-or-shorter-than-expected">Scrollback missing or shorter than expected</h2>
           <ul>
             <li>
               Retention is <code>ui.scrollback_bytes</code> (default 200 KB, clamp 16 KB–5 MB), applied on the
@@ -149,14 +149,14 @@ vmux attach</code></pre>
             <li>Lean attach polls omit full history except for panes you are scrolled back in.</li>
           </ul>
 
-          <h2>Port detection empty</h2>
+          <h2 id="port-detection-empty">Port detection empty</h2>
           <p>
             See <a href="ports.html">Ports &amp; forwarding</a>. Short version: Linux only, leave
             <code>ports.enabled</code> on, ensure the listener is a child of a pane process, and check
             <code>ports.ignore</code> / <code>ignore_ephemeral</code>.
           </p>
 
-          <h2>Config changes seem ignored</h2>
+          <h2 id="config-changes-seem-ignored">Config changes seem ignored</h2>
           <ul>
             <li>Many keys apply immediately; <code>ui.scrollback_bytes</code> and some title settings need a daemon restart.</li>
             <li>Malformed config is ignored on read (defaults) with a warning; mutation commands refuse to overwrite a broken file — fix or delete <code>~/.config/vmux/config.json</code> first.</li>
@@ -164,11 +164,11 @@ vmux attach</code></pre>
           </ul>
           <pre><code>vmux config show</code></pre>
 
-          <h2>Develop without killing your real session</h2>
+          <h2 id="develop-without-killing-your-real-session">Develop without killing your real session</h2>
           <pre><code>cargo run -- --session dev attach</code></pre>
           <p>Never point a buggy debug build at the session where your agents live.</p>
 
-          <h2>Still stuck</h2>
+          <h2 id="still-stuck">Still stuck</h2>
           <pre><code>vmux doctor
 vmux logs --lines 200
 vmux --version</code></pre>
@@ -183,6 +183,20 @@ vmux --version</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/troubleshooting.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#attach-fails">Attach fails</a></li>
+              <li><a href="#phantom-sessions-in-vmux-sessions">Phantom sessions in vmux sessions</a></li>
+              <li><a href="#relay-will-not-pair-phone-cannot-connect">Relay will not pair / phone cannot connect</a></li>
+              <li><a href="#agent-hooks-not-updating-the-sidebar">Agent hooks not updating the sidebar</a></li>
+              <li><a href="#scrollback-missing-or-shorter-than-expected">Scrollback missing or shorter than expected</a></li>
+              <li><a href="#port-detection-empty">Port detection empty</a></li>
+              <li><a href="#config-changes-seem-ignored">Config changes seem ignored</a></li>
+              <li><a href="#develop-without-killing-your-real-session">Develop without killing your real session</a></li>
+              <li><a href="#still-stuck">Still stuck</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

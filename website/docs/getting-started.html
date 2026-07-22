@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -81,7 +81,7 @@
             Panes run inside a small daemon, so when SSH drops or you close the terminal, your agents keep working.
           </p>
 
-          <h2>Install</h2>
+          <h2 id="install">Install</h2>
           <p>Prebuilt binary — Linux (x86_64, aarch64) and macOS (Apple silicon, Intel):</p>
           <pre><code>curl -fsSL https://raw.githubusercontent.com/UAEpro/vmux/main/install.sh | sh</code></pre>
           <p>
@@ -107,7 +107,7 @@
             once-a-day update check (disable with <code>VMUX_NO_UPDATE_CHECK=1</code>).
           </p>
 
-          <h2>Attach</h2>
+          <h2 id="attach">Attach</h2>
           <p>That is the whole thing — attach starts a daemon if one is not already running:</p>
           <pre><code>vmux attach</code></pre>
           <p>From there, or from any other shell:</p>
@@ -126,7 +126,7 @@ vmux identify --json</code></pre>
           <pre><code>vmux sessions               # what is still running
 vmux --session work attach  # pick up where you left off</code></pre>
 
-          <h2>See it in the sidebar</h2>
+          <h2 id="see-it-in-the-sidebar">See it in the sidebar</h2>
           <p>
             A workspace is the unit you think in — it has a directory, so a new pane opens where you expect, and the
             sidebar shows its git branch, its listening ports, and its agent's status: <strong>busy</strong>,
@@ -134,7 +134,7 @@ vmux --session work attach  # pick up where you left off</code></pre>
             <a href="concepts.html">Concepts</a>.
           </p>
 
-          <h2>Next steps</h2>
+          <h2 id="next-steps">Next steps</h2>
           <ul>
             <li>Learn the <a href="keyboard-shortcuts.html">keyboard shortcuts</a> — one prefix key drives everything.</li>
             <li>Wire up <a href="agents.html">agent hooks</a> so Claude Code, Codex, and Grok report status automatically.</li>
@@ -148,6 +148,15 @@ vmux --session work attach  # pick up where you left off</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/README.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#install">Install</a></li>
+              <li><a href="#attach">Attach</a></li>
+              <li><a href="#see-it-in-the-sidebar">See it in the sidebar</a></li>
+              <li><a href="#next-steps">Next steps</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

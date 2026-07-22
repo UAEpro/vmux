@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -81,7 +81,7 @@
             agent state lands in the sidebar without you doing anything else.
           </p>
 
-          <h2>Install hooks</h2>
+          <h2 id="install-hooks">Install hooks</h2>
           <pre><code>vmux hooks install                  # all detected agents
 vmux hooks status
 vmux hooks install --agent claude   # ~/.claude/settings.json
@@ -95,7 +95,7 @@ vmux hooks install --agent shell</code></pre>
             <code>vmux hooks status</code> any time to see which are wired up.
           </p>
 
-          <h2>Screen-manifest detection</h2>
+          <h2 id="screen-manifest-detection">Screen-manifest detection</h2>
           <p>
             For agents without a hook system, vmux can also read the pane's screen contents against known UI
             patterns (herdr-style primary status for Claude/Codex/…). Screen rules take priority; hooks fill in when
@@ -106,13 +106,13 @@ printf '%s\n' ' ❯  ' | vmux detect --agent claude
 vmux detect --agent claude --file screen.txt --osc-title $'⣿ thinking' --json
 # Local rule overrides: ~/.config/vmux/agent-detection/&lt;agent&gt;.toml</code></pre>
 
-          <h2>Status is sticky when it matters</h2>
+          <h2 id="status-is-sticky-when-it-matters">Status is sticky when it matters</h2>
           <p>
             <strong>Done (✅)</strong> is sticky — it stays until you actually look at the pane, so an agent finishing
             while you were in another workspace is still there when you get back.
           </p>
 
-          <h2>Drive it yourself</h2>
+          <h2 id="drive-it-yourself">Drive it yourself</h2>
           <p>To report status from a script or an agent with no built-in integration:</p>
           <pre><code>vmux set-status busy --message "working"
 vmux set-progress 75
@@ -126,7 +126,7 @@ vmux jump-notification</code></pre>
           <pre><code>printf '\033]9;needs input\a'
 printf '\033]777;notify;Claude;waiting for approval\a'</code></pre>
 
-          <h2>Shell integration and scripting</h2>
+          <h2 id="shell-integration-and-scripting">Shell integration and scripting</h2>
           <pre><code>eval "$(vmux hooks shell)"
 vmux hooks setup --dir ~/.config/vmux --rc ~/.bashrc
 echo '{"event":"needs-input","message":"waiting"}' | vmux hooks event --pane "$VMUX_PANE_ID"</code></pre>
@@ -135,14 +135,14 @@ echo '{"event":"needs-input","message":"waiting"}' | vmux hooks event --pane "$V
 vmux_hook_attention "waiting for approval"
 vmux_hook_progress 50</code></pre>
 
-          <h2>Automatic tab names</h2>
+          <h2 id="automatic-tab-names">Automatic tab names</h2>
           <p>
             Any tab holding a coding agent names itself after the work in it — see
             <a href="configuration.html#automatic-tab-names">Configuration → automatic tab names</a> for the full
             source order (OSC titles, hook prompts, status messages, LLM fallback).
           </p>
 
-          <h2>Finding your own place in the tree</h2>
+          <h2 id="finding-your-own-place-in-the-tree">Finding your own place in the tree</h2>
           <p>Panes export discovery variables, so a process can find its own place without being told:</p>
           <pre><code>VMUX_SESSION  VMUX_WORKSPACE_ID  VMUX_PANE_ID  VMUX_SURFACE_ID  VMUX_SOCKET_PATH</code></pre>
           <pre><code>vmux identify --json
@@ -157,7 +157,7 @@ vmux agent send --agent pane-1 --enter "continue"</code></pre>
             <code>vmux hooks status</code> flags a hook that only mentions the old name as stale.</p>
           </div>
 
-          <h2>Multi-agent teams</h2>
+          <h2 id="multi-agent-teams">Multi-agent teams</h2>
           <pre><code>vmux agent new --command "claude" --title backend --workspace ws-2
 vmux agent team --agents codex,claude --cwd "$PWD"
 vmux agent list
@@ -171,6 +171,19 @@ vmux wait --pane pane-1 --status attention,done,error --timeout 600</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/cli.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#install-hooks">Install hooks</a></li>
+              <li><a href="#screen-manifest-detection">Screen-manifest detection</a></li>
+              <li><a href="#status-is-sticky-when-it-matters">Status is sticky when it matters</a></li>
+              <li><a href="#drive-it-yourself">Drive it yourself</a></li>
+              <li><a href="#shell-integration-and-scripting">Shell integration and scripting</a></li>
+              <li><a href="#automatic-tab-names">Automatic tab names</a></li>
+              <li><a href="#finding-your-own-place-in-the-tree">Finding your own place in the tree</a></li>
+              <li><a href="#multi-agent-teams">Multi-agent teams</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

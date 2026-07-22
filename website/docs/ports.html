@@ -38,7 +38,7 @@
     </header>
 
     <main id="main" class="page-main docs-main">
-      <div class="docs-shell" style="margin-top: 40px">
+      <div class="docs-shell">
         <aside class="docs-sidebar" aria-label="Documentation">
           <div class="docs-sidebar-group">
             <span class="docs-group-title">Introduction</span>
@@ -87,7 +87,7 @@
             the main scanner.</p>
           </div>
 
-          <h2>How detection works</h2>
+          <h2 id="how-detection-works">How detection works</h2>
           <p>A dedicated background loop (default every <code>ports.poll_secs</code>, never the snapshot hot path):</p>
           <ol>
             <li>Collects each pane's root PID and walks descendants via a single <code>/proc</code> ppid map.</li>
@@ -106,7 +106,7 @@ vmux config set ports.ignore_processes ssh,sshd
 vmux config set ports.ignore_ephemeral true  # default: hide kernel ephemeral range</code></pre>
           <p>Full key list: <a href="configuration.html#ports">Configuration → ports.*</a>. Array keys are comma-separated on the CLI; edit <code>config.json</code> for complex lists.</p>
 
-          <h2>CLI</h2>
+          <h2 id="cli">CLI</h2>
           <pre><code># List detected ports (optional workspace filter)
 vmux ports list
 vmux ports list --workspace ws-2 --json
@@ -140,7 +140,7 @@ vmux ports unforward 3000</code></pre>
             runtime-only; pane exit and <code>unforward</code> stop them.
           </p>
 
-          <h2>Security</h2>
+          <h2 id="security">Security</h2>
           <ul>
             <li>Forwards never bind all interfaces — only the Tailscale IP.</li>
             <li>The phone <a href="phone-relay.html">relay</a> is a separate surface and also refuses public binds. Don't confuse <code>relay.port</code> (default 4399) with application ports (3000, 5173, …).</li>
@@ -148,14 +148,14 @@ vmux ports unforward 3000</code></pre>
             <li>Put noisy ports/processes in <code>ports.ignore</code> / <code>ports.ignore_processes</code>.</li>
           </ul>
 
-          <h2>Sidebar and attach UI</h2>
+          <h2 id="sidebar-and-attach-ui">Sidebar and attach UI</h2>
           <p>
             When ports are present, the workspace detail row shows short labels (<code>:3000</code>). Open the panel
             with the command palette → <em>ports</em>, or the prefix key — see
             <a href="keyboard-shortcuts.html">Keyboard shortcuts</a> for the panel's keys.
           </p>
 
-          <h2>Troubleshooting</h2>
+          <h2 id="troubleshooting">Troubleshooting</h2>
           <table>
             <thead><tr><th>Symptom</th><th>Check</th></tr></thead>
             <tbody>
@@ -173,6 +173,16 @@ vmux ports unforward 3000</code></pre>
           </div>
           <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/ports.md">Edit this page on GitHub</a></div>
         </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#how-detection-works">How detection works</a></li>
+              <li><a href="#cli">CLI</a></li>
+              <li><a href="#security">Security</a></li>
+              <li><a href="#sidebar-and-attach-ui">Sidebar and attach UI</a></li>
+              <li><a href="#troubleshooting">Troubleshooting</a></li>
+          </ul>
+        </aside>
       </div>
     </main>
 

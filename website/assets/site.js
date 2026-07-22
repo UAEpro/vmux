@@ -82,6 +82,24 @@ document.querySelectorAll("[data-copy]").forEach((button) => {
   });
 });
 
+const tocLinks = document.querySelectorAll(".docs-toc a");
+if (tocLinks.length && "IntersectionObserver" in window) {
+  const setActive = (id) => {
+    tocLinks.forEach((link) => link.classList.toggle("active", link.hash === `#${id}`));
+  };
+  const headings = Array.from(tocLinks)
+    .map((link) => document.getElementById(decodeURIComponent(link.hash.slice(1))))
+    .filter(Boolean);
+  const tocObserver = new IntersectionObserver(
+    (entries) => {
+      const visible = entries.filter((entry) => entry.isIntersecting);
+      if (visible.length) setActive(visible[0].target.id);
+    },
+    { rootMargin: "-100px 0px -70% 0px", threshold: 0 },
+  );
+  headings.forEach((heading) => tocObserver.observe(heading));
+}
+
 const reveals = document.querySelectorAll(".reveal");
 if ("IntersectionObserver" in window) {
   const observer = new IntersectionObserver(
