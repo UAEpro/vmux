@@ -1014,13 +1014,12 @@ impl Ui {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
+        // Bell only on agent_status Attention — not on a leftover banner
+        // (screen detection clears banners when leaving Attention).
         let now: BTreeSet<String> = snapshot
             .panes
             .iter()
-            .filter(|(_, pane)| {
-                matches!(pane.agent_status, crate::model::AgentStatus::Attention)
-                    || pane.notification_message.is_some()
-            })
+            .filter(|(_, pane)| matches!(pane.agent_status, crate::model::AgentStatus::Attention))
             .map(|(id, _)| id.clone())
             .collect();
         let new_attention = now.difference(&self.prev_attention_panes).next().is_some();

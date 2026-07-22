@@ -224,6 +224,52 @@ pub fn merge_screen_status(
     Some((next, pinned))
 }
 
+/// Human message for the notification feed/banner when screen detection
+/// elevates a pane to Attention (blocked / needs input).
+pub fn screen_attention_message(detection: &Detection) -> String {
+    let agent = detection.agent.unwrap_or("agent");
+    match detection.matched_rule.as_deref() {
+        Some(rule)
+            if rule.contains("permission")
+                || rule.contains("bash_permission")
+                || rule.contains("allow") =>
+        {
+            format!("{agent} needs permission")
+        }
+        Some(rule) if rule.contains("blocked") || rule.contains("prompt") => {
+            format!("{agent} needs input")
+        }
+        Some(rule) if rule.contains("workflow") => {
+            format!("{agent} needs a decision")
+        }
+        _ => format!("{agent} needs input"),
+    }
+}
+
+/// Keep the pane banner in sync with screen-derived status: set a short
+/// message when entering Attention, clear it when leaving.
+pub fn apply_screen_notification_banner(
+    pane: &mut crate::model::Pane,
+    previous: &crate::model::AgentStatus,
+    next: &crate::model::AgentStatus,
+    detection: &Detection,
+) {
+    use crate::model::AgentStatus;
+    match next {
+        AgentStatus::Attention => {
+            pane.notification_color = Some("blue".to_string());
+            pane.notification_message = Some(screen_attention_message(detection));
+        }
+        // Leaving Attention (or clearing a leftover banner on any non-attention
+        // status): drop so the sidebar / bell cannot re-fire on stale messages.
+        _ if matches!(previous, AgentStatus::Attention) || pane.notification_message.is_some() => {
+            pane.notification_message = None;
+            pane.notification_color = None;
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +350,46 @@ Do you want to proceed?
             merge_screen_status(AgentStatus::Done, &working),
             Some((AgentStatus::Busy, false))
         );
+    }
+
+    #[test]
+    fn screen_attention_banner_set_and_cleared() {
+        use crate::cli::SplitDirection;
+        use crate::model::{AgentStatus, Pane};
+        let mut pane = Pane::new("p".into(), "claude".into(), SplitDirection::Right);
+        let blocked = Detection {
+            agent: Some("claude"),
+            state: DetectedState::Blocked,
+            skip_state_update: false,
+            visible_idle: false,
+            visible_blocker: true,
+            visible_working: false,
+            matched_rule: Some("bash_permission_prompt".into()),
+            fallback_reason: None,
+        };
+        apply_screen_notification_banner(
+            &mut pane,
+            &AgentStatus::Busy,
+            &AgentStatus::Attention,
+            &blocked,
+        );
+        assert_eq!(
+            pane.notification_message.as_deref(),
+            Some("claude needs permission")
+        );
+        apply_screen_notification_banner(
+            &mut pane,
+            &AgentStatus::Attention,
+            &AgentStatus::Idle,
+            &Detection {
+                state: DetectedState::Idle,
+                matched_rule: Some("live_prompt_box".into()),
+                visible_idle: true,
+                visible_blocker: false,
+                ..blocked
+            },
+        );
+        assert!(pane.notification_message.is_none());
+        assert!(pane.notification_color.is_none());
     }
 }
