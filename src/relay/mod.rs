@@ -551,7 +551,13 @@ pub fn assert_safe_listen(listen: &str) -> Result<()> {
         .map(|(h, _)| h.trim())
         .unwrap_or(listen.trim());
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host == "0.0.0.0" || host == "::" || host == "*" {
+    // Parse-based check catches unspecified aliases the string match misses
+    // (`::0`, `0:0:0:0:0:0:0:0`, …); keep the literals for non-address forms.
+    let unspecified = host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_unspecified())
+        .unwrap_or(false);
+    if unspecified || host == "0.0.0.0" || host == "::" || host == "*" {
         bail!(
             "refusing to bind relay on {host} (all interfaces). \
              Use Tailscale IP, 127.0.0.1, or relay.bind=auto|tailscale|local"
@@ -953,8 +959,33 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 256 * 1024;
 /// Body cap for authenticated POST /v1/paste (browser screenshot paste).
 const MAX_PASTE_BODY: usize = 16 * 1024 * 1024;
+/// Cap for a single WebSocket message (tungstenite would otherwise default to
+/// 64 MiB). The largest legitimate frame is a `file.upload` carrying a
+/// MAX_PASTE_BODY-sized file as base64 inside JSON (~4/3 × 16 MiB), so 24 MiB
+/// leaves headroom without letting one authenticated connection stage 64 MiB.
+const MAX_WS_MSG: usize = 24 * 1024 * 1024;
+// A MAX_PASTE_BODY file arrives over WS as base64 (4/3 overhead) inside JSON;
+// the cap must fit that while staying below tungstenite's 64 MiB default.
+const _: () = assert!(MAX_WS_MSG > MAX_PASTE_BODY / 3 * 4 + MAX_HTTP_BODY);
+const _: () = assert!(MAX_WS_MSG < 64 * 1024 * 1024);
 /// Served at GET /paste: browser page that pastes clipboard images into panes.
 const PASTE_PAGE: &str = include_str!("paste_page.html");
+
+/// Minimal HTML entity escaping for values substituted into PASTE_PAGE.
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 /// Bound on the per-connection outbound push queue. A stalled client blocks
 /// `ws.send` up to the 30s write timeout; with an unbounded channel the surface
 /// pollers would buffer ~30s of full-snapshot frames in memory. When the queue
@@ -1081,8 +1112,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
                 return Ok(());
             }
             // Static page, no secrets: pairing/auth happens from its JS via
-            // the same registration flow the phone app uses.
-            let page = PASTE_PAGE.replace("{{SESSION}}", &state.config.session);
+            // the same registration flow the phone app uses. Session names are
+            // operator-set today, but escape anyway so a future network-
+            // reachable rename can never become stored XSS on this page.
+            let page = PASTE_PAGE.replace("{{SESSION}}", &html_escape(&state.config.session));
             write_http(
                 &mut stream,
                 200,
@@ -1387,7 +1420,12 @@ fn handle_ws_upgrade(
         pos: 0,
         inner: stream,
     };
-    let mut ws = tungstenite::WebSocket::from_raw_socket(socket, Role::Server, None);
+    let ws_config = tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_WS_MSG),
+        max_frame_size: Some(MAX_WS_MSG),
+        ..Default::default()
+    };
+    let mut ws = tungstenite::WebSocket::from_raw_socket(socket, Role::Server, Some(ws_config));
     ws.get_mut()
         .set_read_timeout(Some(Duration::from_millis(200)))
         .ok();
@@ -3363,6 +3401,19 @@ mod tests {
         assert!(assert_safe_listen("[::]:4399").is_err());
         assert!(assert_safe_listen("127.0.0.1:4399").is_ok());
         assert!(assert_safe_listen("100.92.56.118:4399").is_ok());
+        // Unspecified aliases the plain string match would miss.
+        assert!(assert_safe_listen("[::0]:4399").is_err());
+        assert!(assert_safe_listen("[0:0:0:0:0:0:0:0]:4399").is_err());
+        assert!(assert_safe_listen("[::1]:4399").is_ok());
+    }
+
+    #[test]
+    fn html_escape_neutralizes_markup() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x")&'</script>"#),
+            "&lt;script&gt;alert(&quot;x&quot;)&amp;&#39;&lt;/script&gt;"
+        );
+        assert_eq!(html_escape("plain-session_1"), "plain-session_1");
     }
 
     #[test]
