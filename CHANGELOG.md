@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.6.0 — 2026-07-22
+
+Feature release: layout skins separate from color palettes, herdr-style
+agent detection and fidelity, relay hardening, docs site, and reliability
+fixes. Upgrade with the install one-liner, `cargo install vmux-tui`, or
+wait for the in-app update notice.
+
+### Added
+
+- **Layout skins vs color palettes.** Structure (`ui.layout`: classic,
+  compact, minimal, flat, zen) is independent of palette (`ui.colors` /
+  legacy `ui.theme`). Sidebar, control bar, tabs, and pane frames each
+  change with the skin; Compact/Flat keep short colored toolbar labels so
+  action colors show. Settings rows + config schema/docs.
+- **Herdr-parity agent fidelity**: higher-fidelity agent TUI surfaces,
+  wait helpers, status, resume, and copy paths for agent workflows.
+- **Screen-manifest agent status detection** (herdr-style) so sidebar
+  status tracks on-screen agent state more reliably.
+- **Website docs section** (getting started, architecture, CLI, relay,
+  ports, troubleshooting, …) with improved layout/TOC and asset cache-bust.
+
+### Changed
+
+- **`ui.sidebar_fit` defaults on** so the rail tracks workspace name width.
+- Dependency and Actions bumps (clap, ureq, serde, anyhow, tui group,
+  portable-pty, checkout/artifact/pages actions, …).
+
+### Fixed
+
+- **Relay hardening**: WebSocket message size cap, robust unspecified-bind
+  checks, safer paste-page session handling; survive missing/broken
+  Tailscale CLI on macOS with clearer diagnostics.
+- **Notification feed + banner** stay in sync with screen Attention.
+- **Pane size upper bound clamped** to avoid vt100 OOM-abort on huge
+  resize requests.
+- **macOS clippy**: cfg-gated Linux-only fallbacks so the matrix stays clean.
+
 ## v0.5.0 — 2026-07-16
 
 Feature release: ports panel, phone multi-viewer sizing, settings that
