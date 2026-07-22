@@ -20,7 +20,10 @@ use settings_panel::{
 };
 #[cfg(test)]
 use settings_panel::{settings_panel_lines, settings_tab_strip};
-use theme::{ThemePalette, UiTheme, UiWorkspaceSecondLine};
+use theme::{
+    ControlBarStyle, LayoutChrome, PaneFrameStyle, SidebarStyle, TabBarStyle, ThemePalette,
+    UiLayout, UiTheme, UiWorkspaceSecondLine,
+};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
@@ -53,6 +56,8 @@ use crate::model::{LayoutNode, Session, SplitAxis};
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request};
 
+/// Classic default: control buttons + session footer (also used by tests).
+#[cfg_attr(not(test), allow(dead_code))]
 const CONTROL_BAR_HEIGHT: u16 = 2;
 /// Workspace tab strip above the pane grid (Workspace → Tab → Pane).
 const TAB_BAR_HEIGHT: u16 = 1;
@@ -286,6 +291,8 @@ struct Ui {
     last_click: Option<ClickStamp>,
     selection: Option<TextSelection>,
     theme: UiTheme,
+    /// Screen structure (classic / compact / minimal / flat / zen).
+    layout: UiLayout,
     workspace_second_line: UiWorkspaceSecondLine,
     scroll_step: usize,
     cursor_blink: bool,
@@ -644,7 +651,12 @@ impl Ui {
             last_click: None,
             selection: None,
             last_mirrored_clipboard: None,
-            theme: UiTheme::from_name(&config.ui.theme),
+            theme: UiTheme::from_name(if config.ui.colors.is_empty() {
+                &config.ui.theme
+            } else {
+                &config.ui.colors
+            }),
+            layout: UiLayout::from_name(&config.ui.layout),
             workspace_second_line: UiWorkspaceSecondLine::from_name(
                 &config.ui.workspace_second_line,
             ),
@@ -841,6 +853,7 @@ impl Ui {
                             self.rename_dialog.as_ref(),
                             self.selection.as_ref(),
                             self.theme,
+                            self.layout,
                             self.workspace_second_line,
                             cursor_blink_on,
                             self.status_markers.as_str(),
@@ -1317,7 +1330,8 @@ impl Ui {
                 MouseEventKind::ScrollUp => {
                     let (tw, th) = terminal_size()?;
                     // Horizontal scroll when pointer is on the control bar.
-                    if th >= CONTROL_BAR_HEIGHT && mouse.row == th.saturating_sub(2) {
+                    let bar_row = th.saturating_sub(self.control_bar_h());
+                    if th >= self.control_bar_h() && mouse.row == bar_row {
                         self.control_bar_scroll = self.control_bar_scroll.saturating_sub(1);
                     } else if !matches!(self.mode, UiMode::Panes) || self.modal_active() {
                         // Don't scroll panes under overlays or confirm/rename modals.
@@ -1341,17 +1355,18 @@ impl Ui {
                 }
                 MouseEventKind::ScrollDown => {
                     let (_tw, th) = terminal_size()?;
-                    if th >= CONTROL_BAR_HEIGHT && mouse.row == th.saturating_sub(2) {
+                    let bar_row = th.saturating_sub(self.control_bar_h());
+                    if th >= self.control_bar_h() && mouse.row == bar_row {
                         let area = Rect::new(
                             self.layout_sidebar_cols(),
-                            th.saturating_sub(2),
+                            bar_row,
                             _tw.saturating_sub(self.layout_sidebar_cols()),
                             1,
                         );
                         let max = control_bar_layout(
                             area,
                             self.control_bar_scroll,
-                            self.is_compact_layout(),
+                            self.control_bar_style(),
                         )
                         .max_scroll;
                         self.control_bar_scroll = (self.control_bar_scroll + 1).min(max);
@@ -2068,6 +2083,52 @@ impl Ui {
             .unwrap_or(false)
     }
 
+    /// Bottom chrome height (control bar ± footer) for the selected layout skin.
+    fn control_bar_h(&self) -> u16 {
+        self.layout.chrome().control_bar_height.max(1)
+    }
+
+    /// Layout control-bar presentation (narrow terms always use equal icon tiles).
+    fn control_bar_style(&self) -> ControlBarStyle {
+        if self.is_compact_layout() {
+            ControlBarStyle::Icons
+        } else {
+            self.layout.chrome().control_bar_style
+        }
+    }
+
+    /// Workspace tab strip height for the active workspace (0 when the skin hides it).
+    fn grid_tab_h(&self) -> u16 {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return TAB_BAR_HEIGHT;
+        };
+        let tab_count = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.id == snapshot.active_workspace)
+            .map(|w| w.tabs.len())
+            .unwrap_or(0);
+        self.layout.tab_bar_height(tab_count)
+    }
+
+    /// Pane grid rect matching `draw()` for the current layout skin.
+    fn pane_grid_area(&self, sidebar_cols: u16, width: u16, height: u16) -> Rect {
+        pane_area(
+            sidebar_cols,
+            width,
+            height,
+            self.control_bar_h(),
+            self.grid_tab_h(),
+        )
+    }
+
+    /// Whether this pane draws a border under the current layout skin.
+    fn pane_has_border(&self, pane_id: &str) -> bool {
+        let chrome = self.layout.chrome();
+        let active = self.active_pane().as_deref() == Some(pane_id);
+        chrome.pane_borders(active, false) != Borders::NONE
+    }
+
     /// Sidebar column count after responsive rules (0 = fully hidden).
     ///
     /// Must match what `draw()` uses for layout so control-bar hit testing
@@ -2132,7 +2193,8 @@ impl Ui {
             return Ok(());
         };
         match entry.id {
-            SettingsEntryId::Theme => self.set_theme(self.theme.relative(delta))?,
+            SettingsEntryId::Layout => self.set_layout(self.layout.relative(delta))?,
+            SettingsEntryId::Colors => self.set_colors(self.theme.relative(delta))?,
             SettingsEntryId::WorkspaceLine => {
                 self.set_workspace_second_line(self.workspace_second_line.relative(delta))?;
             }
@@ -2383,9 +2445,16 @@ impl Ui {
         Ok(())
     }
 
-    fn set_theme(&mut self, theme: UiTheme) -> Result<()> {
+    fn set_colors(&mut self, theme: UiTheme) -> Result<()> {
         self.theme = theme;
+        // Write both keys so legacy `ui.theme` readers stay in sync.
+        self.save_ui_config("ui.colors", theme.name())?;
         self.save_ui_config("ui.theme", theme.name())
+    }
+
+    fn set_layout(&mut self, layout: UiLayout) -> Result<()> {
+        self.layout = layout;
+        self.save_ui_config("ui.layout", layout.name())
     }
 
     fn set_workspace_second_line(&mut self, second_line: UiWorkspaceSecondLine) -> Result<()> {
@@ -3007,9 +3076,10 @@ impl Ui {
         self.update_hover(column, row)?;
         let (width, height) = terminal_size()?;
         let layout_cols = self.layout_sidebar_cols();
+        let control_h = self.control_bar_h();
         // Modal-first: dialogs own input before sidebar resize / chrome.
         if self.rename_dialog.is_some() {
-            let main = confirm_main_area(layout_cols, width, height);
+            let main = confirm_main_area(layout_cols, width, height, control_h);
             if let Some((ok, cancel)) = rename_button_rects(main) {
                 if point_in_rect(ok, column, row) {
                     self.submit_rename()?;
@@ -3023,7 +3093,7 @@ impl Ui {
             return Ok(false);
         }
         if self.pending_confirm.is_some() {
-            let main = confirm_main_area(layout_cols, width, height);
+            let main = confirm_main_area(layout_cols, width, height, control_h);
             if let Some((yes, no)) = confirm_button_rects(main) {
                 if point_in_rect(yes, column, row) {
                     self.confirm_pending()?;
@@ -3041,7 +3111,7 @@ impl Ui {
         if !self.sidebar_collapsed
             && layout_cols > 0
             && is_sidebar_resize_edge(column, cols)
-            && row < height.saturating_sub(CONTROL_BAR_HEIGHT)
+            && row < height.saturating_sub(control_h)
         {
             self.sidebar_resize_drag = true;
             self.sidebar_drag_workspace = None;
@@ -3050,7 +3120,7 @@ impl Ui {
         }
         // ☰ workspace picker: click a row to switch.
         if self.mode == UiMode::WorkspacePicker {
-            let main = confirm_main_area(layout_cols, width, height);
+            let main = confirm_main_area(layout_cols, width, height, control_h);
             // List starts one row below the border title.
             if column > main.x
                 && column < main.x.saturating_add(main.width)
@@ -3071,7 +3141,7 @@ impl Ui {
         // Settings: click a tab to switch page, click a row to select it,
         // click the selected row again to change/install it.
         if self.mode == UiMode::Settings {
-            let main = confirm_main_area(layout_cols, width, height);
+            let main = confirm_main_area(layout_cols, width, height, control_h);
             if point_in_rect(main, column, row) {
                 let content_x = main.x.saturating_add(1);
                 let content_y = main.y.saturating_add(1);
@@ -3099,7 +3169,7 @@ impl Ui {
             }
             // Clicks under the overlay must not reach hidden panes; only the
             // control bar below stays live.
-            if row < height.saturating_sub(CONTROL_BAR_HEIGHT) {
+            if row < height.saturating_sub(control_h) {
                 return Ok(false);
             }
         }
@@ -3115,7 +3185,8 @@ impl Ui {
             column,
             row,
             self.control_bar_scroll,
-            self.is_compact_layout(),
+            self.control_bar_style(),
+            control_h,
         ) {
             self.sidebar_drag_workspace = None;
             self.pane_resize_drag = None;
@@ -3126,14 +3197,15 @@ impl Ui {
                     return Ok(false);
                 }
                 ControlBarHit::ScrollRight => {
+                    let bar_row = height.saturating_sub(control_h);
                     let area = Rect::new(
                         self.layout_sidebar_cols(),
-                        height.saturating_sub(2),
+                        bar_row,
                         width.saturating_sub(self.layout_sidebar_cols()),
                         1,
                     );
                     let max =
-                        control_bar_layout(area, self.control_bar_scroll, self.is_compact_layout())
+                        control_bar_layout(area, self.control_bar_scroll, self.control_bar_style())
                             .max_scroll;
                     self.control_bar_scroll = (self.control_bar_scroll + 1).min(max);
                     return Ok(false);
@@ -3145,7 +3217,7 @@ impl Ui {
         }
         // Context menu is an overlay but must accept item clicks.
         if self.mode == UiMode::ContextMenu {
-            let menu = confirm_main_area(layout_cols, width, height);
+            let menu = confirm_main_area(layout_cols, width, height, control_h);
             if self.handle_context_click(menu, column, row)? {
                 return Ok(false);
             }
@@ -3154,7 +3226,7 @@ impl Ui {
         }
         // Notifications panel: click selects, double-click jumps.
         if self.mode == UiMode::Notifications {
-            let main = confirm_main_area(layout_cols, width, height);
+            let main = confirm_main_area(layout_cols, width, height, control_h);
             let count = self.notification_count();
             if let Some(index) = notification_index_at(main, column, row, count) {
                 let same = self.notification_selected == index;
@@ -3185,7 +3257,7 @@ impl Ui {
             return Ok(false);
         }
         if self.mode == UiMode::Panes && self.active_workspace_is_empty() {
-            let area = pane_area(layout_cols, width, height);
+            let area = self.pane_grid_area(layout_cols, width, height);
             if let Some(rect) = empty_create_pane_rect(area) {
                 if point_in_rect(rect, column, row) {
                     self.new_pane(SplitDirection::Right)?;
@@ -3196,6 +3268,7 @@ impl Ui {
         let Some(snapshot) = &self.snapshot else {
             return Ok(false);
         };
+        let tab_h = self.grid_tab_h();
         // Double-click rename targets (workspace / tab / pane title).
         if let Some((target, current)) = rename_target_at(
             snapshot,
@@ -3208,6 +3281,8 @@ impl Ui {
             row,
             self.status_markers.as_str(),
             self.tab_close_button,
+            control_h,
+            tab_h,
         ) {
             if self.is_double_click(column, row, &target) {
                 self.open_rename(target, current);
@@ -3225,11 +3300,22 @@ impl Ui {
         if self.forward_mouse_to_pane(column, row, MouseButtonCode::Left, true)? {
             return Ok(false);
         }
-        if let Some(hit) = pane_control_at(snapshot, layout_cols, width, height, column, row) {
-            self.sidebar_drag_workspace = None;
-            self.pane_resize_drag = None;
-            self.run_pane_control(hit)?;
-            return Ok(false);
+        if self.layout.chrome().show_pane_controls {
+            if let Some(hit) = pane_control_at(
+                snapshot,
+                layout_cols,
+                width,
+                height,
+                column,
+                row,
+                control_h,
+                tab_h,
+            ) {
+                self.sidebar_drag_workspace = None;
+                self.pane_resize_drag = None;
+                self.run_pane_control(hit)?;
+                return Ok(false);
+            }
         }
         match primary_mouse_action(
             snapshot,
@@ -3242,6 +3328,8 @@ impl Ui {
             row,
             self.status_markers.as_str(),
             self.tab_close_button,
+            control_h,
+            tab_h,
         ) {
             PrimaryMouseAction::SwitchWorkspace(workspace) => {
                 self.sidebar_drag_workspace = Some(workspace.clone());
@@ -3285,6 +3373,7 @@ impl Ui {
 
     fn update_hover(&mut self, column: u16, row: u16) -> Result<()> {
         let (width, height) = terminal_size()?;
+        let control_h = self.control_bar_h();
         self.hover_control = match control_bar_hit_at(
             self.layout_sidebar_cols(),
             width,
@@ -3292,14 +3381,15 @@ impl Ui {
             column,
             row,
             self.control_bar_scroll,
-            self.is_compact_layout(),
+            self.control_bar_style(),
+            control_h,
         ) {
             Some(ControlBarHit::Action(a)) => Some(a),
             _ => None,
         };
         // Notification cards: track hover for theme surface_alt highlight.
         if self.mode == UiMode::Notifications {
-            let main = confirm_main_area(self.layout_sidebar_cols(), width, height);
+            let main = confirm_main_area(self.layout_sidebar_cols(), width, height, control_h);
             let count = self.notification_count();
             self.hover_notification = notification_index_at(main, column, row, count);
         } else {
@@ -3322,12 +3412,26 @@ impl Ui {
                 })
                 .flatten()
         });
-        self.hover_pane_control = self.snapshot.as_ref().and_then(|snapshot| {
-            pane_control_at(snapshot, live_sidebar_cols, width, height, column, row)
-        });
+        let tab_h = self.grid_tab_h();
+        self.hover_pane_control = if self.layout.chrome().show_pane_controls {
+            self.snapshot.as_ref().and_then(|snapshot| {
+                pane_control_at(
+                    snapshot,
+                    live_sidebar_cols,
+                    width,
+                    height,
+                    column,
+                    row,
+                    control_h,
+                    tab_h,
+                )
+            })
+        } else {
+            None
+        };
         self.hover_empty_create = self.mode == UiMode::Panes
             && self.active_workspace_is_empty()
-            && empty_create_pane_rect(pane_area(live_sidebar_cols, width, height))
+            && empty_create_pane_rect(self.pane_grid_area(live_sidebar_cols, width, height))
                 .map(|rect| point_in_rect(rect, column, row))
                 .unwrap_or(false);
         Ok(())
@@ -3491,7 +3595,8 @@ impl Ui {
             .and_then(|snapshot| snapshot.panes.get(pane))
             .map(pane_has_tab_strip)
             .unwrap_or(false);
-        if !point_in_rect(pane_content_area(area, has_strip), column, row) {
+        let content = pane_content_area_for_chrome(area, has_strip, self.pane_has_border(pane));
+        if !point_in_rect(content, column, row) {
             self.selection = None;
             return Ok(());
         }
@@ -3577,7 +3682,11 @@ impl Ui {
             .unwrap_or(0);
         selected_text_from_pane(
             pane,
-            pane_content_area(area, pane_has_tab_strip(pane)),
+            pane_content_area_for_chrome(
+                area,
+                pane_has_tab_strip(pane),
+                self.pane_has_border(&selection.pane),
+            ),
             selection,
             scroll_offset,
         )
@@ -3600,7 +3709,11 @@ impl Ui {
         else {
             return Ok(false);
         };
-        let content = pane_content_area(area, pane_has_tab_strip(pane));
+        let content = pane_content_area_for_chrome(
+            area,
+            pane_has_tab_strip(pane),
+            self.pane_has_border(&pane_id),
+        );
         if !point_in_rect(content, column, row) {
             return Ok(false);
         }
@@ -3646,10 +3759,13 @@ impl Ui {
             .filter(|pane| active.panes.iter().any(|item| item == *pane))
         {
             let (width, height) = terminal_size()?;
-            return Ok(Some((pane.clone(), pane_area(sidebar_cols, width, height))));
+            return Ok(Some((
+                pane.clone(),
+                self.pane_grid_area(sidebar_cols, width, height),
+            )));
         }
         let (width, height) = terminal_size()?;
-        let area = pane_area(sidebar_cols, width, height);
+        let area = self.pane_grid_area(sidebar_cols, width, height);
         Ok(pane_area_at(active.layout.as_ref(), area, column, row))
     }
 
@@ -3665,7 +3781,7 @@ impl Ui {
             return Ok(None);
         };
         let (width, height) = terminal_size()?;
-        let area = pane_area(self.layout_sidebar_cols(), width, height);
+        let area = self.pane_grid_area(self.layout_sidebar_cols(), width, height);
         if active.zoomed_pane.as_deref() == Some(pane_id) {
             return Ok(Some(area));
         }
@@ -3702,6 +3818,7 @@ fn draw(
     rename: Option<&RenameDialog>,
     selection: Option<&TextSelection>,
     theme: UiTheme,
+    layout: UiLayout,
     workspace_second_line: UiWorkspaceSecondLine,
     cursor_blink_on: bool,
     status_markers: &str,
@@ -3734,10 +3851,21 @@ fn draw(
     control_bar_scroll: usize,
 ) {
     let palette = theme.palette();
+    let chrome = layout.chrome();
+    let control_h = chrome.control_bar_height.max(1);
     let term_w = frame.area().width;
-    let compact = sidebar_responsive && term_w < COMPACT_TERM_WIDTH;
+    let narrow = sidebar_responsive && term_w < COMPACT_TERM_WIDTH;
+    let bar_style = if narrow {
+        ControlBarStyle::Icons
+    } else {
+        chrome.control_bar_style
+    };
+    let compact = matches!(
+        bar_style,
+        ControlBarStyle::Icons | ControlBarStyle::Ghost | ControlBarStyle::Pills
+    );
     // Mobile / narrow: fully hide the rail; ☰ menu picks workspaces instead.
-    let sidebar_width = if compact {
+    let sidebar_width = if narrow {
         0
     } else {
         sidebar_width(sidebar_collapsed, sidebar_expanded)
@@ -3753,69 +3881,37 @@ fn draw(
     };
 
     if sidebar_width > 0 {
-        let sidebar_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(chunks[0]);
-        // Collapsed rail: show burger glyph so click-to-open is discoverable.
-        let sidebar_title = if sidebar_collapsed { " ☰ " } else { " vmux " };
-        frame.render_widget(
-            Paragraph::new(sidebar_title).style(
-                Style::default()
-                    .fg(palette.active)
-                    .bg(palette.background)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            sidebar_chunks[0],
-        );
-        // Inner width available for labels (Borders::RIGHT steals one column).
-        let sidebar_label_width = usize::from(sidebar_chunks[1].width.saturating_sub(1)).max(1);
-        let workspace_items: Vec<ListItem> = sidebar_entries(
-            snapshot.workspaces.len(),
-            sidebar_scroll,
-            sidebar_chunks[1].height,
+        draw_sidebar(
+            frame,
+            chunks[0],
+            snapshot,
             sidebar_collapsed,
-        )
-        .into_iter()
-        .map(|entry| match entry {
-            SidebarEntry::Above(hidden) => ListItem::new(Line::from(Span::styled(
-                format!("  ▲ +{hidden}"),
-                Style::default().fg(palette.muted).bg(palette.background),
-            ))),
-            SidebarEntry::Below(hidden) => ListItem::new(Line::from(Span::styled(
-                format!("  ▼ +{hidden}"),
-                Style::default().fg(palette.muted).bg(palette.background),
-            ))),
-            SidebarEntry::Workspace(index) => workspace_list_item(
-                snapshot,
-                index,
-                sidebar_collapsed,
-                workspace_second_line,
-                hover_workspace,
-                sidebar_label_width,
-                palette,
-                status_markers,
-            ),
-        })
-        .collect();
-        let sidebar = List::new(workspace_items)
-            .block(
-                Block::default()
-                    .borders(Borders::RIGHT)
-                    .border_style(Style::default().fg(palette.border)),
-            )
-            .style(Style::default().fg(palette.text).bg(palette.background));
-        frame.render_widget(sidebar, sidebar_chunks[1]);
-    } // end sidebar_width > 0
+            sidebar_scroll,
+            workspace_second_line,
+            hover_workspace,
+            palette,
+            status_markers,
+            chrome,
+        );
+    }
 
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(chunks[1]);
+    // Bottom control bar: classic uses 2 rows (buttons + footer); denser skins use 1.
+    let main_chunks = if control_h >= 2 && chrome.show_session_footer {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(chunks[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(chunks[1])
+    };
+    let content_area = main_chunks[0];
 
     let highlight_pane = confirm.and_then(|c| c.highlight_pane());
     match mode {
@@ -3824,20 +3920,37 @@ fn draw(
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == snapshot.active_workspace);
-            let pane_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(TAB_BAR_HEIGHT), Constraint::Min(1)])
-                .split(main_chunks[0]);
+            let tab_count = active.map(|w| w.tabs.len()).unwrap_or(0);
+            let tab_h = layout.tab_bar_height(tab_count);
+            let pane_chunks = if tab_h > 0 {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(tab_h), Constraint::Min(1)])
+                    .split(content_area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1)])
+                    .split(content_area)
+            };
+            let panes_area = if tab_h > 0 {
+                pane_chunks[1]
+            } else {
+                pane_chunks[0]
+            };
             if let Some(active) = active {
-                draw_workspace_tab_bar(
-                    frame,
-                    pane_chunks[0],
-                    snapshot,
-                    active,
-                    palette,
-                    status_markers,
-                    tab_close_button,
-                );
+                if tab_h > 0 {
+                    draw_workspace_tab_bar(
+                        frame,
+                        pane_chunks[0],
+                        snapshot,
+                        active,
+                        palette,
+                        status_markers,
+                        tab_close_button,
+                        chrome.tab_bar_style,
+                    );
+                }
                 // Host caret follows the active pane PTY cursor (skipped under modals).
                 let mut host_cursor: Option<(u16, u16)> = None;
                 let host_cursor_slot = if confirm.is_none() && rename.is_none() {
@@ -3848,7 +3961,7 @@ fn draw(
                 if active.panes.is_empty() {
                     draw_empty_workspace(
                         frame,
-                        pane_chunks[1],
+                        panes_area,
                         theme,
                         prefix_label,
                         hover_empty_create,
@@ -3860,7 +3973,7 @@ fn draw(
                 {
                     draw_single_pane(
                         frame,
-                        pane_chunks[1],
+                        panes_area,
                         snapshot,
                         zoomed,
                         Some(zoomed),
@@ -3870,13 +3983,14 @@ fn draw(
                         selection,
                         highlight_pane,
                         theme,
+                        chrome,
                         host_cursor_slot,
                         cursor_blink_on,
                     );
                 } else {
                     draw_panes(
                         frame,
-                        pane_chunks[1],
+                        panes_area,
                         snapshot,
                         active.layout.as_ref(),
                         active.panes.as_slice(),
@@ -3887,6 +4001,7 @@ fn draw(
                         selection,
                         highlight_pane,
                         theme,
+                        chrome,
                         host_cursor_slot,
                         cursor_blink_on,
                     );
@@ -3898,7 +4013,7 @@ fn draw(
         }
         UiMode::Notifications => draw_notifications(
             frame,
-            main_chunks[0],
+            content_area,
             snapshot,
             notification_selected,
             hover_notification,
@@ -3907,7 +4022,7 @@ fn draw(
         ),
         UiMode::Ports => draw_ports(
             frame,
-            main_chunks[0],
+            content_area,
             ports_list,
             ports_selected,
             action_error,
@@ -3915,7 +4030,7 @@ fn draw(
         ),
         UiMode::Actions => draw_actions(
             frame,
-            main_chunks[0],
+            content_area,
             actions,
             action_selected,
             action_error,
@@ -3923,7 +4038,7 @@ fn draw(
         ),
         UiMode::Commands => draw_commands(
             frame,
-            main_chunks[0],
+            content_area,
             command_selected,
             command_filter,
             prefix_label,
@@ -3931,9 +4046,10 @@ fn draw(
         ),
         UiMode::Settings => draw_settings(
             frame,
-            main_chunks[0],
+            content_area,
             SettingsView {
                 theme,
+                layout,
                 workspace_second_line,
                 sidebar_collapsed,
                 sidebar_responsive,
@@ -3971,49 +4087,164 @@ fn draw(
         // (parameter still required for SettingsView construction.)
         UiMode::WorkspacePicker => draw_workspace_picker(
             frame,
-            main_chunks[0],
+            content_area,
             snapshot,
             workspace_picker_selected,
             theme,
             status_markers,
             compact,
         ),
-        UiMode::ContextMenu => draw_context_menu(
-            frame,
-            main_chunks[0],
-            context_selected,
-            context_pane,
-            palette,
-        ),
+        UiMode::ContextMenu => {
+            draw_context_menu(frame, content_area, context_selected, context_pane, palette)
+        }
     }
     // Modal alerts on top of the current view (panes stay visible underneath).
     if confirm.is_some() {
-        draw_confirm_overlay(frame, main_chunks[0], confirm, theme);
+        draw_confirm_overlay(frame, content_area, confirm, theme);
     }
     if let Some(dialog) = rename {
-        draw_rename_overlay(frame, main_chunks[0], dialog, theme);
+        draw_rename_overlay(frame, content_area, dialog, theme);
     }
-    draw_control_bar(
-        frame,
-        main_chunks[1],
-        mode,
-        confirm,
-        hover_control,
-        theme,
-        control_bar_scroll,
-        compact,
-    );
-    frame.render_widget(
-        Paragraph::new(session_footer_with_modals(
-            snapshot,
+    if control_h >= 2 && chrome.show_session_footer && main_chunks.len() >= 3 {
+        draw_control_bar(
+            frame,
+            main_chunks[1],
             mode,
-            notification_selected,
             confirm,
-            rename,
-        ))
-        .style(Style::default().fg(palette.muted).bg(palette.background)),
-        main_chunks[2],
-    );
+            hover_control,
+            theme,
+            control_bar_scroll,
+            bar_style,
+            chrome,
+        );
+        frame.render_widget(
+            Paragraph::new(session_footer_with_modals(
+                snapshot,
+                mode,
+                notification_selected,
+                confirm,
+                rename,
+            ))
+            .style(Style::default().fg(palette.muted).bg(palette.background)),
+            main_chunks[2],
+        );
+    } else {
+        draw_control_bar(
+            frame,
+            *main_chunks.last().unwrap_or(&content_area),
+            mode,
+            confirm,
+            hover_control,
+            theme,
+            control_bar_scroll,
+            bar_style,
+            chrome,
+        );
+    }
+}
+
+/// Workspace rail — style depends on the layout skin.
+fn draw_sidebar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &Session,
+    sidebar_collapsed: bool,
+    sidebar_scroll: usize,
+    workspace_second_line: UiWorkspaceSecondLine,
+    hover_workspace: Option<&str>,
+    palette: ThemePalette,
+    status_markers: &str,
+    chrome: LayoutChrome,
+) {
+    let rail_bg = match chrome.sidebar_style {
+        SidebarStyle::Classic | SidebarStyle::Ghost => palette.background,
+        SidebarStyle::Compact | SidebarStyle::Pill => palette.surface,
+    };
+    // Paint the whole rail first so styles that use surface stand out from panes.
+    frame.render_widget(Block::default().style(Style::default().bg(rail_bg)), area);
+
+    let has_header = sidebar_collapsed || !chrome.sidebar_header.is_empty();
+    let chunks = if has_header {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1)])
+            .split(area)
+    };
+    let list_area = if has_header { chunks[1] } else { chunks[0] };
+
+    if has_header {
+        let title = if sidebar_collapsed {
+            " ☰ "
+        } else {
+            chrome.sidebar_header
+        };
+        let header_style = match chrome.sidebar_style {
+            SidebarStyle::Classic => Style::default()
+                .fg(palette.active)
+                .bg(rail_bg)
+                .add_modifier(Modifier::BOLD),
+            SidebarStyle::Compact => Style::default()
+                .fg(palette.muted)
+                .bg(rail_bg)
+                .add_modifier(Modifier::DIM),
+            SidebarStyle::Pill => Style::default().fg(palette.muted).bg(rail_bg),
+            SidebarStyle::Ghost => Style::default().fg(palette.muted).bg(rail_bg),
+        };
+        frame.render_widget(Paragraph::new(title).style(header_style), chunks[0]);
+    }
+
+    let border_cols = u16::from(chrome.sidebar_border());
+    let sidebar_label_width = usize::from(list_area.width.saturating_sub(border_cols)).max(1);
+    let overflow_style = Style::default().fg(palette.muted).bg(rail_bg);
+    let workspace_items: Vec<ListItem> = sidebar_entries(
+        snapshot.workspaces.len(),
+        sidebar_scroll,
+        list_area.height,
+        sidebar_collapsed,
+    )
+    .into_iter()
+    .map(|entry| match entry {
+        SidebarEntry::Above(hidden) => ListItem::new(Line::from(Span::styled(
+            format!("  ▲ +{hidden}"),
+            overflow_style,
+        ))),
+        SidebarEntry::Below(hidden) => ListItem::new(Line::from(Span::styled(
+            format!("  ▼ +{hidden}"),
+            overflow_style,
+        ))),
+        SidebarEntry::Workspace(index) => workspace_list_item(
+            snapshot,
+            index,
+            sidebar_collapsed,
+            workspace_second_line,
+            hover_workspace,
+            sidebar_label_width,
+            palette,
+            status_markers,
+            chrome.sidebar_style,
+            rail_bg,
+        ),
+    })
+    .collect();
+    let mut sidebar =
+        List::new(workspace_items).style(Style::default().fg(palette.text).bg(rail_bg));
+    if chrome.sidebar_border() {
+        let rule = match chrome.sidebar_style {
+            SidebarStyle::Compact => palette.surface_alt,
+            _ => palette.border,
+        };
+        sidebar = sidebar.block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(rule)),
+        );
+    }
+    frame.render_widget(sidebar, list_area);
 }
 
 /// Shared block for every overlay panel so borders, title emphasis, and panel
@@ -4385,12 +4616,17 @@ fn confirm_dialog_rect(area: Rect) -> Option<Rect> {
 
 /// Main content area used for the confirm overlay (matches draw() layout).
 /// `sidebar_cols` must be the live painted width (`layout_sidebar_cols()`).
-fn confirm_main_area(sidebar_cols: u16, terminal_width: u16, terminal_height: u16) -> Rect {
+fn confirm_main_area(
+    sidebar_cols: u16,
+    terminal_width: u16,
+    terminal_height: u16,
+    control_h: u16,
+) -> Rect {
     Rect::new(
         sidebar_cols,
         0,
         terminal_width.saturating_sub(sidebar_cols),
-        terminal_height.saturating_sub(CONTROL_BAR_HEIGHT),
+        terminal_height.saturating_sub(control_h.max(1)),
     )
 }
 
@@ -4812,21 +5048,42 @@ fn workspace_list_item(
     usable_width: usize,
     palette: ThemePalette,
     status_markers: &str,
+    sidebar_style: SidebarStyle,
+    rail_bg: Color,
 ) -> ListItem<'static> {
     let workspace = &snapshot.workspaces[index];
     let active = workspace.id == snapshot.active_workspace;
     let hovered = hover_workspace == Some(workspace.id.as_str());
-    // Fixed-width prefix so active/inactive rows align (avoids a ragged left edge).
-    let prefix = if sidebar_collapsed {
-        if active {
-            "> "
-        } else {
-            "  "
+    // Fixed-width prefix — shape depends on the layout skin.
+    let prefix = match sidebar_style {
+        SidebarStyle::Classic => {
+            if active {
+                "> "
+            } else {
+                "  "
+            }
         }
-    } else if active {
-        "> "
-    } else {
-        "  "
+        SidebarStyle::Compact => {
+            if active {
+                "▎ "
+            } else {
+                "  "
+            }
+        }
+        SidebarStyle::Pill => {
+            if active {
+                "● "
+            } else {
+                "  "
+            }
+        }
+        SidebarStyle::Ghost => {
+            if active {
+                "· "
+            } else {
+                "  "
+            }
+        }
     };
     // Aggregate across every tab so ✅/🔄 still show if work finished on a
     // background tab while you were elsewhere.
@@ -4881,19 +5138,60 @@ fn workspace_list_item(
             })
     };
 
-    let row_bg = if active {
-        palette.active
-    } else if hovered {
-        // selected_row_style uses hover bg — keep padding consistent
-        palette.hover
-    } else {
-        palette.background
+    // Selection treatment varies by skin — full fill only for Classic.
+    let (row_bg, active_style, hover_style) = match sidebar_style {
+        SidebarStyle::Classic => (
+            if active {
+                palette.active
+            } else if hovered {
+                palette.hover
+            } else {
+                rail_bg
+            },
+            Style::default()
+                .fg(palette.on_accent)
+                .bg(palette.active)
+                .add_modifier(Modifier::BOLD),
+            selected_row_style(palette),
+        ),
+        SidebarStyle::Compact => (
+            if active || hovered {
+                palette.surface_alt
+            } else {
+                rail_bg
+            },
+            Style::default()
+                .fg(palette.active)
+                .bg(palette.surface_alt)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(palette.text).bg(palette.surface_alt),
+        ),
+        SidebarStyle::Pill => (
+            if active {
+                palette.surface_alt
+            } else if hovered {
+                palette.hover
+            } else {
+                rail_bg
+            },
+            Style::default()
+                .fg(palette.text)
+                .bg(palette.surface_alt)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette.on_bright)
+                .bg(palette.hover)
+                .add_modifier(Modifier::BOLD),
+        ),
+        SidebarStyle::Ghost => (
+            rail_bg,
+            Style::default()
+                .fg(palette.active)
+                .bg(rail_bg)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(palette.hover).bg(rail_bg),
+        ),
     };
-    let active_style = Style::default()
-        .fg(palette.on_accent)
-        .bg(palette.active)
-        .add_modifier(Modifier::BOLD);
-    let hover_style = selected_row_style(palette);
 
     // Active/hovered rows keep the row fill but still tint the status marker —
     // dots carry their meaning in color, so they must stay colored on the
@@ -4906,7 +5204,11 @@ fn workspace_list_item(
                 let style = match seg {
                     SidebarSeg::Status => Style::default()
                         .fg(status_marker_color(&status, palette))
-                        .bg(row_style.bg.unwrap_or(palette.background))
+                        .bg(row_style.bg.unwrap_or(rail_bg))
+                        .add_modifier(Modifier::BOLD),
+                    SidebarSeg::Pin if workspace.pinned && !active => Style::default()
+                        .fg(palette.active)
+                        .bg(row_style.bg.unwrap_or(rail_bg))
                         .add_modifier(Modifier::BOLD),
                     _ => row_style,
                 };
@@ -4922,7 +5224,7 @@ fn workspace_list_item(
         filled_row(hover_style)
     } else {
         // Ordinary row: tint the pin and status marker so they read at a glance.
-        let base = Style::default().fg(palette.text).bg(palette.background);
+        let base = Style::default().fg(palette.text).bg(rail_bg);
         let mut spans: Vec<Span<'static>> = segments
             .into_iter()
             .filter(|(text, _)| !text.is_empty())
@@ -4931,12 +5233,12 @@ fn workspace_list_item(
                     SidebarSeg::Plain => base,
                     SidebarSeg::Pin if workspace.pinned => Style::default()
                         .fg(palette.active)
-                        .bg(palette.background)
+                        .bg(rail_bg)
                         .add_modifier(Modifier::BOLD),
                     SidebarSeg::Pin => base,
                     SidebarSeg::Status => Style::default()
                         .fg(status_marker_color(&status, palette))
-                        .bg(palette.background)
+                        .bg(rail_bg)
                         .add_modifier(Modifier::BOLD),
                 };
                 Span::styled(text, style)
@@ -4952,7 +5254,7 @@ fn workspace_list_item(
         } else if hovered {
             hover_style
         } else {
-            Style::default().fg(palette.muted).bg(palette.background)
+            Style::default().fg(palette.muted).bg(rail_bg)
         };
         let second_padded = pad_to_width(&second, usable_width);
         ListItem::new(vec![
@@ -5263,6 +5565,8 @@ fn primary_mouse_action(
     row: u16,
     status_markers: &str,
     tab_close_button: bool,
+    control_h: u16,
+    tab_h: u16,
 ) -> PrimaryMouseAction {
     if column < sidebar_cols {
         let list_height = terminal_height.saturating_sub(1);
@@ -5286,19 +5590,27 @@ fn primary_mouse_action(
     if active.panes.is_empty() {
         return PrimaryMouseAction::None;
     }
-    let tab_area = workspace_tab_bar_area(sidebar_cols, terminal_width);
-    if let Some(action) = workspace_tab_bar_hit(
-        snapshot,
-        active,
-        tab_area,
-        column,
-        row,
-        status_markers,
-        tab_close_button,
-    ) {
-        return action;
+    let tab_area = workspace_tab_bar_area(sidebar_cols, terminal_width, tab_h);
+    if tab_h > 0 {
+        if let Some(action) = workspace_tab_bar_hit(
+            snapshot,
+            active,
+            tab_area,
+            column,
+            row,
+            status_markers,
+            tab_close_button,
+        ) {
+            return action;
+        }
     }
-    let area = pane_area(sidebar_cols, terminal_width, terminal_height);
+    let area = pane_area(
+        sidebar_cols,
+        terminal_width,
+        terminal_height,
+        control_h,
+        tab_h,
+    );
     if !point_in_rect(area, column, row) {
         return PrimaryMouseAction::None;
     }
@@ -5320,23 +5632,29 @@ fn primary_mouse_action(
 }
 
 /// Pane grid rect. `sidebar_cols` is the live painted width (0 when compact).
-fn pane_area(sidebar_cols: u16, terminal_width: u16, terminal_height: u16) -> Rect {
+fn pane_area(
+    sidebar_cols: u16,
+    terminal_width: u16,
+    terminal_height: u16,
+    control_h: u16,
+    tab_h: u16,
+) -> Rect {
     Rect::new(
         sidebar_cols,
-        TAB_BAR_HEIGHT,
+        tab_h,
         terminal_width.saturating_sub(sidebar_cols),
         terminal_height
-            .saturating_sub(CONTROL_BAR_HEIGHT)
-            .saturating_sub(TAB_BAR_HEIGHT),
+            .saturating_sub(control_h.max(1))
+            .saturating_sub(tab_h),
     )
 }
 
-fn workspace_tab_bar_area(sidebar_cols: u16, terminal_width: u16) -> Rect {
+fn workspace_tab_bar_area(sidebar_cols: u16, terminal_width: u16, tab_h: u16) -> Rect {
     Rect::new(
         sidebar_cols,
         0,
         terminal_width.saturating_sub(sidebar_cols),
-        TAB_BAR_HEIGHT,
+        tab_h,
     )
 }
 
@@ -5353,6 +5671,8 @@ fn rename_target_at(
     row: u16,
     status_markers: &str,
     tab_close_button: bool,
+    control_h: u16,
+    tab_h: u16,
 ) -> Option<(RenameTarget, String)> {
     // Workspace name in the sidebar.
     if column < sidebar_cols {
@@ -5374,36 +5694,44 @@ fn rename_target_at(
         .iter()
         .find(|workspace| workspace.id == snapshot.active_workspace)?;
     // Tab title in the tab bar (not the "+" control or close ×).
-    let tab_area = workspace_tab_bar_area(sidebar_cols, terminal_width);
-    if point_in_rect(tab_area, column, row) {
-        let mut x = tab_area.x;
-        for chip in workspace_tab_chips(snapshot, active, status_markers, tab_close_button) {
-            let width = UnicodeWidthStr::width(chip.label.as_str()) as u16;
-            if column >= x && column < x.saturating_add(width) {
-                let rel = column.saturating_sub(x) as usize;
-                // Clicking × is close, not rename.
-                if chip.close_start.map(|start| rel >= start).unwrap_or(false) {
-                    return None;
+    if tab_h > 0 {
+        let tab_area = workspace_tab_bar_area(sidebar_cols, terminal_width, tab_h);
+        if point_in_rect(tab_area, column, row) {
+            let mut x = tab_area.x;
+            for chip in workspace_tab_chips(snapshot, active, status_markers, tab_close_button) {
+                let width = UnicodeWidthStr::width(chip.label.as_str()) as u16;
+                if column >= x && column < x.saturating_add(width) {
+                    let rel = column.saturating_sub(x) as usize;
+                    // Clicking × is close, not rename.
+                    if chip.close_start.map(|start| rel >= start).unwrap_or(false) {
+                        return None;
+                    }
+                    let title = active
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == chip.tab_id)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_default();
+                    return Some((
+                        RenameTarget::Tab {
+                            id: chip.tab_id.clone(),
+                        },
+                        title,
+                    ));
                 }
-                let title = active
-                    .tabs
-                    .iter()
-                    .find(|t| t.id == chip.tab_id)
-                    .map(|t| t.title.clone())
-                    .unwrap_or_default();
-                return Some((
-                    RenameTarget::Tab {
-                        id: chip.tab_id.clone(),
-                    },
-                    title,
-                ));
+                x = x.saturating_add(width).saturating_add(1);
             }
-            x = x.saturating_add(width).saturating_add(1);
+            return None;
         }
-        return None;
     }
     // Pane title on the top border row of a pane.
-    let area = pane_area(sidebar_cols, terminal_width, terminal_height);
+    let area = pane_area(
+        sidebar_cols,
+        terminal_width,
+        terminal_height,
+        control_h,
+        tab_h,
+    );
     if !point_in_rect(area, column, row) {
         return None;
     }
@@ -5543,25 +5871,60 @@ fn draw_workspace_tab_bar(
     palette: ThemePalette,
     status_markers: &str,
     tab_close_button: bool,
+    tab_style: TabBarStyle,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let bar_bg = match tab_style {
+        TabBarStyle::Chips => palette.background,
+        TabBarStyle::Underline | TabBarStyle::Ghost => palette.background,
+    };
     let mut spans = Vec::new();
     for chip in workspace_tab_chips(snapshot, workspace, status_markers, tab_close_button) {
         let active = workspace.active_tab.as_deref() == Some(chip.tab_id.as_str());
-        let chip_bg = if active {
-            palette.active
-        } else {
-            palette.surface
-        };
-        let style = if active {
-            Style::default()
-                .fg(palette.on_accent)
-                .bg(palette.active)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(palette.muted).bg(palette.surface)
+        let (chip_bg, style) = match tab_style {
+            TabBarStyle::Chips => {
+                let bg = if active {
+                    palette.active
+                } else {
+                    palette.surface
+                };
+                let st = if active {
+                    Style::default()
+                        .fg(palette.on_accent)
+                        .bg(palette.active)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.muted).bg(palette.surface)
+                };
+                (bg, st)
+            }
+            TabBarStyle::Underline => {
+                let bg = bar_bg;
+                // Underline via trailing underscore on active title.
+                let st = if active {
+                    Style::default()
+                        .fg(palette.active)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(palette.muted).bg(bg)
+                };
+                (bg, st)
+            }
+            TabBarStyle::Ghost => {
+                let bg = bar_bg;
+                let st = if active {
+                    Style::default()
+                        .fg(palette.text)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.muted).bg(bg)
+                };
+                (bg, st)
+            }
         };
         // Tint the leading status marker per-status (dots read by color), then
         // hand the remainder of the label to the close-× split below.
@@ -5615,17 +5978,27 @@ fn draw_workspace_tab_bar(
         } else {
             spans.push(Span::styled(rest, style));
         }
-        spans.push(Span::raw(" "));
+        let gap = match tab_style {
+            TabBarStyle::Chips => " ",
+            TabBarStyle::Underline => "  ",
+            TabBarStyle::Ghost => " · ",
+        };
+        spans.push(Span::styled(gap.to_string(), Style::default().bg(bar_bg)));
     }
-    spans.push(Span::styled(
-        " + ",
-        Style::default()
+    let plus_style = match tab_style {
+        TabBarStyle::Chips => Style::default()
             .fg(palette.success)
             .bg(palette.surface)
             .add_modifier(Modifier::BOLD),
-    ));
+        TabBarStyle::Underline => Style::default()
+            .fg(palette.success)
+            .bg(bar_bg)
+            .add_modifier(Modifier::BOLD),
+        TabBarStyle::Ghost => Style::default().fg(palette.muted).bg(bar_bg),
+    };
+    spans.push(Span::styled(" + ", plus_style));
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.background)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg)),
         area,
     );
 }
@@ -5805,21 +6178,33 @@ struct ControlBarLayout {
     max_scroll: usize,
 }
 
-fn control_bar_layout(area: Rect, scroll: usize, compact: bool) -> ControlBarLayout {
-    let buttons = control_buttons(compact);
+fn control_bar_layout(area: Rect, scroll: usize, bar_style: ControlBarStyle) -> ControlBarLayout {
+    let compact_labels = !matches!(bar_style, ControlBarStyle::Labeled);
+    let buttons = control_buttons(compact_labels);
     let detach = detach_control_button();
 
-    // Compact / mobile: equal-width tiles across the full bar so every column
-    // is clickable and touch targets are large (no dead gaps between labels).
-    if compact && area.width > 0 && !buttons.is_empty() {
-        return control_bar_layout_compact(area, scroll, &buttons, detach);
+    // Icons (and narrow/touch): equal-width tiles so every column is clickable.
+    if matches!(bar_style, ControlBarStyle::Icons) && area.width > 0 && !buttons.is_empty() {
+        return control_bar_layout_compact(area, scroll, &buttons, detach, bar_style);
     }
 
-    let detach_w = detach.width().min(area.width);
+    // Pills / Ghost: sequential placement with small gaps so pills read as islands.
+    let gap = match bar_style {
+        ControlBarStyle::Pills => 1u16,
+        ControlBarStyle::Ghost => 1u16,
+        _ => 0u16,
+    };
+    let btn_width = |b: &ControlButton| control_button_display_width(*b, bar_style);
+
+    let detach_w = control_button_display_width(detach, bar_style).min(area.width);
     let left_end = area.x.saturating_add(area.width).saturating_sub(detach_w);
 
-    // Total width of all left-side buttons.
-    let total_w: u16 = buttons.iter().map(|b| b.width()).sum();
+    // Total width of all left-side buttons including gaps.
+    let total_w: u16 = buttons
+        .iter()
+        .map(|b| btn_width(b).saturating_add(gap))
+        .sum::<u16>()
+        .saturating_sub(gap);
     let avail = left_end.saturating_sub(area.x);
     let needs_scroll = total_w > avail && avail > CONTROL_SCROLL_BTN_W * 2 + 4;
 
@@ -5848,14 +6233,14 @@ fn control_bar_layout(area: Rect, scroll: usize, compact: bool) -> ControlBarLay
         if x >= end_x {
             break;
         }
-        let bw = button.width();
+        let bw = btn_width(button);
         let remaining = end_x.saturating_sub(x);
         // Never paint a partial button — clipped hits feel "unclickable".
         if remaining < bw {
             break;
         }
         visible.push((button.action, Rect::new(x, area.y, bw, area.height.max(1))));
-        x = x.saturating_add(bw);
+        x = x.saturating_add(bw).saturating_add(gap);
     }
 
     // Compute max_scroll: largest start index that still shows the last button.
@@ -5865,8 +6250,11 @@ fn control_bar_layout(area: Rect, scroll: usize, compact: bool) -> ControlBarLay
         for start in 0..buttons.len() {
             let mut fit = 0u16;
             let mut all = true;
-            for b in buttons.iter().skip(start) {
-                fit = fit.saturating_add(b.width());
+            for (i, b) in buttons.iter().enumerate().skip(start) {
+                if i > start {
+                    fit = fit.saturating_add(gap);
+                }
+                fit = fit.saturating_add(btn_width(b));
                 if fit > track {
                     all = false;
                     break;
@@ -5898,17 +6286,21 @@ fn control_bar_layout(area: Rect, scroll: usize, compact: bool) -> ControlBarLay
     }
 }
 
-/// Compact control bar: equal-width tiles (icon-only when narrow) with scroll.
+/// Compact control bar: equal-width tiles (icon + short colored label) with scroll.
 fn control_bar_layout_compact(
     area: Rect,
     scroll: usize,
     buttons: &[ControlButton],
     _detach: ControlButton,
+    bar_style: ControlBarStyle,
 ) -> ControlBarLayout {
-    // Minimum tile width: icon + padding (" XX "). Prefer content width when
-    // wider so short labels still show.
-    let content_ws: Vec<u16> = buttons.iter().map(|b| b.width().max(4)).collect();
-    let min_tile = content_ws.iter().copied().min().unwrap_or(4).min(6);
+    // Tile width from preferred " icon label " shape so semantic text fits and
+    // colors show (emoji alone ignore terminal fg).
+    let content_ws: Vec<u16> = buttons
+        .iter()
+        .map(|b| control_button_display_width(*b, bar_style).max(5))
+        .collect();
+    let min_tile = content_ws.iter().copied().min().unwrap_or(5).clamp(5, 10);
 
     // How many left buttons fit alongside detach at min_tile size?
     let max_slots = (area.width / min_tile).max(1) as usize;
@@ -6033,6 +6425,9 @@ enum ControlBarHit {
 
 /// Hit-test control bar. `sidebar_cols` must match the live layout width
 /// (`layout_sidebar_cols()`), not the configured expanded width alone.
+///
+/// `control_h` is the layout skin's bottom chrome (classic=2 with footer;
+/// compact skins=1). Buttons always occupy the first reserved bottom row.
 fn control_bar_hit_at(
     sidebar_cols: u16,
     terminal_width: u16,
@@ -6040,19 +6435,24 @@ fn control_bar_hit_at(
     column: u16,
     row: u16,
     scroll: usize,
-    compact: bool,
+    bar_style: ControlBarStyle,
+    control_h: u16,
 ) -> Option<ControlBarHit> {
-    // Control bar is main_chunks[1]: second-to-last row (footer is last).
-    if terminal_height < CONTROL_BAR_HEIGHT || row != terminal_height.saturating_sub(2) {
+    let control_h = control_h.max(1);
+    if terminal_height < control_h {
+        return None;
+    }
+    let bar_row = terminal_height.saturating_sub(control_h);
+    if row != bar_row {
         return None;
     }
     let area = Rect::new(
         sidebar_cols,
-        terminal_height.saturating_sub(2),
+        bar_row,
         terminal_width.saturating_sub(sidebar_cols),
         1,
     );
-    let layout = control_bar_layout(area, scroll, compact);
+    let layout = control_bar_layout(area, scroll, bar_style);
     if let Some(r) = layout.scroll_left {
         if point_in_rect(r, column, row) {
             return Some(ControlBarHit::ScrollLeft);
@@ -6071,7 +6471,8 @@ fn control_bar_hit_at(
     None
 }
 
-/// Test helper: hit-test with scroll offset 0, desktop (non-compact) buttons.
+/// Test helper: hit-test with scroll offset 0, desktop (non-compact) buttons,
+/// classic 2-row chrome.
 #[cfg(test)]
 fn control_action_at(
     sidebar_collapsed: bool,
@@ -6082,9 +6483,35 @@ fn control_action_at(
     row: u16,
 ) -> Option<ControlAction> {
     let cols = sidebar_width(sidebar_collapsed, sidebar_expanded);
-    match control_bar_hit_at(cols, terminal_width, terminal_height, column, row, 0, false) {
+    match control_bar_hit_at(
+        cols,
+        terminal_width,
+        terminal_height,
+        column,
+        row,
+        0,
+        ControlBarStyle::Labeled,
+        CONTROL_BAR_HEIGHT,
+    ) {
         Some(ControlBarHit::Action(a)) => Some(a),
         _ => None,
+    }
+}
+
+/// Semantic foreground for an idle control button (success / danger / …).
+fn control_action_fg(action: ControlAction, palette: ThemePalette) -> Color {
+    match action {
+        ControlAction::Detach | ControlAction::KillPane | ControlAction::DeleteWorkspace => {
+            palette.danger
+        }
+        ControlAction::NewWorkspace
+        | ControlAction::NewTab
+        | ControlAction::SplitRight
+        | ControlAction::SplitDown => palette.success,
+        ControlAction::Notifications => palette.warning,
+        ControlAction::Commands | ControlAction::Settings | ControlAction::Workspaces => {
+            palette.command
+        }
     }
 }
 
@@ -6094,6 +6521,7 @@ fn control_button_style(
     confirm: Option<&PendingConfirm>,
     hover: Option<ControlAction>,
     palette: ThemePalette,
+    bar_style: ControlBarStyle,
 ) -> Style {
     let active = matches!(
         (mode, button.action),
@@ -6113,31 +6541,38 @@ fn control_button_style(
             )
     );
     let hovered = hover == Some(button.action);
-    if active || hovered {
+    let idle_bg = match bar_style {
+        ControlBarStyle::Labeled | ControlBarStyle::Icons => palette.surface,
+        ControlBarStyle::Pills => palette.surface_alt,
+        ControlBarStyle::Ghost => palette.background,
+    };
+    if active {
         Style::default()
-            .fg(Color::Black)
-            .bg(if active {
-                palette.active
-            } else {
-                palette.hover
-            })
+            .fg(palette.on_accent)
+            .bg(palette.active)
             .add_modifier(Modifier::BOLD)
-    } else {
-        match button.action {
-            ControlAction::Detach | ControlAction::KillPane | ControlAction::DeleteWorkspace => {
-                Style::default().fg(palette.danger).bg(palette.surface)
-            }
-            ControlAction::NewWorkspace
-            | ControlAction::NewTab
-            | ControlAction::SplitRight
-            | ControlAction::SplitDown => Style::default().fg(palette.success).bg(palette.surface),
-            ControlAction::Notifications => {
-                Style::default().fg(palette.warning).bg(palette.surface)
-            }
-            ControlAction::Commands | ControlAction::Settings | ControlAction::Workspaces => {
-                Style::default().fg(palette.command).bg(palette.surface)
-            }
+    } else if hovered {
+        match bar_style {
+            ControlBarStyle::Ghost => Style::default()
+                .fg(palette.hover)
+                .bg(palette.background)
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .fg(palette.on_bright)
+                .bg(palette.hover)
+                .add_modifier(Modifier::BOLD),
         }
+    } else {
+        // Ghost stays nearly monochrome; every other style keeps action colors
+        // so short labels (ws / tab / set) read clearly — emoji alone ignore fg.
+        let fg = match bar_style {
+            ControlBarStyle::Ghost => palette.muted,
+            _ => control_action_fg(button.action, palette),
+        };
+        Style::default()
+            .fg(fg)
+            .bg(idle_bg)
+            .add_modifier(Modifier::BOLD)
     }
 }
 
@@ -6149,21 +6584,44 @@ fn draw_control_bar(
     hover: Option<ControlAction>,
     theme: UiTheme,
     scroll: usize,
-    compact: bool,
+    bar_style: ControlBarStyle,
+    chrome: LayoutChrome,
 ) {
     let palette = theme.palette();
-    let layout = control_bar_layout(area, scroll, compact);
-    let arrow_style = Style::default()
-        .fg(palette.active)
-        .bg(palette.surface)
-        .add_modifier(Modifier::BOLD);
-    let muted_arrow = Style::default().fg(palette.muted).bg(palette.surface);
+    let short_labels = !matches!(bar_style, ControlBarStyle::Labeled);
+    let layout = control_bar_layout(area, scroll, bar_style);
 
-    // Paint full bar background first.
+    let bar_bg = match bar_style {
+        ControlBarStyle::Labeled | ControlBarStyle::Icons => palette.surface,
+        ControlBarStyle::Pills | ControlBarStyle::Ghost => palette.background,
+    };
+
+    // Full bar fill first so gaps between pills / ghost icons match chrome.
     frame.render_widget(
-        Paragraph::new(" ".repeat(area.width as usize)).style(Style::default().bg(palette.surface)),
+        Paragraph::new(" ".repeat(area.width as usize)).style(Style::default().bg(bar_bg)),
         area,
     );
+    if chrome.control_bar_separator && area.width > 2 {
+        // Dim top-edge ticks so the bar separates from pane content.
+        let mark = match bar_style {
+            ControlBarStyle::Pills => "·",
+            _ => "─",
+        };
+        frame.render_widget(
+            Paragraph::new(mark).style(Style::default().fg(palette.border).bg(bar_bg)),
+            Rect::new(area.x, area.y, 1, 1),
+        );
+    }
+
+    let arrow_bg = match bar_style {
+        ControlBarStyle::Ghost | ControlBarStyle::Pills => palette.background,
+        _ => palette.surface,
+    };
+    let arrow_style = Style::default()
+        .fg(palette.active)
+        .bg(arrow_bg)
+        .add_modifier(Modifier::BOLD);
+    let muted_arrow = Style::default().fg(palette.muted).bg(arrow_bg);
 
     if let Some(r) = layout.scroll_left {
         let style = if scroll > 0 { arrow_style } else { muted_arrow };
@@ -6176,7 +6634,7 @@ fn draw_control_bar(
     }
 
     for (action, rect) in &layout.buttons {
-        let button = control_buttons(compact)
+        let button = control_buttons(short_labels)
             .into_iter()
             .find(|b| b.action == *action)
             .unwrap_or(ControlButton {
@@ -6184,31 +6642,87 @@ fn draw_control_bar(
                 label: "?",
                 action: *action,
             });
-        let style = control_button_style(button, mode, confirm, hover, palette);
-        let text = control_button_label(button, rect.width, compact);
-        frame.render_widget(Paragraph::new(text).style(style), *rect);
+        let style = control_button_style(button, mode, confirm, hover, palette, bar_style);
+        let line = control_button_line(button, rect.width, style, bar_style, palette);
+        frame.render_widget(Paragraph::new(line), *rect);
     }
     if let Some((action, rect)) = layout.detach {
         let button = detach_control_button();
-        let style = control_button_style(button, mode, confirm, hover, palette);
-        let text = control_button_label(button, rect.width, compact);
-        frame.render_widget(Paragraph::new(text).style(style), rect);
+        let style = control_button_style(button, mode, confirm, hover, palette, bar_style);
+        let line = control_button_line(button, rect.width, style, bar_style, palette);
+        frame.render_widget(Paragraph::new(line), rect);
         let _ = action;
     }
 }
 
-/// Label for a control-bar button, clipped/icon-only when the tile is narrow.
-fn control_button_label(button: ControlButton, width: u16, compact: bool) -> String {
-    let full = button.text();
-    if UnicodeWidthStr::width(full.as_str()) as u16 <= width {
-        return full;
+/// Control-bar button content. Emoji alone ignore terminal fg colors, so Compact /
+/// Flat always keep a short colored text label (ws / tab / set) when width allows.
+fn control_button_line(
+    button: ControlButton,
+    width: u16,
+    style: Style,
+    bar_style: ControlBarStyle,
+    palette: ThemePalette,
+) -> Line<'static> {
+    let bg = style.bg.unwrap_or(palette.surface);
+    let pad = Style::default().bg(bg);
+    let w = width as usize;
+
+    // Ghost: bare icons (or dim labels when forced).
+    if matches!(bar_style, ControlBarStyle::Ghost) {
+        let icon_only = format!(" {} ", button.icon);
+        let text = if UnicodeWidthStr::width(icon_only.as_str()) as u16 <= width {
+            icon_only
+        } else {
+            truncate_to_width(&format!(" {} ", button.label), w)
+        };
+        return Line::from(Span::styled(pad_to_width(&text, w), style));
     }
-    // Prefer icon-only for compact tiles: " XX " centered-ish.
+
+    // Prefer " icon label " so action colors land on the ASCII label (emoji ignore fg).
+    let with_icon = format!(" {} {} ", button.icon, button.label);
+    let label_only = format!(" {} ", button.label);
     let icon_only = format!(" {} ", button.icon);
-    if compact && (UnicodeWidthStr::width(icon_only.as_str()) as u16) <= width {
-        return icon_only;
+
+    let (icon_part, label_part) = if (UnicodeWidthStr::width(with_icon.as_str()) as u16) <= width {
+        (Some(format!(" {} ", button.icon)), button.label.to_string())
+    } else if (UnicodeWidthStr::width(label_only.as_str()) as u16) <= width {
+        // Text-only still carries semantic color — better than invisible emoji-only.
+        (None, button.label.to_string())
+    } else if (UnicodeWidthStr::width(icon_only.as_str()) as u16) <= width {
+        // Last resort: icon only (color may not show on emoji).
+        return Line::from(Span::styled(pad_to_width(&icon_only, w), style));
+    } else {
+        let t = truncate_to_width(&label_only, w);
+        return Line::from(Span::styled(pad_to_width(&t, w), style));
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Leading pad.
+    spans.push(Span::styled(" ".to_string(), pad));
+    if let Some(icon) = icon_part {
+        // Icon keeps base style (emoji often ignore fg); label forces colored text.
+        spans.push(Span::styled(icon.trim().to_string(), style));
+        spans.push(Span::styled(" ".to_string(), pad));
     }
-    truncate_to_width(&full, width as usize)
+    spans.push(Span::styled(label_part, style));
+    spans.push(Span::styled(" ".to_string(), pad));
+    pad_spans_to_width(&mut spans, w, pad);
+    Line::from(spans)
+}
+
+/// Display width for layout/hit-testing (matches [`control_button_line`] preference).
+fn control_button_display_width(button: ControlButton, bar_style: ControlBarStyle) -> u16 {
+    match bar_style {
+        ControlBarStyle::Labeled => button.width(),
+        ControlBarStyle::Ghost => {
+            (UnicodeWidthStr::width(format!(" {} ", button.icon).as_str()) as u16).max(3)
+        }
+        ControlBarStyle::Icons | ControlBarStyle::Pills => {
+            let with_icon = format!(" {} {} ", button.icon, button.label);
+            (UnicodeWidthStr::width(with_icon.as_str()) as u16).max(4)
+        }
+    }
 }
 
 fn draw_panes(
@@ -6224,6 +6738,7 @@ fn draw_panes(
     selection: Option<&TextSelection>,
     highlight_pane: Option<&str>,
     theme: UiTheme,
+    chrome: LayoutChrome,
     host_cursor: Option<&mut Option<(u16, u16)>>,
     cursor_blink_on: bool,
 ) {
@@ -6244,6 +6759,7 @@ fn draw_panes(
             selection,
             highlight_pane,
             theme,
+            chrome,
             host_cursor,
             cursor_blink_on,
         );
@@ -6267,6 +6783,7 @@ fn draw_panes(
             selection,
             highlight_pane,
             theme,
+            chrome,
             host_cursor.as_deref_mut(),
             cursor_blink_on,
         );
@@ -6285,6 +6802,7 @@ fn draw_layout_node(
     selection: Option<&TextSelection>,
     highlight_pane: Option<&str>,
     theme: UiTheme,
+    chrome: LayoutChrome,
     host_cursor: Option<&mut Option<(u16, u16)>>,
     cursor_blink_on: bool,
 ) {
@@ -6301,6 +6819,7 @@ fn draw_layout_node(
             selection,
             highlight_pane,
             theme,
+            chrome,
             host_cursor,
             cursor_blink_on,
         ),
@@ -6316,17 +6835,48 @@ fn draw_layout_node(
                 SplitAxis::Horizontal => Direction::Horizontal,
                 SplitAxis::Vertical => Direction::Vertical,
             };
-            let chunks = Layout::default()
-                .direction(direction)
-                .constraints([
-                    Constraint::Percentage(first_pct as u16),
-                    Constraint::Percentage(second_pct as u16),
-                ])
-                .split(area);
+            let gap = chrome.split_gap;
+            let chunks = if gap > 0 {
+                // Flat layout: leave a 1-cell gutter of host background between panes.
+                let first_len = match axis {
+                    SplitAxis::Horizontal => {
+                        ((u32::from(area.width) * first_pct) / 100).max(1) as u16
+                    }
+                    SplitAxis::Vertical => {
+                        ((u32::from(area.height) * first_pct) / 100).max(1) as u16
+                    }
+                };
+                Layout::default()
+                    .direction(direction)
+                    .constraints([
+                        Constraint::Length(first_len.saturating_sub(0)),
+                        Constraint::Length(gap),
+                        Constraint::Min(1),
+                    ])
+                    .split(area)
+            } else {
+                Layout::default()
+                    .direction(direction)
+                    .constraints([
+                        Constraint::Percentage(first_pct as u16),
+                        Constraint::Percentage(second_pct as u16),
+                    ])
+                    .split(area)
+            };
             let mut host_cursor = host_cursor;
+            let (first_area, second_area) = if gap > 0 && chunks.len() >= 3 {
+                let palette = theme.palette();
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(palette.background)),
+                    chunks[1],
+                );
+                (chunks[0], chunks[2])
+            } else {
+                (chunks[0], chunks[1])
+            };
             draw_layout_node(
                 frame,
-                chunks[0],
+                first_area,
                 snapshot,
                 first,
                 active_pane,
@@ -6336,12 +6886,13 @@ fn draw_layout_node(
                 selection,
                 highlight_pane,
                 theme,
+                chrome,
                 host_cursor.as_deref_mut(),
                 cursor_blink_on,
             );
             draw_layout_node(
                 frame,
-                chunks[1],
+                second_area,
                 snapshot,
                 second,
                 active_pane,
@@ -6351,6 +6902,7 @@ fn draw_layout_node(
                 selection,
                 highlight_pane,
                 theme,
+                chrome,
                 host_cursor,
                 cursor_blink_on,
             );
@@ -6370,15 +6922,21 @@ fn draw_single_pane(
     selection: Option<&TextSelection>,
     highlight_pane: Option<&str>,
     theme: UiTheme,
+    chrome: LayoutChrome,
     mut host_cursor: Option<&mut Option<(u16, u16)>>,
     cursor_blink_on: bool,
 ) {
     if let Some(pane) = snapshot.panes.get(pane_id) {
         let palette = theme.palette();
+        let active = active_pane == Some(pane_id);
+        let danger = highlight_pane == Some(pane_id);
+        let borders = chrome.pane_borders(active, danger);
+        let has_border = borders != Borders::NONE;
         let has_strip = pane_has_tab_strip(pane) && area.width > 2 && area.height >= 3;
-        let content = pane_content_area(area, has_strip);
+        let content = pane_content_area_for_chrome(area, has_strip, has_border);
+        let border_pad = if has_border { 2 } else { 0 };
         let inner_rows = content.height.max(1);
-        let inner_cols = area.width.saturating_sub(2).max(2);
+        let inner_cols = area.width.saturating_sub(border_pad).max(2);
         pane_sizes.insert(
             pane_id.to_string(),
             PaneSize {
@@ -6386,15 +6944,23 @@ fn draw_single_pane(
                 cols: inner_cols,
             },
         );
-        let active = active_pane == Some(pane_id);
-        let danger = highlight_pane == Some(pane_id);
         let scroll_offset = *scroll_offsets.get(pane_id).unwrap_or(&0);
+        let show_title =
+            chrome.show_pane_titles && (!chrome.titles_active_only || active || danger);
         // Cap the title so it never runs under the top-right control buttons.
-        let controls_reserved = if area.width >= 10 { 10 } else { 0 };
+        let controls_reserved = if chrome.show_pane_controls && area.width >= 10 {
+            10
+        } else {
+            0
+        };
         let title_budget = usize::from(area.width)
-            .saturating_sub(2)
+            .saturating_sub(usize::from(border_pad))
             .saturating_sub(controls_reserved);
-        let title = truncate_to_width(&pane_title_text(pane, scroll_offset), title_budget);
+        let title = if show_title {
+            truncate_to_width(&pane_title_text(pane, scroll_offset), title_budget)
+        } else {
+            String::new()
+        };
         // Danger: thick red border + red title only — keep pane body readable.
         let (title_style, border_style) = if danger {
             (
@@ -6405,13 +6971,16 @@ fn draw_single_pane(
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )
         } else if active {
+            let border_fg = match chrome.pane_frame {
+                PaneFrameStyle::LeftAccent => palette.active,
+                PaneFrameStyle::ActiveBox | PaneFrameStyle::Box => palette.active,
+                PaneFrameStyle::None => palette.border,
+            };
             (
                 Style::default()
                     .fg(palette.active)
                     .add_modifier(Modifier::BOLD),
-                Style::default()
-                    .fg(palette.active)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(border_fg).add_modifier(Modifier::BOLD),
             )
         } else {
             (
@@ -6419,13 +6988,13 @@ fn draw_single_pane(
                 Style::default().fg(palette.border),
             )
         };
-        // Outer chrome keeps the theme background; the pane body deliberately
-        // does not (see Paragraph below).
-        let block = Block::default()
-            .title(Span::styled(title, title_style))
-            .borders(Borders::ALL)
+        let mut block = Block::default()
+            .borders(borders)
             .border_style(border_style)
             .style(Style::default().fg(palette.text).bg(palette.background));
+        if show_title && !title.is_empty() {
+            block = block.title(Span::styled(title, title_style));
+        }
         // Cursor only on the active pane: solid while typing, otherwise blinks.
         let show_cursor = active && !danger && cursor_blink_on;
         let text = pane_lines_for_view(
@@ -6438,24 +7007,13 @@ fn draw_single_pane(
             show_cursor,
         );
         frame.render_widget(block, area);
-        // Pane bodies render on the terminal's OWN default colors (herdr-style)
-        // instead of a theme surface: agents probe the terminal background
-        // (OSC 11), paint panels derived from the answer, and only blend when
-        // the cells around them really are that color. Theme colors stay on
-        // the chrome (borders, sidebar, bars). Never `surface_alt` here — that
-        // wash is what made Claude Code's native grey bands look unnatural.
-        // Clear first so a previous frame's theme cells cannot bleed through
-        // on short lines / empty rows.
+        // Pane bodies use host Color::Reset so agent TUIs blend (herdr-style).
         frame.render_widget(Clear, content);
         frame.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::Reset).bg(Color::Reset)),
             content,
         );
-        // Phone-fit: the PTY is being held smaller than this layout box by a
-        // remote viewer. Dim the dead margin and say why, tmux-style, so the
-        // person at the desk knows the pane isn't broken.
         draw_view_size_margins(frame, content, pane, palette);
-        // Host caret tracks the active pane only (hidden while blink is off).
         if show_cursor {
             if let Some((x, y)) = host_cursor_position(pane, content, scroll_offset) {
                 if let Some(slot) = host_cursor.as_mut() {
@@ -6463,11 +7021,8 @@ fn draw_single_pane(
                 }
             }
         }
-        // Workspace-level tabs render in the global tab bar; no per-pane strip.
         let _ = has_strip;
-        // Hide corner controls on the pane marked for close (and when confirm
-        // is open the caller already passes hover_pane_control as None).
-        if !danger {
+        if !danger && chrome.show_pane_controls {
             let layout = snapshot
                 .workspaces
                 .iter()
@@ -6610,6 +7165,8 @@ fn pane_control_at(
     terminal_height: u16,
     column: u16,
     row: u16,
+    control_h: u16,
+    tab_h: u16,
 ) -> Option<PaneControlHit> {
     let active = snapshot
         .workspaces
@@ -6618,7 +7175,13 @@ fn pane_control_at(
     if active.panes.is_empty() {
         return None;
     }
-    let area = pane_area(sidebar_cols, terminal_width, terminal_height);
+    let area = pane_area(
+        sidebar_cols,
+        terminal_width,
+        terminal_height,
+        control_h,
+        tab_h,
+    );
     if !point_in_rect(area, column, row) {
         return None;
     }
@@ -7674,6 +8237,19 @@ fn pane_has_tab_strip(pane: &crate::model::Pane) -> bool {
 /// Content rectangle inside the pane block. When a tab strip is present the top
 /// is pushed down one extra row so the PTY content never overlaps the strip.
 fn pane_content_area(area: Rect, has_strip: bool) -> Rect {
+    pane_content_area_for_chrome(area, has_strip, true)
+}
+
+fn pane_content_area_for_chrome(area: Rect, has_strip: bool, has_border: bool) -> Rect {
+    if !has_border {
+        let top = if has_strip { 1 } else { 0 };
+        return Rect::new(
+            area.x,
+            area.y.saturating_add(top),
+            area.width,
+            area.height.saturating_sub(top),
+        );
+    }
     let top = if has_strip { 2 } else { 1 };
     Rect::new(
         area.x.saturating_add(1),
@@ -8602,6 +9178,7 @@ mod tests {
                     None,
                     None,
                     UiTheme::Midnight,
+                    UiLayout::Classic,
                     UiWorkspaceSecondLine::Path,
                     true,
                     "emoji",
@@ -8690,6 +9267,7 @@ mod tests {
                     rename,
                     None,
                     UiTheme::Midnight,
+                    UiLayout::Classic,
                     UiWorkspaceSecondLine::Path,
                     true,
                     "emoji",
@@ -8855,9 +9433,45 @@ mod tests {
     }
 
     #[test]
-    fn ui_theme_catalog_has_fifteen_named_themes() {
+    fn ui_layout_catalog_has_named_skins() {
+        let layouts = UiLayout::all();
+        assert_eq!(layouts.len(), 5);
+        let names: Vec<&str> = layouts.iter().map(|l| l.name()).collect();
+        assert_eq!(names, crate::config::supported_layouts());
+        // Classic is the only skin with a 2-row control bar + footer.
+        assert_eq!(UiLayout::Classic.chrome().control_bar_height, 2);
+        assert!(UiLayout::Classic.chrome().show_session_footer);
+        for layout in layouts.iter().copied().filter(|l| *l != UiLayout::Classic) {
+            assert_eq!(layout.chrome().control_bar_height, 1);
+            assert!(!layout.chrome().show_session_footer);
+        }
+        assert_eq!(UiLayout::Flat.chrome().split_gap, 1);
+        assert_eq!(
+            UiLayout::Flat.chrome().pane_frame,
+            PaneFrameStyle::LeftAccent
+        );
+        assert_eq!(UiLayout::Zen.chrome().pane_frame, PaneFrameStyle::None);
+        assert_eq!(
+            UiLayout::Zen.chrome().control_bar_style,
+            ControlBarStyle::Ghost
+        );
+        assert_eq!(UiLayout::Zen.chrome().sidebar_style, SidebarStyle::Ghost);
+        assert_eq!(
+            UiLayout::Classic.chrome().control_bar_style,
+            ControlBarStyle::Labeled
+        );
+        assert_eq!(
+            UiLayout::Compact.chrome().control_bar_style,
+            ControlBarStyle::Icons
+        );
+        assert_eq!(UiLayout::from_name("product"), UiLayout::Flat);
+        assert_eq!(UiLayout::Classic.relative(1), UiLayout::Compact);
+    }
+
+    #[test]
+    fn ui_theme_catalog_has_named_themes() {
         let themes = UiTheme::all();
-        assert_eq!(themes.len(), 15, "expected 15 themes, got {}", themes.len());
+        assert_eq!(themes.len(), 20, "expected 20 themes, got {}", themes.len());
         // Config allow-list and UI catalog must stay in sync.
         let names: Vec<&str> = themes.iter().map(|t| t.name()).collect();
         assert_eq!(names.len(), crate::config::supported_themes().len());
@@ -8868,9 +9482,13 @@ mod tests {
             );
             assert_eq!(UiTheme::from_name(name).name(), *name);
         }
+        // Product-skin aliases resolve to the canonical config name.
+        assert_eq!(UiTheme::from_name("classic").name(), "midnight");
+        assert_eq!(UiTheme::from_name("classic").label(), "Classic");
+        assert_eq!(UiTheme::from_name("flat").name(), "modern");
         // Cycle wraps cleanly through the full set.
         let mut theme = UiTheme::Midnight;
-        for _ in 0..15 {
+        for _ in 0..themes.len() {
             theme = theme.relative(1);
         }
         assert_eq!(theme, UiTheme::Midnight);
@@ -9058,11 +9676,37 @@ mod tests {
         let session = mouse_test_session();
 
         assert_eq!(
-            primary_mouse_action(&session, 0, false, 24, 100, 30, 2, 3, "emoji", true),
+            primary_mouse_action(
+                &session,
+                0,
+                false,
+                24,
+                100,
+                30,
+                2,
+                3,
+                "emoji",
+                true,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT
+            ),
             PrimaryMouseAction::SwitchWorkspace("ws-2".to_string())
         );
         assert_eq!(
-            primary_mouse_action(&session, 0, false, 24, 100, 30, 2, 20, "emoji", true),
+            primary_mouse_action(
+                &session,
+                0,
+                false,
+                24,
+                100,
+                30,
+                2,
+                20,
+                "emoji",
+                true,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT
+            ),
             PrimaryMouseAction::None
         );
     }
@@ -9072,7 +9716,20 @@ mod tests {
         let session = mouse_test_session();
 
         assert_eq!(
-            primary_mouse_action(&session, 0, false, 24, 100, 30, 62, 10, "emoji", true),
+            primary_mouse_action(
+                &session,
+                0,
+                false,
+                24,
+                100,
+                30,
+                62,
+                10,
+                "emoji",
+                true,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT
+            ),
             PrimaryMouseAction::StartResize(PaneResizeDrag {
                 axis: SplitAxis::Horizontal,
                 column: 62,
@@ -9087,7 +9744,20 @@ mod tests {
 
         // Pane grid sits below the workspace tab bar (row 0).
         assert_eq!(
-            primary_mouse_action(&session, 0, false, 24, 100, 30, 70, 5, "emoji", true),
+            primary_mouse_action(
+                &session,
+                0,
+                false,
+                24,
+                100,
+                30,
+                70,
+                5,
+                "emoji",
+                true,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT
+            ),
             PrimaryMouseAction::FocusPane("pane-2".to_string())
         );
         // Workspace tab bar "+" hits new tab (after tab labels).
@@ -9102,7 +9772,9 @@ mod tests {
                 sidebar_width(false, 24) + 2,
                 0,
                 "emoji",
-                true
+                true,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT,
             ),
             PrimaryMouseAction::FocusWorkspaceTab {
                 tab: "tab-1".to_string(),
@@ -9122,7 +9794,7 @@ mod tests {
         assert!(chips[0].close_start.is_some());
         assert!(chips[0].label.contains('×'));
 
-        let area = workspace_tab_bar_area(24, 120);
+        let area = workspace_tab_bar_area(24, 120, TAB_BAR_HEIGHT);
         // Click the × on the first tab.
         let close_x = area.x + chips[0].close_start.unwrap() as u16; // first cell of ×
         assert_eq!(
@@ -9149,11 +9821,24 @@ mod tests {
         let session = mouse_test_session();
 
         assert_eq!(
-            primary_mouse_action(&session, 0, false, 24, 100, 30, 70, 28, "emoji", true),
+            primary_mouse_action(
+                &session,
+                0,
+                false,
+                24,
+                100,
+                30,
+                70,
+                28,
+                "emoji",
+                true,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT
+            ),
             PrimaryMouseAction::None
         );
         assert_eq!(
-            pane_area(24, 100, 30),
+            pane_area(24, 100, 30, CONTROL_BAR_HEIGHT, TAB_BAR_HEIGHT),
             Rect::new(24, TAB_BAR_HEIGHT, 76, 27)
         );
     }
@@ -9216,7 +9901,7 @@ mod tests {
     fn compact_control_bar_menu_and_equal_tiles() {
         // Mobile: full-width bar (sidebar_cols=0), first button is menu.
         let area = Rect::new(0, 28, 80, 1);
-        let layout = control_bar_layout(area, 0, true);
+        let layout = control_bar_layout(area, 0, ControlBarStyle::Icons);
         assert!(
             !layout.buttons.is_empty(),
             "compact bar should show at least one button"
@@ -9224,13 +9909,90 @@ mod tests {
         assert_eq!(layout.buttons[0].0, ControlAction::Workspaces);
         // Hit-test at the first tile should map to menu.
         assert_eq!(
-            control_bar_hit_at(0, 80, 30, 1, 28, 0, true),
+            control_bar_hit_at(
+                0,
+                80,
+                30,
+                1,
+                28,
+                0,
+                ControlBarStyle::Icons,
+                CONTROL_BAR_HEIGHT
+            ),
             Some(ControlBarHit::Action(ControlAction::Workspaces))
         );
         // Tiles should cover the bar without leaving large dead zones at the start.
         let first = layout.buttons[0].1;
         assert_eq!(first.x, 0);
         assert!(first.width >= 4);
+    }
+
+    #[test]
+    fn compact_and_flat_control_buttons_keep_colored_text_labels() {
+        // Emoji alone ignore terminal fg — Compact / Flat must keep short
+        // ASCII labels so success/danger/command colors are visible.
+        let palette = UiTheme::Midnight.palette();
+        let button = ControlButton {
+            icon: "📁",
+            label: "ws",
+            action: ControlAction::NewWorkspace,
+        };
+        for style in [ControlBarStyle::Icons, ControlBarStyle::Pills] {
+            let st = control_button_style(button, UiMode::Panes, None, None, palette, style);
+            assert_eq!(
+                st.fg,
+                Some(palette.success),
+                "{style:?} idle new-workspace should use success green"
+            );
+            assert!(st.add_modifier.contains(Modifier::BOLD));
+            let line = control_button_line(button, 12, st, style, palette);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.contains("ws"),
+                "{style:?} label must include short text, got {text:?}"
+            );
+            // At least one span carries the success color (the text label).
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.style.fg == Some(palette.success)),
+                "{style:?} expected a success-colored span in {line:?}"
+            );
+        }
+        // Classic labeled buttons keep full words + color.
+        let full = ControlButton {
+            icon: "📁",
+            label: "workspace",
+            action: ControlAction::NewWorkspace,
+        };
+        let st = control_button_style(
+            full,
+            UiMode::Panes,
+            None,
+            None,
+            palette,
+            ControlBarStyle::Labeled,
+        );
+        assert_eq!(st.fg, Some(palette.success));
+        let line = control_button_line(full, 20, st, ControlBarStyle::Labeled, palette);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("workspace"), "got {text:?}");
+
+        // Danger actions stay red in Compact.
+        let kill = ControlButton {
+            icon: "❌",
+            label: "×",
+            action: ControlAction::KillPane,
+        };
+        let st = control_button_style(
+            kill,
+            UiMode::Panes,
+            None,
+            None,
+            palette,
+            ControlBarStyle::Icons,
+        );
+        assert_eq!(st.fg, Some(palette.danger));
     }
 
     #[test]
@@ -9344,7 +10106,16 @@ mod tests {
         let mut found_split_right = false;
         let mut found_split_down = false;
         for x in 80..99 {
-            if let Some(hit) = pane_control_at(&session, 24, 100, 30, x, y) {
+            if let Some(hit) = pane_control_at(
+                &session,
+                24,
+                100,
+                30,
+                x,
+                y,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT,
+            ) {
                 if hit.action == PaneControlAction::Close {
                     found_close = true;
                 }
@@ -9365,7 +10136,19 @@ mod tests {
             found_split_down,
             "expected a split-down control on pane chrome"
         );
-        assert_eq!(pane_control_at(&session, 24, 100, 30, 10, y), None);
+        assert_eq!(
+            pane_control_at(
+                &session,
+                24,
+                100,
+                30,
+                10,
+                y,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT
+            ),
+            None
+        );
     }
 
     #[test]
@@ -9504,7 +10287,20 @@ mod tests {
     fn rename_target_at_resolves_workspace_and_tab() {
         let session = mouse_test_session();
         // Sidebar workspace row 1 (after title row 0).
-        let hit = rename_target_at(&session, 0, false, 24, 100, 30, 2, 1, "emoji", true);
+        let hit = rename_target_at(
+            &session,
+            0,
+            false,
+            24,
+            100,
+            30,
+            2,
+            1,
+            "emoji",
+            true,
+            CONTROL_BAR_HEIGHT,
+            TAB_BAR_HEIGHT,
+        );
         assert!(
             matches!(hit, Some((RenameTarget::Workspace { .. }, _))),
             "expected workspace rename target, got {hit:?}"
@@ -9521,6 +10317,8 @@ mod tests {
             0,
             "emoji",
             true,
+            CONTROL_BAR_HEIGHT,
+            TAB_BAR_HEIGHT,
         );
         assert!(
             matches!(tab_hit, Some((RenameTarget::Tab { .. }, _))),
@@ -9544,7 +10342,7 @@ mod tests {
         // The create-pane button has a real, non-empty click region inside the
         // pane area, and clicks elsewhere in the empty area do not misroute.
         let session = Session::new("test");
-        let area = pane_area(24, 120, 40);
+        let area = pane_area(24, 120, 40, CONTROL_BAR_HEIGHT, TAB_BAR_HEIGHT);
         let rect = empty_create_pane_rect(area).expect("create-pane rect");
         assert!(rect.width > 0 && rect.height == 1);
         assert!(point_in_rect(area, rect.x, rect.y));
@@ -9553,12 +10351,26 @@ mod tests {
         // The empty pane area never resolves to a pane focus/switch/resize.
         assert_eq!(
             primary_mouse_action(
-                &session, 0, false, 24, 120, 40, center_col, rect.y, "emoji", true
+                &session,
+                0,
+                false,
+                24,
+                120,
+                40,
+                center_col,
+                rect.y,
+                "emoji",
+                true,
+                CONTROL_BAR_HEIGHT,
+                TAB_BAR_HEIGHT,
             ),
             PrimaryMouseAction::None
         );
         // A cramped pane area yields no button rather than an out-of-bounds rect.
-        assert!(empty_create_pane_rect(pane_area(24, 30, 4)).is_none());
+        assert!(
+            empty_create_pane_rect(pane_area(24, 30, 4, CONTROL_BAR_HEIGHT, TAB_BAR_HEIGHT))
+                .is_none()
+        );
     }
 
     #[test]
@@ -10118,6 +10930,7 @@ mod tests {
     fn settings_panel_lines_include_theme_and_selection() {
         let lines = settings_panel_lines(SettingsView {
             theme: UiTheme::Daylight,
+            layout: UiLayout::Classic,
             workspace_second_line: UiWorkspaceSecondLine::Path,
             sidebar_collapsed: false,
             sidebar_responsive: true,
@@ -10151,23 +10964,26 @@ mod tests {
         });
 
         assert!(lines.len() >= 10);
-        assert!(lines[0].spans[0].content.as_ref().contains("theme"));
-        assert!(lines[0].spans[0].content.as_ref().contains("Daylight"));
-        assert!(lines[1].spans[0]
+        assert!(lines[0].spans[0].content.as_ref().contains("layout"));
+        assert!(lines[0].spans[0].content.as_ref().contains("Classic"));
+        assert!(lines[0].spans[0].content.as_ref().contains("full boxes"));
+        assert!(lines[1].spans[0].content.as_ref().contains("colors"));
+        assert!(lines[1].spans[0].content.as_ref().contains("Daylight"));
+        assert!(lines[2].spans[0]
             .content
             .as_ref()
             .contains("workspace line"));
-        assert!(lines[2].spans[0].content.as_ref().contains("sidebar"));
-        assert!(lines[3].spans[0]
-            .content
-            .as_ref()
-            .contains("responsive layout"));
+        assert!(lines[3].spans[0].content.as_ref().contains("sidebar"));
         assert!(lines[4].spans[0]
             .content
             .as_ref()
+            .contains("responsive layout"));
+        assert!(lines[5].spans[0]
+            .content
+            .as_ref()
             .contains("sidebar fit text"));
-        assert!(lines[5].spans[0].content.as_ref().contains("sidebar width"));
-        assert!(lines[5].spans[0].content.as_ref().contains("24"));
+        assert!(lines[6].spans[0].content.as_ref().contains("sidebar width"));
+        assert!(lines[6].spans[0].content.as_ref().contains("24"));
         // Rows that used to sit under `── section ──` headers now live on
         // their own tabs.
         let names_for = |tab: SettingsTab| {

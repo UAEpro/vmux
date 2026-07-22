@@ -35,11 +35,13 @@ Or open [config.schema.json](config.schema.json) directly (`$id`:
 | `ui.prefix_key` | `Ctrl-b`, `Ctrl-a` | Prefix chord. Default `Ctrl-b`. |
 | `ui.sidebar_collapsed` | `true` / `false` | Start with a compact sidebar |
 | `ui.sidebar_width` | `28` | Expanded width (12–60). Max when `sidebar_fit` is on |
-| `ui.sidebar_fit` | `true` / `false` | Fit width to workspace name text |
+| `ui.sidebar_fit` | `true` / `false` | Fit width to workspace name text (default **on**) |
 | `ui.sidebar_responsive` | `true` / `false` | Auto-hide sidebar on narrow terminals (default on) |
 | `ui.scroll_step` | `8` | Lines per scroll step |
 | `ui.scrollback_bytes` | `200000` | Output retained per pane (~2500 lines). Clamped 16 KB–5 MB. **Next daemon start** |
-| `ui.theme` | see below | Color theme |
+| `ui.layout` | `classic`, `compact`, `minimal`, `flat`, `zen` | Screen **structure** (chrome density, borders, titles) |
+| `ui.colors` | see below | Color **palette** only |
+| `ui.theme` | same as `ui.colors` | Legacy alias of `ui.colors` (still written/read for older tools) |
 | `ui.workspace_second_line` | `path`, `branch`, … | Second line of each sidebar workspace row |
 | `ui.status_markers` | `dots` (default), `emoji`, `ascii`, `off` | How agent status renders in the sidebar: colored dots (✖ error, ◉ needs input, ● busy, ○ done), emoji (❌🙋🔄✅), ASCII, or hidden |
 | `ui.cursor_blink` | `true` / `false` | Soft-blink active caret while idle |
@@ -141,18 +143,51 @@ vmux config set agent_titles.enabled false     # off entirely
 Changes take effect on the next daemon start (`vmux kill` / `vmux stop`, then
 attach).
 
-## Themes
+## Layout vs colors
 
-Fifteen built-in themes:
+Structure and palette are independent settings (Settings → **layout** / **colors**).
 
-```text
-midnight  daylight  contrast  nord  dracula  gruvbox  catppuccin
-solarized-dark  solarized-light  tokyo-night  forest  rose-pine
-ocean  ember  monokai
-```
+### Layouts (`ui.layout`)
+
+Each skin changes **sidebar**, **control bar**, **tabs**, and **pane frames** —
+not just a border toggle.
+
+| Name | Look |
+|------|------|
+| `classic` (default) | Filled active sidebar row, labeled toolbar + session footer, solid tab chips, full box panes |
+| `compact` | Dense surface rail with `▎` accent, equal icon toolbar, chip tabs, full boxes |
+| `minimal` | Ghost text sidebar, bare muted icons, underlined tabs, frame **only** the focused pane |
+| `flat` | Soft surface rail + `●` pill selection, spaced pill buttons, underline tabs, left-edge active accent |
+| `zen` | Content first: no frames, no titles, text-only sidebar, nearly invisible icon bar |
+
+Aliases: `dense`→compact, `focus`→minimal, `product`→flat, `immersive`→zen.
 
 ```sh
-vmux config set ui.theme tokyo-night
+vmux config set ui.layout flat
+```
+
+### Color palettes (`ui.colors` / legacy `ui.theme`)
+
+Twenty built-in palettes. The first six are product-oriented; the rest are
+familiar editor palettes. Changing colors never changes borders or bar height.
+
+| Name | Feel |
+|------|------|
+| `midnight` (alias `classic`) | Default dark + cyan |
+| `modern` | Flat slate / indigo |
+| `soft` | Warm low-contrast stone |
+| `neon` | Deep black + electric pink / cyan |
+| `paper` | Light warm paper / ink |
+| `minimal` | Near-monochrome zinc |
+
+Also: `daylight`, `contrast`, `nord`, `dracula`, `gruvbox`, `catppuccin`,
+`solarized-dark`, `solarized-light`, `tokyo-night`, `forest`, `rose-pine`,
+`ocean`, `ember`, `monokai`.
+
+```sh
+vmux config set ui.colors modern
+# still accepted:
+vmux config set ui.theme modern
 ```
 
 ## Responsive layout
