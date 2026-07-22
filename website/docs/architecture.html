@@ -82,7 +82,7 @@
           </p>
 
           <h2 id="processes">Processes</h2>
-          <pre><code>┌──────────────────┐   JSON-RPC over    ┌──────────────────────────┐
+          <pre class="pre-plain"><code>┌──────────────────┐   JSON-RPC over    ┌──────────────────────────┐
 │  vmux CLI        │   Unix socket      │  vmux daemon             │
 │  vmux attach UI  │ ─────────────────► │  owns PTYs, layout,      │
 │  agent scripts   │ ◄── snapshots ──── │  hooks, save/restore     │
@@ -111,7 +111,7 @@
           </p>
 
           <h2 id="hierarchy">Hierarchy</h2>
-          <pre><code>Session  (default, work, …)     one daemon, one socket, one state file
+          <pre class="pre-plain"><code>Session  (default, work, …)     one daemon, one socket, one state file
  └── Workspace                  sidebar row: cwd, git branch, ports, agent status
       └── Tab                   strip above the pane grid
            └── Pane             one PTY process</code></pre>
@@ -152,7 +152,7 @@
           </p>
 
           <h2 id="source-map">Source map</h2>
-          <pre><code>src/
+          <pre class="pre-plain"><code>src/
   main.rs           entry point
   cli.rs            clap commands
   daemon/mod.rs     PTY management, socket server, port/meta refresh

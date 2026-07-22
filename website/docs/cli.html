@@ -143,7 +143,7 @@ vmux agents
 vmux events --limit 50
 vmux events --since 120 --follow --interval-ms 500</code></pre>
           <p>Panes export discovery variables, so a process can find its own place in the tree without being told:</p>
-          <pre><code>VMUX_SESSION  VMUX_WORKSPACE_ID  VMUX_PANE_ID  VMUX_SURFACE_ID  VMUX_SOCKET_PATH</code></pre>
+          <pre class="pre-plain"><code>VMUX_SESSION  VMUX_WORKSPACE_ID  VMUX_PANE_ID  VMUX_SURFACE_ID  VMUX_SOCKET_PATH</code></pre>
 
           <h2 id="notifications-and-events">Notifications and events</h2>
           <pre><code>vmux notify --message "build finished"
@@ -241,7 +241,7 @@ vmux stop</code></pre>
           <p>Session state is persisted separately, in <code>~/.local/state/vmux/</code>.</p>
 
           <h2 id="full-command-surface">Full command surface</h2>
-          <pre><code>attach  daemon  new-pane  split  run  open-url  url-snapshot  url-links
+          <pre class="pre-plain"><code>attach  daemon  new-pane  split  run  open-url  url-snapshot  url-links
 browser  agent  remote  markdown  actions  skills  config  ports  relay
 send  send-key  send-image  broadcast  read-screen  search  clear-pane
 copy-pane  paste  clipboard  kill-pane  duplicate-pane  prune  restart-pane

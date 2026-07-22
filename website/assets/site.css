@@ -1705,6 +1705,8 @@ h3 {
   text-transform: uppercase;
   content: "sh";
 }
+.docs-content pre.pre-plain { padding-top: 18px; }
+.docs-content pre.pre-plain::before, .docs-content pre.pre-plain::after { content: none; }
 .docs-content pre code { padding: 0; border: 0; background: none; color: #c8ecd4; font-size: 0.82rem; line-height: 1.65; }
 .docs-content code { padding: 0.15em 0.42em; border-radius: 6px; background: var(--surface-3); color: var(--green-bright); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
 

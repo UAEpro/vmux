@@ -123,7 +123,7 @@ vmux config set ui.prefix_key Ctrl-a</code></pre>
               <tr><td><code>relay.bind</code></td><td><code>auto</code>, <code>tailscale</code>, <code>local</code></td><td>Never binds <code>0.0.0.0</code></td></tr>
               <tr><td><code>relay.port</code></td><td><code>4399</code></td><td>TCP port 1–65535 (default 4399). Also: <code>vmux relay serve --listen host:port</code></td></tr>
               <tr><td><code>relay.allow_localhost</code></td><td><code>true</code> / <code>false</code></td><td>Allow device registration from loopback</td></tr>
-              <tr><td><code>relay.allow_tailnet_cgnat</code></td><td><code>true</code> / <code>false</code></td><td>Accept CGNAT peers without whois</td></tr>
+              <tr><td><code>relay.allow_tailnet_cgnat</code></td><td><code>true</code> / <code>false</code></td><td>Accept CGNAT peers without whois (default off)</td></tr>
               <tr><td><code>relay.allow_paste</code></td><td><code>true</code> / <code>false</code></td><td>Browser paste page (<code>/paste</code>)</td></tr>
               <tr><td><code>relay.allow_view_resize</code></td><td><code>true</code> / <code>false</code></td><td>Phone-fit leased pane resize (default off)</td></tr>
             </tbody>
@@ -183,7 +183,7 @@ vmux relay serve --listen 127.0.0.1:4400</code></pre>
 
           <h2 id="themes">Themes</h2>
           <p>Fifteen built-in themes:</p>
-          <pre><code>midnight  daylight  contrast  nord  dracula  gruvbox  catppuccin
+          <pre class="pre-plain"><code>midnight  daylight  contrast  nord  dracula  gruvbox  catppuccin
 solarized-dark  solarized-light  tokyo-night  forest  rose-pine
 ocean  ember  monokai</code></pre>
           <pre><code>vmux config set ui.theme tokyo-night</code></pre>

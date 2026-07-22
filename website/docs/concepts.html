@@ -82,7 +82,7 @@
           </p>
 
           <h2 id="hierarchy">Hierarchy</h2>
-          <pre><code>Session  (default, work, …)     one daemon, one socket, one state file
+          <pre class="pre-plain"><code>Session  (default, work, …)     one daemon, one socket, one state file
  └── Workspace                  sidebar row: cwd, git branch, ports, agent status
       └── Tab                   strip above the pane grid
            └── Pane             one PTY process</code></pre>
@@ -133,7 +133,7 @@
 vmux --session work attach  # reattach</code></pre>
           <p>
             Session state — including scrollback — is written to
-            <code>~/.local/state/&lt;session&gt;.json</code> under the XDG state directory. A corrupt file is moved
+            <code>~/.local/state/vmux/&lt;session&gt;.json</code> under the XDG state directory. A corrupt file is moved
             aside rather than deleted, so a bad write never silently erases a session.
           </p>
 

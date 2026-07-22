@@ -83,21 +83,22 @@ document.querySelectorAll("[data-copy]").forEach((button) => {
 });
 
 const tocLinks = document.querySelectorAll(".docs-toc a");
-if (tocLinks.length && "IntersectionObserver" in window) {
-  const setActive = (id) => {
-    tocLinks.forEach((link) => link.classList.toggle("active", link.hash === `#${id}`));
-  };
+if (tocLinks.length) {
   const headings = Array.from(tocLinks)
     .map((link) => document.getElementById(decodeURIComponent(link.hash.slice(1))))
     .filter(Boolean);
-  const tocObserver = new IntersectionObserver(
-    (entries) => {
-      const visible = entries.filter((entry) => entry.isIntersecting);
-      if (visible.length) setActive(visible[0].target.id);
-    },
-    { rootMargin: "-100px 0px -70% 0px", threshold: 0 },
-  );
-  headings.forEach((heading) => tocObserver.observe(heading));
+  const setActive = (id) =>
+    tocLinks.forEach((link) => link.classList.toggle("active", link.hash === `#${id}`));
+  const updateToc = () => {
+    let current = headings[0];
+    for (const heading of headings) {
+      if (heading.getBoundingClientRect().top <= 140) current = heading;
+      else break;
+    }
+    if (current) setActive(current.id);
+  };
+  updateToc();
+  window.addEventListener("scroll", updateToc, { passive: true });
 }
 
 const reveals = document.querySelectorAll(".reveal");
