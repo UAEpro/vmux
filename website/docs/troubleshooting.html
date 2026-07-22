@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Troubleshooting — vmux docs</title>
+    <meta name="description" content="Fixes for the vmux problems people hit most: stuck attaches, relay pairing, missing scrollback." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/troubleshooting.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css?v=fb8464d" />
+    <script src="../assets/site.js?v=fb8464d" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html">Keyboard shortcuts</a></li>
+              <li><a href="agents.html">Agent integrations</a></li>
+              <li><a href="phone-relay.html">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html" aria-current="page">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Help</p>
+          <h1>Troubleshooting</h1>
+          <p class="docs-lede">
+            Quick fixes for the problems people hit most. For deeper context see
+            <a href="architecture.html">Architecture</a> and <a href="configuration.html">Configuration</a>.
+          </p>
+
+          <h2 id="attach-fails">Attach fails</h2>
+          <p><strong>Symptom:</strong> <code>vmux attach</code> errors, hangs, or exits immediately.</p>
+          <table>
+            <thead><tr><th>Check</th><th>What to do</th></tr></thead>
+            <tbody>
+              <tr><td>Stale lock / dead daemon</td><td><code>vmux sessions</code>, then <code>vmux doctor</code>. If a pid file exists but the process is gone, <code>vmux stop</code> and attach again.</td></tr>
+              <tr><td>Wrong session</td><td><code>vmux --session &lt;name&gt; attach</code>. Default session is <code>default</code>.</td></tr>
+              <tr><td>Socket permissions / path</td><td>Runtime dir must be owned by you, not a symlink, and not group/other-writable. <code>vmux doctor</code> reports this.</td></tr>
+              <tr><td>Terminal too small</td><td>Extremely small TTYs can make the layout unusable; enlarge the window.</td></tr>
+            </tbody>
+          </table>
+          <pre><code>vmux doctor
+vmux status
+vmux logs --lines 200</code></pre>
+
+          <h2 id="phantom-sessions-in-vmux-sessions">Phantom sessions in <code>vmux sessions</code></h2>
+          <p><strong>Symptom:</strong> names like <code>update-check</code> or <code>relay-devices</code> appear as sessions.</p>
+          <p>
+            Those are daemon state files that live next to session JSON under <code>~/.local/state/vmux/</code>.
+            Current builds exclude them via a reserved-stem list. If you still see them, upgrade vmux, and don't
+            create a real session with one of those names.
+          </p>
+
+          <h2 id="relay-will-not-pair-phone-cannot-connect">Relay will not pair / phone cannot connect</h2>
+          <p>See also <a href="phone-relay.html">Phone relay &amp; remote</a>.</p>
+          <ol>
+            <li>Tailscale up on <strong>both</strong> phone and host, same tailnet.</li>
+            <li>Relay running: <code>vmux relay status</code> or rely on auto-start (<code>relay.enabled</code>, default on).</li>
+            <li>
+              Port: default <strong>4399</strong>, but it is configurable:
+              <pre><code>vmux config set relay.port 4399
+vmux relay serve --listen 127.0.0.1:4400</code></pre>
+              The phone app must use the <strong>same</strong> port.
+            </li>
+            <li>Bind mode: <code>relay.bind</code> is <code>auto</code> | <code>tailscale</code> | <code>local</code>. Localhost-only binds are unreachable from a physical phone over the tailnet.</li>
+            <li>Health probe: <code>curl -s http://$(tailscale ip -4):4399/v1/health</code></li>
+            <li>Pairing policy: <code>allow_localhost</code> is for same-machine/dev only. <code>allow_tailnet_cgnat</code> is off by default (whois required).</li>
+            <li>Lost phone: <code>vmux relay devices list</code> then <code>vmux relay devices revoke &lt;id&gt;</code>.</li>
+          </ol>
+          <p>The relay <strong>never</strong> binds <code>0.0.0.0</code> / <code>::</code>. LAN-wide exposure is intentionally unsupported — use Tailscale.</p>
+
+          <h2 id="agent-hooks-not-updating-the-sidebar">Agent hooks not updating the sidebar</h2>
+          <ol>
+            <li><code>vmux hooks status</code> — incomplete installs are reported.</li>
+            <li>Reinstall: <code>vmux hooks install</code> (or <code>--agent claude|codex|grok|shell</code>).</li>
+            <li>Inside panes, confirm env: <code>echo $VMUX_PANE_ID</code>.</li>
+            <li>
+              Manual probe:
+              <pre><code>vmux set-status busy --message "working"
+vmux notify --status done --message "tests passed"</code></pre>
+            </li>
+            <li>Shell integration: <code>eval "$(vmux hooks shell)"</code> in the rc file the pane actually sources.</li>
+          </ol>
+          <p>Automatic tab titles need <code>agent_titles.enabled</code> (default on) and a daemon restart after config changes.</p>
+
+          <h2 id="scrollback-missing-or-shorter-than-expected">Scrollback missing or shorter than expected</h2>
+          <ul>
+            <li>
+              Retention is <code>ui.scrollback_bytes</code> (default 200 KB, clamp 16 KB–5 MB), applied on the
+              <strong>next daemon start</strong>:
+              <pre><code>vmux config set ui.scrollback_bytes 500000
+vmux stop
+vmux attach</code></pre>
+            </li>
+            <li>Session state lives in <code>~/.local/state/vmux/&lt;session&gt;.json</code>. Corrupt files are moved aside, not silently deleted.</li>
+            <li>Lean attach polls omit full history except for panes you are scrolled back in.</li>
+          </ul>
+
+          <h2 id="port-detection-empty">Port detection empty</h2>
+          <p>
+            See <a href="ports.html">Ports &amp; forwarding</a>. Short version: Linux only, leave
+            <code>ports.enabled</code> on, ensure the listener is a child of a pane process, and check
+            <code>ports.ignore</code> / <code>ignore_ephemeral</code>.
+          </p>
+
+          <h2 id="config-changes-seem-ignored">Config changes seem ignored</h2>
+          <ul>
+            <li>Many keys apply immediately; <code>ui.scrollback_bytes</code> and some title settings need a daemon restart.</li>
+            <li>Malformed config is ignored on read (defaults) with a warning; mutation commands refuse to overwrite a broken file — fix or delete <code>~/.config/vmux/config.json</code> first.</li>
+            <li>Symlinked (dotfiles) config is written <strong>through</strong> the link; a broken symlink is refused rather than replaced.</li>
+          </ul>
+          <pre><code>vmux config show</code></pre>
+
+          <h2 id="develop-without-killing-your-real-session">Develop without killing your real session</h2>
+          <pre><code>cargo run -- --session dev attach</code></pre>
+          <p>Never point a buggy debug build at the session where your agents live.</p>
+
+          <h2 id="still-stuck">Still stuck</h2>
+          <pre><code>vmux doctor
+vmux logs --lines 200
+vmux --version</code></pre>
+          <p>
+            Open an issue at <a href="https://github.com/UAEpro/vmux">github.com/UAEpro/vmux</a> with the doctor
+            output (redact paths/secrets), or see <a href="../support.html">Support</a>.
+          </p>
+
+          <div class="docs-pager">
+            <a href="architecture.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Architecture</span></a>
+            <a class="docs-pager-next" href="index.html"><span class="docs-pager-label">Done</span><span class="docs-pager-title">Docs overview →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/troubleshooting.md">Edit this page on GitHub</a></div>
+        </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#attach-fails">Attach fails</a></li>
+              <li><a href="#phantom-sessions-in-vmux-sessions">Phantom sessions in vmux sessions</a></li>
+              <li><a href="#relay-will-not-pair-phone-cannot-connect">Relay will not pair / phone cannot connect</a></li>
+              <li><a href="#agent-hooks-not-updating-the-sidebar">Agent hooks not updating the sidebar</a></li>
+              <li><a href="#scrollback-missing-or-shorter-than-expected">Scrollback missing or shorter than expected</a></li>
+              <li><a href="#port-detection-empty">Port detection empty</a></li>
+              <li><a href="#config-changes-seem-ignored">Config changes seem ignored</a></li>
+              <li><a href="#develop-without-killing-your-real-session">Develop without killing your real session</a></li>
+              <li><a href="#still-stuck">Still stuck</a></li>
+          </ul>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

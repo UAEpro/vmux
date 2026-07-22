@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CLI reference — vmux docs</title>
+    <meta name="description" content="Every vmux subcommand, grouped by what it does." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/cli.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css?v=fb8464d" />
+    <script src="../assets/site.js?v=fb8464d" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html">Keyboard shortcuts</a></li>
+              <li><a href="agents.html">Agent integrations</a></li>
+              <li><a href="phone-relay.html">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html" aria-current="page">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Reference</p>
+          <h1>CLI reference</h1>
+          <p class="docs-lede">
+            Every command accepts <code>--session &lt;name&gt;</code> (or the <code>VMUX_SESSION</code> env var). Most
+            take <code>--workspace</code> / <code>--pane</code> when you are not already running inside a pane. Run
+            <code>vmux --help</code> or <code>vmux &lt;command&gt; --help</code> for the authoritative flags.
+          </p>
+
+          <h2 id="layout-and-panes">Layout and panes</h2>
+          <pre><code>vmux new-pane --direction right --command "claude" --title backend --workspace ws-2
+vmux split right --command "claude" --title backend
+vmux focus right
+vmux focus-pane --pane pane-1
+vmux move left|right|up|down
+vmux resize right --amount 10
+vmux view-size --pane pane-1 --cols 46 --rows 22   # phone-fit: hold the PTY at min(layout, view)
+vmux view-size --pane pane-1 --clear               # restore the layout size now
+vmux zoom --pane pane-1
+vmux swap-panes --first pane-1 --second pane-2
+vmux duplicate-pane --pane pane-1 --direction down
+vmux restart-pane --workspace ws-2
+vmux kill-pane --pane pane-1
+vmux prune --workspace ws-2</code></pre>
+          <p><code>vmux move</code> shifts a pane with its layout neighbor. It does not wrap.</p>
+          <p>
+            <code>vmux view-size</code> is a leased override (default 10s): it expires unless re-sent, so a viewer
+            that dies can never pin a pane small. Phone-driven resizing is additionally gated behind
+            <code>relay.allow_view_resize</code> (default off); the CLI command talks to the daemon directly and is
+            not gated. Zoomed panes refuse it. Overrides are never persisted — a daemon restart always restores
+            desktop sizes.
+          </p>
+
+          <h2 id="workspaces-and-tabs">Workspaces and tabs</h2>
+          <pre><code>vmux workspace new --name agents --command "claude"
+vmux workspace pin ws-2
+vmux workspace move ws-2 --position 1
+vmux workspace next | previous
+vmux tab list
+vmux tab new --title tests
+vmux tab switch tab-2
+vmux tab rename tab-2 --title integration
+vmux tab close tab-2</code></pre>
+          <p><code>pane-tab</code> is deprecated. Use <code>vmux tab</code>.</p>
+
+          <h2 id="agents-and-scripting">Agents and scripting</h2>
+          <pre><code>vmux agent new --command "claude" --title backend --workspace ws-2
+vmux agent team --agents codex,claude --cwd "$PWD"
+vmux agent list
+vmux agent send --agent pane-1 --enter "continue"
+vmux agent read --agent pane-1
+vmux agent notify --agent pane-1 --status attention --message "needs input"
+
+vmux send --enter "npm test"
+vmux send-key enter
+# save an image on this host and type its path into the pane — pipe a
+# screenshot over SSH into Claude Code: pngpaste - | ssh box vmux send-image -
+vmux send-image screenshot.png --pane pane-1
+vmux broadcast --scope workspace --enter "npm test"
+vmux run --command "npm test" --title tests --timeout 60
+vmux wait --workspace ws-2 --timeout 30
+# block until the agent needs you (or finishes / the pane exits)
+vmux wait --pane pane-1 --status attention,done,error --timeout 600
+vmux read-screen --pane pane-1 --limit-bytes 64000
+vmux search "needle"
+vmux identify --json
+vmux agents
+vmux events --limit 50
+vmux events --since 120 --follow --interval-ms 500</code></pre>
+          <p>Panes export discovery variables, so a process can find its own place in the tree without being told:</p>
+          <pre class="pre-plain"><code>VMUX_SESSION  VMUX_WORKSPACE_ID  VMUX_PANE_ID  VMUX_SURFACE_ID  VMUX_SOCKET_PATH</code></pre>
+
+          <h2 id="notifications-and-events">Notifications and events</h2>
+          <pre><code>vmux notify --message "build finished"
+vmux notify --pane pane-1 --status done --color green --message "agent done"
+vmux notifications --limit 10
+vmux events --limit 50
+vmux events --follow --interval-ms 250
+vmux clear-notifications
+vmux jump-notification
+vmux set-status busy --message "working"
+vmux set-progress 75</code></pre>
+          <p>Processes can also raise notifications with OSC escapes, with no vmux command in the loop:</p>
+          <pre><code>printf '\033]9;needs input\a'
+printf '\033]777;notify;Claude;waiting for approval\a'</code></pre>
+
+          <h2 id="hooks">Hooks</h2>
+          <p>Full guide: <a href="agents.html">Agent integrations</a>.</p>
+          <pre><code>vmux hooks install                  # all detected agents
+vmux hooks status
+vmux hooks install --agent claude   # ~/.claude/settings.json
+vmux hooks install --agent codex    # ~/.codex/hooks.json
+vmux hooks install --agent grok     # ~/.grok/hooks/vmux.json (+ skill)
+vmux hooks install --agent shell
+
+vmux detect --agent claude --file screen.txt --osc-title $'⣿ thinking' --json
+
+eval "$(vmux hooks shell)"
+vmux hooks setup --dir ~/.config/vmux --rc ~/.bashrc
+echo '{"event":"needs-input","message":"waiting"}' | vmux hooks event --pane "$VMUX_PANE_ID"</code></pre>
+
+          <h2 id="browser-markdown-remote">Browser, markdown, remote</h2>
+          <pre><code>vmux open-url https://example.com
+vmux browser snapshot https://example.com
+vmux browser screenshot https://example.com
+vmux browser links https://example.com
+vmux markdown open README.md
+vmux remote ssh user@host --command "claude"
+vmux remote tmux user@host --session work</code></pre>
+
+          <h2 id="ports">Ports</h2>
+          <p>Listening ports owned by pane processes. Full guide: <a href="ports.html">Ports &amp; forwarding</a>.</p>
+          <pre><code>vmux ports list
+vmux ports list --workspace ws-2 --json
+vmux ports ssh-cmd 5173
+vmux config set ports.ssh_host 'user@devbox'
+vmux ports forward 3000 --via tailscale
+vmux ports unforward 3000</code></pre>
+
+          <h2 id="relay">Relay</h2>
+          <p>Default port <strong>4399</strong>, change anytime. Full guide: <a href="phone-relay.html">Phone relay &amp; remote</a>.</p>
+          <pre><code>vmux config set relay.port 4400
+vmux relay serve
+vmux relay serve --port 4400
+vmux relay serve --listen 127.0.0.1:4400
+vmux relay status
+vmux relay devices list
+vmux relay devices revoke &lt;device_id&gt;</code></pre>
+
+          <h2 id="config-actions-skills">Config, actions, skills</h2>
+          <pre><code>vmux config show
+vmux config init
+vmux config set ui.prefix_key Ctrl-a
+vmux config set ui.sidebar_collapsed true
+vmux config set ui.theme contrast
+vmux config set relay.port 4399
+vmux actions list
+vmux actions run test
+vmux skills list
+vmux skills install vmux-control --dir .vmux/skills</code></pre>
+          <p>
+            Project actions are defined in <code>vmux.json</code> and can also be run from the TUI with
+            <kbd>Ctrl-b</kbd> <kbd>A</kbd>. See <a href="configuration.html">Configuration</a>.
+          </p>
+
+          <h2 id="session-ops">Session ops</h2>
+          <pre><code>vmux daemon                 # start the daemon without attaching
+vmux sessions               # running and persisted sessions
+vmux --session work attach  # reattach, e.g. after an SSH drop
+vmux list
+vmux status
+vmux logs --lines 200
+vmux doctor
+vmux smoke
+vmux stop</code></pre>
+          <p>Most commands auto-start the daemon, wait for the socket, then run. You rarely need <code>vmux daemon</code> by hand.</p>
+          <p>Runtime files live under <code>$XDG_RUNTIME_DIR/vmux</code>, falling back to <code>/tmp/vmux-$UID/vmux</code>:</p>
+          <table>
+            <thead><tr><th>File</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>&lt;session&gt;.sock</code></td><td>CLI control socket</td></tr>
+              <tr><td><code>&lt;session&gt;.pid</code></td><td>Daemon process id</td></tr>
+              <tr><td><code>&lt;session&gt;.log</code></td><td>Daemon stdout and stderr</td></tr>
+            </tbody>
+          </table>
+          <p>Session state is persisted separately, in <code>~/.local/state/vmux/</code>.</p>
+
+          <h2 id="full-command-surface">Full command surface</h2>
+          <pre class="pre-plain"><code>attach  daemon  new-pane  split  run  open-url  url-snapshot  url-links
+browser  agent  remote  markdown  actions  skills  config  ports  relay
+send  send-key  send-image  broadcast  read-screen  search  clear-pane
+copy-pane  paste  clipboard  kill-pane  duplicate-pane  prune  restart-pane
+move-pane  swap-panes  title  tab  move  metadata  wait  resize
+focus  focus-pane  zoom  workspace  surface  progress  hooks
+set-progress  set-status  notify  notifications  events
+clear-notifications  jump-notification  identify  list  agents
+status  sessions  logs  doctor  smoke  stop</code></pre>
+
+          <div class="docs-pager">
+            <a href="ports.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Ports &amp; forwarding</span></a>
+            <a class="docs-pager-next" href="architecture.html"><span class="docs-pager-label">Next</span><span class="docs-pager-title">Architecture →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/cli.md">Edit this page on GitHub</a></div>
+        </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#layout-and-panes">Layout and panes</a></li>
+              <li><a href="#workspaces-and-tabs">Workspaces and tabs</a></li>
+              <li><a href="#agents-and-scripting">Agents and scripting</a></li>
+              <li><a href="#notifications-and-events">Notifications and events</a></li>
+              <li><a href="#hooks">Hooks</a></li>
+              <li><a href="#browser-markdown-remote">Browser, markdown, remote</a></li>
+              <li><a href="#ports">Ports</a></li>
+              <li><a href="#relay">Relay</a></li>
+              <li><a href="#config-actions-skills">Config, actions, skills</a></li>
+              <li><a href="#session-ops">Session ops</a></li>
+              <li><a href="#full-command-surface">Full command surface</a></li>
+          </ul>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

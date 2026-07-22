@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent integrations — vmux docs</title>
+    <meta name="description" content="Hooks for Claude Code, Codex, Grok, and shells. Status, notifications, and automatic tab titles." />
+    <meta name="theme-color" content="#070b09" />
+    <link rel="canonical" href="https://vmux.sh/docs/agents.html" />
+    <link rel="icon" href="../assets/favicon.png" />
+    <link rel="manifest" href="../site.webmanifest" />
+    <link rel="stylesheet" href="../assets/site.css?v=fb8464d" />
+    <script src="../assets/site.js?v=fb8464d" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="../index.html" aria-label="vmux home">
+          <img src="../assets/logo.png" alt="" width="40" height="40" />
+          <span>vmux</span>
+        </a>
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span><span></span>
+          <span class="sr-only">Open navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="../index.html#features">Features</a>
+          <a href="../remote.html">Remote</a>
+          <a href="../install.html">Install</a>
+          <a href="index.html" aria-current="page">Docs</a>
+          <a class="nav-github" href="https://github.com/UAEpro/vmux" aria-label="vmux on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7A11.5 11.5 0 0 0 8.4 23c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.6.1-3.1 0 0 1-.3 3.2 1.2A11 11 0 0 1 12 6.3c1 0 2 .1 2.9.4C17.1 5.2 18.1 5.5 18.1 5.5c.6 1.5.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.8 5.4-5.5 5.7.4.4.8 1.1.8 2.1v2.9c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" class="page-main docs-main">
+      <div class="docs-shell">
+        <aside class="docs-sidebar" aria-label="Documentation">
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Introduction</span>
+            <ul>
+              <li><a href="index.html">Overview</a></li>
+              <li><a href="getting-started.html">Getting started</a></li>
+              <li><a href="concepts.html">Concepts</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Guides</span>
+            <ul>
+              <li><a href="configuration.html">Configuration</a></li>
+              <li><a href="keyboard-shortcuts.html">Keyboard shortcuts</a></li>
+              <li><a href="agents.html" aria-current="page">Agent integrations</a></li>
+              <li><a href="phone-relay.html">Phone relay &amp; remote</a></li>
+              <li><a href="ports.html">Ports &amp; forwarding</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Reference</span>
+            <ul>
+              <li><a href="cli.html">CLI reference</a></li>
+              <li><a href="architecture.html">Architecture</a></li>
+            </ul>
+          </div>
+          <div class="docs-sidebar-group">
+            <span class="docs-group-title">Help</span>
+            <ul>
+              <li><a href="troubleshooting.html">Troubleshooting</a></li>
+            </ul>
+          </div>
+        </aside>
+
+        <article class="docs-content content-page">
+          <p class="eyebrow">Guides</p>
+          <h1>Agent integrations</h1>
+          <p class="docs-lede">
+            <code>vmux hooks install</code> writes the integration for whichever agents it finds. Once installed,
+            agent state lands in the sidebar without you doing anything else.
+          </p>
+
+          <h2 id="install-hooks">Install hooks</h2>
+          <pre><code>vmux hooks install                  # all detected agents
+vmux hooks status
+vmux hooks install --agent claude   # ~/.claude/settings.json
+vmux hooks install --agent codex    # ~/.codex/hooks.json
+vmux hooks install --agent grok     # ~/.grok/hooks/vmux.json (+ skill)
+vmux hooks install --agent shell</code></pre>
+          <p>
+            Once installed, agent state — busy, needs input, done, failed — lands in the sidebar with no further
+            setup: Claude (<code>~/.claude/settings.json</code>), Codex (<code>~/.codex/hooks.json</code>), Grok
+            Build (<code>~/.grok/hooks/vmux.json</code>), and a shell hook for anything else. Run
+            <code>vmux hooks status</code> any time to see which are wired up.
+          </p>
+
+          <h2 id="screen-manifest-detection">Screen-manifest detection</h2>
+          <p>
+            For agents without a hook system, vmux can also read the pane's screen contents against known UI
+            patterns (herdr-style primary status for Claude/Codex/…). Screen rules take priority; hooks fill in when
+            no manifest agent is running.
+          </p>
+          <pre><code># Offline explain (read screen dump from stdin or --file):
+printf '%s\n' ' ❯  ' | vmux detect --agent claude
+vmux detect --agent claude --file screen.txt --osc-title $'⣿ thinking' --json
+# Local rule overrides: ~/.config/vmux/agent-detection/&lt;agent&gt;.toml</code></pre>
+
+          <h2 id="status-is-sticky-when-it-matters">Status is sticky when it matters</h2>
+          <p>
+            <strong>Done (✅)</strong> is sticky — it stays until you actually look at the pane, so an agent finishing
+            while you were in another workspace is still there when you get back.
+          </p>
+
+          <h2 id="drive-it-yourself">Drive it yourself</h2>
+          <p>To report status from a script or an agent with no built-in integration:</p>
+          <pre><code>vmux set-status busy --message "working"
+vmux set-progress 75
+vmux notify --pane pane-1 --status done --color green --message "tests passed"
+vmux notifications --limit 10
+vmux events --limit 50
+vmux events --follow --interval-ms 250
+vmux clear-notifications
+vmux jump-notification</code></pre>
+          <p>Or raise notifications with plain OSC escapes, no vmux command in the loop:</p>
+          <pre><code>printf '\033]9;needs input\a'
+printf '\033]777;notify;Claude;waiting for approval\a'</code></pre>
+
+          <h2 id="shell-integration-and-scripting">Shell integration and scripting</h2>
+          <pre><code>eval "$(vmux hooks shell)"
+vmux hooks setup --dir ~/.config/vmux --rc ~/.bashrc
+echo '{"event":"needs-input","message":"waiting"}' | vmux hooks event --pane "$VMUX_PANE_ID"</code></pre>
+          <p>The shell integration defines helpers you can call from scripts:</p>
+          <pre><code>vmux_hook_run "tests" cargo test
+vmux_hook_attention "waiting for approval"
+vmux_hook_progress 50</code></pre>
+
+          <h2 id="automatic-tab-names">Automatic tab names</h2>
+          <p>
+            Any tab holding a coding agent names itself after the work in it — see
+            <a href="configuration.html#automatic-tab-names">Configuration → automatic tab names</a> for the full
+            source order (OSC titles, hook prompts, status messages, LLM fallback).
+          </p>
+
+          <h2 id="finding-your-own-place-in-the-tree">Finding your own place in the tree</h2>
+          <p>Panes export discovery variables, so a process can find its own place without being told:</p>
+          <pre class="pre-plain"><code>VMUX_SESSION  VMUX_WORKSPACE_ID  VMUX_PANE_ID  VMUX_SURFACE_ID  VMUX_SOCKET_PATH</code></pre>
+          <pre><code>vmux identify --json
+vmux agents
+vmux agent read --agent pane-1
+vmux agent send --agent pane-1 --enter "continue"</code></pre>
+
+          <div class="docs-callout">
+            <p><strong>Naming note.</strong> vmux was renamed from an earlier project called <em>lmux</em>. The
+            <code>LMUX_PANE_ID</code> environment variable still exists next to <code>VMUX_PANE_ID</code> for
+            backward compatibility — shell hooks read <code>${VMUX_PANE_ID:-${LMUX_PANE_ID:-}}</code>, and
+            <code>vmux hooks status</code> flags a hook that only mentions the old name as stale.</p>
+          </div>
+
+          <h2 id="multi-agent-teams">Multi-agent teams</h2>
+          <pre><code>vmux agent new --command "claude" --title backend --workspace ws-2
+vmux agent team --agents codex,claude --cwd "$PWD"
+vmux agent list
+vmux broadcast --scope workspace --enter "npm test"
+vmux run --command "npm test" --title tests --timeout 60
+vmux wait --pane pane-1 --status attention,done,error --timeout 600</code></pre>
+
+          <div class="docs-pager">
+            <a href="keyboard-shortcuts.html"><span class="docs-pager-label">← Back</span><span class="docs-pager-title">Keyboard shortcuts</span></a>
+            <a class="docs-pager-next" href="phone-relay.html"><span class="docs-pager-label">Next</span><span class="docs-pager-title">Phone relay &amp; remote →</span></a>
+          </div>
+          <div class="docs-edit-link"><a href="https://github.com/UAEpro/vmux/edit/main/docs/cli.md">Edit this page on GitHub</a></div>
+        </article>
+        <aside class="docs-toc">
+          <span class="docs-toc-title">On this page</span>
+          <ul>
+              <li><a href="#install-hooks">Install hooks</a></li>
+              <li><a href="#screen-manifest-detection">Screen-manifest detection</a></li>
+              <li><a href="#status-is-sticky-when-it-matters">Status is sticky when it matters</a></li>
+              <li><a href="#drive-it-yourself">Drive it yourself</a></li>
+              <li><a href="#shell-integration-and-scripting">Shell integration and scripting</a></li>
+              <li><a href="#automatic-tab-names">Automatic tab names</a></li>
+              <li><a href="#finding-your-own-place-in-the-tree">Finding your own place in the tree</a></li>
+              <li><a href="#multi-agent-teams">Multi-agent teams</a></li>
+          </ul>
+        </aside>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <a class="brand" href="../index.html"><img src="../assets/logo.png" alt="" width="36" height="36" /><span>vmux</span></a>
+          <p>The agent-first terminal multiplexer.</p>
+        </div>
+        <div class="footer-links">
+          <div><strong>Product</strong><a href="../index.html#features">Features</a><a href="../remote.html">Remote</a><a href="../install.html">Install</a></div>
+          <div><strong>Resources</strong><a href="index.html">Documentation</a><a href="https://github.com/UAEpro/vmux/releases">Releases</a><a href="../support.html">Support</a></div>
+          <div><strong>Legal</strong><a href="../privacy.html">Privacy</a><a href="https://github.com/UAEpro/vmux/blob/main/LICENSE">MIT License</a></div>
+        </div>
+      </div>
+      <div class="shell footer-bottom"><span>© 2026 vmux</span><span>Built in the terminal.</span></div>
+    </footer>
+  </body>
+</html>

@@ -82,6 +82,25 @@ document.querySelectorAll("[data-copy]").forEach((button) => {
   });
 });
 
+const tocLinks = document.querySelectorAll(".docs-toc a");
+if (tocLinks.length) {
+  const headings = Array.from(tocLinks)
+    .map((link) => document.getElementById(decodeURIComponent(link.hash.slice(1))))
+    .filter(Boolean);
+  const setActive = (id) =>
+    tocLinks.forEach((link) => link.classList.toggle("active", link.hash === `#${id}`));
+  const updateToc = () => {
+    let current = headings[0];
+    for (const heading of headings) {
+      if (heading.getBoundingClientRect().top <= 140) current = heading;
+      else break;
+    }
+    if (current) setActive(current.id);
+  };
+  updateToc();
+  window.addEventListener("scroll", updateToc, { passive: true });
+}
+
 const reveals = document.querySelectorAll(".reveal");
 if ("IntersectionObserver" in window) {
   const observer = new IntersectionObserver(
