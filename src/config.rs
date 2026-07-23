@@ -604,7 +604,7 @@ pub fn default_scrollback_bytes() -> usize {
 }
 
 pub fn default_theme() -> String {
-    "midnight".to_string()
+    "tokyo-night".to_string()
 }
 
 pub fn default_layout() -> String {
@@ -618,6 +618,7 @@ pub fn default_workspace_second_line() -> String {
 /// Color palette names (`ui.colors` / legacy `ui.theme`).
 pub fn supported_themes() -> Vec<&'static str> {
     vec![
+        "tokyo-night", // default
         "midnight",
         "modern",
         "soft",
@@ -632,7 +633,6 @@ pub fn supported_themes() -> Vec<&'static str> {
         "catppuccin",
         "solarized-dark",
         "solarized-light",
-        "tokyo-night",
         "forest",
         "rose-pine",
         "ocean",
@@ -963,7 +963,9 @@ mod tests {
         assert!(config.ui.sidebar_collapsed);
         assert_eq!(config.ui.prefix_key, "Ctrl-b");
         assert_eq!(config.ui.scroll_step, 5);
-        assert_eq!(config.ui.theme, "midnight");
+        assert_eq!(config.ui.theme, "tokyo-night");
+        assert_eq!(config.ui.colors, "tokyo-night");
+        assert_eq!(config.ui.layout, "classic");
         assert_eq!(config.ui.workspace_second_line, "path");
         assert!(config.ui.cursor_blink);
         assert_eq!(config.ui.cursor_blink_ms, 1000);
@@ -1024,7 +1026,7 @@ mod tests {
         config.ui.workspace_second_line = "DETAILS".to_string();
         let n = config.normalized();
         assert_eq!(n.ui.prefix_key, "Alt-x");
-        assert_eq!(n.ui.theme, "midnight");
+        assert_eq!(n.ui.theme, "midnight"); // explicit theme still normalizes
         assert_eq!(n.ui.workspace_second_line, "details");
 
         let mut empty = LmuxConfig::default();
@@ -1032,7 +1034,9 @@ mod tests {
         empty.ui.theme = "unknown".to_string();
         let empty_n = empty.normalized();
         assert_eq!(empty_n.ui.prefix_key, "Ctrl-b");
-        assert_eq!(empty_n.ui.theme, "midnight");
+        assert_eq!(empty_n.ui.theme, "tokyo-night");
+        assert_eq!(empty_n.ui.colors, "tokyo-night");
+        assert_eq!(empty_n.ui.layout, "classic");
     }
 
     #[test]
@@ -1112,6 +1116,12 @@ mod tests {
         assert_eq!(n.ui.layout, "flat");
         assert_eq!(n.ui.colors, "midnight");
         assert_eq!(n.ui.theme, "midnight");
+
+        // Empty colors + empty theme → current default palette.
+        let d = LmuxConfig::default().normalized();
+        assert_eq!(d.ui.colors, "tokyo-night");
+        assert_eq!(d.ui.theme, "tokyo-night");
+        assert_eq!(d.ui.layout, "classic");
     }
 
     #[test]

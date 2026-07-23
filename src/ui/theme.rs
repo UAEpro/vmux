@@ -388,7 +388,8 @@ impl UiTheme {
             "ocean" | "deep-ocean" => Self::Ocean,
             "ember" | "warm" => Self::Ember,
             "monokai" => Self::Monokai,
-            _ => Self::Midnight,
+            // Unknown names fall back to the current default palette.
+            _ => Self::TokyoNight,
         }
     }
 
@@ -444,7 +445,9 @@ impl UiTheme {
     }
 
     pub(crate) fn all() -> &'static [Self] {
+        // Default first so Settings ←/→ cycles start from tokyo-night.
         &[
+            Self::TokyoNight,
             Self::Midnight,
             Self::Modern,
             Self::Soft,
@@ -459,7 +462,6 @@ impl UiTheme {
             Self::Catppuccin,
             Self::SolarizedDark,
             Self::SolarizedLight,
-            Self::TokyoNight,
             Self::Forest,
             Self::RosePine,
             Self::Ocean,
