@@ -77,7 +77,7 @@
             "ember",
             "monokai"
           ],
-          "default": "midnight",
+          "default": "tokyo-night",
           "description": "Color palette only. Prefer this over ui.theme."
         },
         "theme": {
@@ -104,7 +104,7 @@
             "ember",
             "monokai"
           ],
-          "default": "midnight",
+          "default": "tokyo-night",
           "description": "Legacy alias of ui.colors. Still accepted and mirrored when either key is set."
         },
         "workspace_second_line": {

@@ -212,6 +212,13 @@ is excellent and is not trying to solve this. If you want vertical workspaces, a
 socket agents can drive, and status that tells you who needs you, that is what
 this is.
 
+Parts of the agent-status UX — especially screen-aware busy / needs-input /
+done detection and herdr-style agent fidelity — take inspiration from
+**[herdr](https://github.com/ogulcancelik/herdr)** ([herdr.dev](https://herdr.dev)),
+an agent multiplexer by [Oğulcan Çelik](https://github.com/ogulcancelik). Thank
+you for the open-source work and for pushing the “status at a glance” model
+forward.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

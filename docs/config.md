@@ -154,7 +154,7 @@ not just a border toggle.
 
 | Name | Look |
 |------|------|
-| `classic` (default) | Filled active sidebar row, labeled toolbar + session footer, solid tab chips, full box panes |
+| `classic` (default structure) | Filled active sidebar row, labeled toolbar + session footer, solid tab chips, full box panes |
 | `compact` | Dense surface rail with `▎` accent, equal icon toolbar, chip tabs, full boxes |
 | `minimal` | Ghost text sidebar, bare muted icons, underlined tabs, frame **only** the focused pane |
 | `flat` | Soft surface rail + `●` pill selection, spaced pill buttons, underline tabs, left-edge active accent |
@@ -173,7 +173,8 @@ familiar editor palettes. Changing colors never changes borders or bar height.
 
 | Name | Feel |
 |------|------|
-| `midnight` (alias `classic`) | Default dark + cyan |
+| `tokyo-night` (default) | Cool blue night editor palette |
+| `midnight` (alias `classic`) | Classic dark + cyan |
 | `modern` | Flat slate / indigo |
 | `soft` | Warm low-contrast stone |
 | `neon` | Deep black + electric pink / cyan |
@@ -181,8 +182,11 @@ familiar editor palettes. Changing colors never changes borders or bar height.
 | `minimal` | Near-monochrome zinc |
 
 Also: `daylight`, `contrast`, `nord`, `dracula`, `gruvbox`, `catppuccin`,
-`solarized-dark`, `solarized-light`, `tokyo-night`, `forest`, `rose-pine`,
-`ocean`, `ember`, `monokai`.
+`solarized-dark`, `solarized-light`, `forest`, `rose-pine`, `ocean`,
+`ember`, `monokai`.
+
+Layout structure defaults to **`classic`** (`ui.layout`); palette defaults to
+**`tokyo-night`** (`ui.colors`). They are independent.
 
 ```sh
 vmux config set ui.colors modern

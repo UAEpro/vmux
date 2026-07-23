@@ -9486,12 +9486,16 @@ mod tests {
         assert_eq!(UiTheme::from_name("classic").name(), "midnight");
         assert_eq!(UiTheme::from_name("classic").label(), "Classic");
         assert_eq!(UiTheme::from_name("flat").name(), "modern");
-        // Cycle wraps cleanly through the full set.
-        let mut theme = UiTheme::Midnight;
+        // Default palette for unknown / empty config paths.
+        assert_eq!(UiTheme::from_name("").name(), "tokyo-night");
+        assert_eq!(UiTheme::from_name("not-a-palette").name(), "tokyo-night");
+        // Cycle wraps cleanly through the full set (default first in catalog).
+        assert_eq!(themes[0], UiTheme::TokyoNight);
+        let mut theme = UiTheme::TokyoNight;
         for _ in 0..themes.len() {
             theme = theme.relative(1);
         }
-        assert_eq!(theme, UiTheme::Midnight);
+        assert_eq!(theme, UiTheme::TokyoNight);
     }
 
     #[test]
