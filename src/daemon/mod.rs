@@ -255,6 +255,18 @@ const DECAY_TICK_SECS: u64 = 4;
 /// parks one connection thread, so cap how long that can be.
 const SNAPSHOT_WAIT_CAP_MS: u64 = 30_000;
 
+/// Pause between pasting text and pressing Enter in `deliver_text_submit`,
+/// so the target app's event loop ingests the paste before the submit. Runs
+/// on the requesting connection's own thread — nothing else waits on it.
+const SUBMIT_SETTLE_MS: u64 = 75;
+
+/// `AgentChat` with no cursor on a huge transcript reads only this much of
+/// the file's tail (then trims to the item limit).
+const CHAT_INITIAL_READ_MAX: u64 = 4 * 1024 * 1024;
+
+/// Default item cap for an initial (`since: None`) `AgentChat` fetch.
+const CHAT_INITIAL_ITEM_LIMIT: usize = 200;
+
 /// 8-bit color components.
 type Rgb8 = (u8, u8, u8);
 /// Outer-terminal default (fg, bg) as reported by an attach client.
@@ -1482,8 +1494,12 @@ impl Server {
                 self.resize_active(direction, amount)?;
                 Ok(Response::empty())
             }
-            Request::Input { pane, data } => {
-                self.write_input(pane, data)?;
+            Request::Input { pane, data, submit } => {
+                if submit {
+                    self.deliver_text_submit(pane, data)?;
+                } else {
+                    self.write_input(pane, data)?;
+                }
                 Ok(Response::empty())
             }
             Request::SendKey { pane, keys } => {
@@ -1504,12 +1520,16 @@ impl Server {
                 message,
                 title,
                 agent_session,
+                agent_transcript,
             } => {
                 let note = self.notify(pane, workspace, status, color, clear, message, title)?;
                 // The note carries the resolved pane id, so hook payloads that
                 // omit --pane still attach the session id to the right pane.
                 if let Some(agent_session) = agent_session {
                     self.record_agent_session(note.pane.as_deref(), &agent_session);
+                }
+                if let Some(agent_transcript) = agent_transcript {
+                    self.record_agent_transcript(note.pane.as_deref(), &agent_transcript);
                 }
                 Ok(Response::ok(note))
             }
@@ -1549,6 +1569,10 @@ impl Server {
                 history_lines,
             } => {
                 let data = self.read_screen(pane, scrollback, limit_bytes, ansi, history_lines)?;
+                Ok(Response::ok(data))
+            }
+            Request::AgentChat { pane, since, limit } => {
+                let data = self.agent_chat(pane, since, limit)?;
                 Ok(Response::ok(data))
             }
             Request::Search { pane, query } => {
@@ -2692,6 +2716,39 @@ impl Server {
         Ok(())
     }
 
+    /// Deliver text as a paste, then press Enter (`Request::Input`'s
+    /// `submit`). Appending `\r` to the text does NOT work against agent
+    /// composers: text and CR arriving in a single PTY read trip their paste
+    /// heuristics and the CR becomes a newline in the composer instead of a
+    /// submit (observed live against Claude Code). So: wrap in bracketed
+    /// paste when the pane's app enabled it (also keeps multi-line text one
+    /// message), give the app's event loop a moment to ingest, then send
+    /// Enter as its own write.
+    fn deliver_text_submit(&self, pane: Option<String>, text: String) -> Result<()> {
+        let pane_id = self.resolve_pane(pane)?;
+        let runtime_key = self.active_runtime_key(&pane_id)?;
+        let bracketed = {
+            let panes = self.panes.lock_or_recover();
+            let key = if panes.contains_key(&runtime_key) {
+                runtime_key
+            } else {
+                legacy_runtime_key(&pane_id)
+            };
+            panes
+                .get(&key)
+                .map(|runtime| runtime.parser.screen().bracketed_paste())
+                .unwrap_or(false)
+        };
+        let data = if bracketed {
+            format!("\x1b[200~{text}\x1b[201~")
+        } else {
+            text
+        };
+        self.write_input(Some(pane_id.clone()), data)?;
+        thread::sleep(Duration::from_millis(SUBMIT_SETTLE_MS));
+        self.write_input(Some(pane_id), "\r".to_string())
+    }
+
     fn mark_coding_agent_busy(&self, pane_id: &str, runtime_key: &str) {
         // Screen-manifest agents (Claude/Codex/…) get status from the live UI,
         // not from "user typed something". A prompt keystroke would otherwise
@@ -3521,6 +3578,36 @@ impl Server {
         }
     }
 
+    /// Remember the agent CLI's transcript path for a pane (Claude Code
+    /// `transcript_path` from hook JSON via `Request::Notify`). Same shape as
+    /// [`Self::record_agent_session`]: saves only on change, and never holds
+    /// the `session` and `panes` locks at once.
+    fn record_agent_transcript(&self, pane_id: Option<&str>, agent_transcript: &str) {
+        let Some(pane_id) = pane_id else {
+            return;
+        };
+        let changed = {
+            let mut session = self.session.lock_or_recover();
+            match session.panes.get_mut(pane_id) {
+                Some(pane) if pane.agent_transcript.as_deref() != Some(agent_transcript) => {
+                    pane.agent_transcript = Some(agent_transcript.to_string());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            let mut panes = self.panes.lock_or_recover();
+            for runtime in panes.values_mut() {
+                if runtime.pane.id == pane_id {
+                    runtime.pane.agent_transcript = Some(agent_transcript.to_string());
+                }
+            }
+            drop(panes);
+            self.save().ok();
+        }
+    }
+
     fn clear_notifications(&self) -> Result<serde_json::Value> {
         let cleared = {
             let mut session = self.session.lock_or_recover();
@@ -3808,6 +3895,103 @@ impl Server {
             value["scrollback"] = serde_json::json!(trim_output(output, limit));
         }
         Ok(value)
+    }
+
+    /// Serve a pane's conversation as structured chat, parsed from its
+    /// transcript file (`Request::AgentChat`). Per-request file IO on the
+    /// caller's own connection thread — this is deliberately NOT the snapshot
+    /// hot path, and no lock is held across the read.
+    fn agent_chat(
+        &self,
+        pane: Option<String>,
+        since: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<protocol::AgentChatData> {
+        use std::io::{Read as _, Seek, SeekFrom};
+
+        let pane_id = self.resolve_pane(pane)?;
+        let (transcript, agent_status, agent_session, attention) = {
+            let session = self.session.lock_or_recover();
+            let pane = session
+                .panes
+                .get(&pane_id)
+                .ok_or_else(|| anyhow!("unknown pane {pane_id}"))?;
+            (
+                pane.agent_transcript.clone(),
+                pane.agent_status.clone(),
+                pane.agent_session.clone(),
+                pane.notification_message.clone().filter(|m| !m.is_empty()),
+            )
+        };
+        let unavailable = |cursor| protocol::AgentChatData {
+            pane: pane_id.clone(),
+            items: Vec::new(),
+            cursor,
+            reset: false,
+            agent_status: agent_status.clone(),
+            agent_session: agent_session.clone(),
+            available: false,
+            attention: attention.clone(),
+        };
+        let Some(transcript) = transcript else {
+            return Ok(unavailable(0));
+        };
+        // Missing/rotated file is a soft state (agent restarted, cleanup),
+        // not an error: report unavailable but keep the caller's cursor.
+        let Ok(file_len) = std::fs::metadata(&transcript).map(|meta| meta.len()) else {
+            return Ok(unavailable(since.unwrap_or(0)));
+        };
+        // A cursor past EOF means the file was replaced or truncated (e.g.
+        // `--resume` wrote a shorter file at the same path): restart from 0
+        // and tell the client to drop what it has.
+        let stale_cursor = since.is_some_and(|offset| offset > file_len);
+        let initial = since.is_none() || stale_cursor;
+        let mut offset = if initial { 0 } else { since.unwrap_or(0) };
+        let mut reset = stale_cursor;
+        if initial && file_len > CHAT_INITIAL_READ_MAX {
+            offset = file_len - CHAT_INITIAL_READ_MAX;
+            reset = true;
+        }
+        let mut file = std::fs::File::open(&transcript)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        // A mid-file start lands mid-line: skip to the first newline so the
+        // parser only ever sees whole lines.
+        let skipped = if offset > 0 && initial {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(newline) => {
+                    bytes.drain(..=newline);
+                    newline as u64 + 1
+                }
+                None => {
+                    let len = bytes.len() as u64;
+                    bytes.clear();
+                    len
+                }
+            }
+        } else {
+            0
+        };
+        let outcome = crate::agent_chat::parse_transcript_chunk(&bytes, offset + skipped);
+        let mut items = outcome.items;
+        if initial {
+            let cap = limit.unwrap_or(CHAT_INITIAL_ITEM_LIMIT);
+            if items.len() > cap {
+                items.drain(..items.len() - cap);
+                reset = true;
+            }
+        }
+        Ok(protocol::AgentChatData {
+            pane: pane_id,
+            items,
+            cursor: offset + skipped + outcome.consumed,
+            reset,
+            agent_status,
+            agent_session,
+            available: true,
+            attention,
+        })
     }
 
     fn search_pane(&self, pane: Option<String>, query: String) -> Result<serde_json::Value> {
@@ -7442,6 +7626,143 @@ mod tests {
         // Unknown panes and missing ids are ignored, not errors.
         server.record_agent_session(Some("pane-404"), "sess-x");
         server.record_agent_session(None, "sess-x");
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn record_agent_transcript_persists_across_reload() {
+        // Gate check for agent chat: the transcript path a hook reports must
+        // land in the session JSON and survive save → drop → reload, or the
+        // phone app's chat has nothing to read after a daemon restart.
+        let session = TestSession::new("agent-transcript");
+        {
+            let server = Arc::new(Server::load(session.as_str()).unwrap());
+            {
+                let mut state = server.session.lock_or_recover();
+                let pane = Pane::new(
+                    "pane-1".to_string(),
+                    "claude".to_string(),
+                    SplitDirection::Right,
+                );
+                state.panes.insert("pane-1".to_string(), pane);
+            }
+            server.record_agent_transcript(Some("pane-1"), "/tmp/transcript.jsonl");
+            // Repeats (hooks resend on every event) must be no-ops.
+            server.record_agent_transcript(Some("pane-1"), "/tmp/transcript.jsonl");
+            server.record_agent_transcript(Some("pane-404"), "/nope");
+            server.record_agent_transcript(None, "/nope");
+            server.save().unwrap();
+        }
+        let reloaded = Server::load(session.as_str()).unwrap();
+        {
+            let state = reloaded.session.lock_or_recover();
+            assert_eq!(
+                state.panes["pane-1"].agent_transcript.as_deref(),
+                Some("/tmp/transcript.jsonl")
+            );
+        }
+        fs::remove_file(reloaded.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn agent_chat_serves_items_and_tails_incrementally() {
+        let session = TestSession::new("agent-chat");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let transcript =
+            std::env::temp_dir().join(format!("{}-transcript.jsonl", session.as_str()));
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"hello"}}"#,
+                "\n",
+                r#"{"type":"file-history-snapshot"}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"hi!"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        {
+            let mut state = server.session.lock_or_recover();
+            let mut pane = Pane::new(
+                "pane-1".to_string(),
+                "claude".to_string(),
+                SplitDirection::Right,
+            );
+            pane.notification_message = Some("Do you want to proceed?".to_string());
+            state.panes.insert("pane-1".to_string(), pane);
+            state.active_workspace_mut().active_pane = Some("pane-1".to_string());
+        }
+
+        // Pane without a recorded transcript → soft unavailable, not an error.
+        let before = server
+            .agent_chat(Some("pane-1".to_string()), None, None)
+            .unwrap();
+        assert!(!before.available);
+        assert!(before.items.is_empty());
+
+        server.record_agent_transcript(Some("pane-1"), &transcript.display().to_string());
+        let first = server
+            .agent_chat(Some("pane-1".to_string()), None, None)
+            .unwrap();
+        assert!(first.available);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+        assert_eq!(first.attention.as_deref(), Some("Do you want to proceed?"));
+        assert!(first.cursor > 0);
+        assert!(!first.reset);
+
+        // Nothing new → empty incremental fetch, same cursor.
+        let idle = server
+            .agent_chat(Some("pane-1".to_string()), Some(first.cursor), None)
+            .unwrap();
+        assert!(idle.items.is_empty());
+        assert_eq!(idle.cursor, first.cursor);
+
+        // Append one turn → only the new item comes back.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","uuid":"a2","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"cargo test"}}}}]}}}}"#
+        )
+        .unwrap();
+        let second = server
+            .agent_chat(Some("pane-1".to_string()), Some(first.cursor), None)
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].kind, "activity");
+        assert_eq!(second.items[0].tool.as_deref(), Some("Bash"));
+        assert!(second.cursor > first.cursor);
+        assert!(!second.reset);
+
+        // Cursor past EOF (file replaced/truncated) → full restart + reset.
+        let stale = server
+            .agent_chat(
+                Some("pane-1".to_string()),
+                Some(second.cursor + 10_000),
+                None,
+            )
+            .unwrap();
+        assert!(stale.reset);
+        assert_eq!(stale.items.len(), 3);
+
+        // Missing file after recording → soft unavailable, cursor preserved.
+        fs::remove_file(&transcript).unwrap();
+        let gone = server
+            .agent_chat(Some("pane-1".to_string()), Some(second.cursor), None)
+            .unwrap();
+        assert!(!gone.available);
+        assert_eq!(gone.cursor, second.cursor);
 
         fs::remove_file(server.state_path.clone()).ok();
     }

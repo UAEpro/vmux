@@ -175,6 +175,20 @@ pub enum Command {
         #[arg(long, default_value_t = 16_000)]
         limit_bytes: usize,
     },
+    /// Structured agent conversation for a pane (user/assistant bubbles +
+    /// tool activity), parsed from the transcript its hooks reported.
+    Chat {
+        #[arg(long)]
+        pane: Option<String>,
+
+        /// Byte-offset cursor from a previous call (incremental tail).
+        #[arg(long)]
+        since: Option<u64>,
+
+        /// Max items on the initial fetch.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     Search {
         #[arg(long)]
         pane: Option<String>,

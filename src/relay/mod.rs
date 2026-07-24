@@ -2244,6 +2244,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                 &Request::Input {
                     pane: Some(surface),
                     data: text,
+                    submit: false,
                 },
             )?;
             Ok(json!({}))
@@ -2415,6 +2416,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                     message,
                     title: None,
                     agent_session: None,
+                    agent_transcript: None,
                 },
             )?;
             Ok(json!({}))
@@ -2804,7 +2806,14 @@ fn paste_upload(state: &RelayState, target: &str, body: &[u8]) -> Result<Value> 
     if enter {
         data.push('\r');
     }
-    call(&state.socket, &Request::Input { pane, data })?;
+    call(
+        &state.socket,
+        &Request::Input {
+            pane,
+            data,
+            submit: false,
+        },
+    )?;
     Ok(json!({
         "path": path.display().to_string(),
         "bytes": body.len(),
