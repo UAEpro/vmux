@@ -38,6 +38,11 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:4399";
 const DEFAULT_FPS: u32 = 15;
 const DEFAULT_IDLE_FPS: u32 = 5;
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+/// Cap on a `chat.send` message (paste-bomb guard).
+const CHAT_SEND_MAX_BYTES: usize = 16 * 1024;
+/// Per-connection floor between `chat.fetch` calls: each one is a daemon
+/// round-trip plus transcript file IO, so a buggy poller must not spin.
+const CHAT_FETCH_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PUSH_GATEWAY: &str = "https://push.vmux.sh";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -1156,6 +1161,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
                 "session": state.config.session,
                 "boot_id": state.boot_id,
                 "push_notifications": true,
+                // Capability flag: phones only show the chat UI when the
+                // relay actually speaks chat.fetch/chat.send, so an older
+                // relay never renders a dead chat icon.
+                "chat": true,
             });
             write_http(
                 &mut stream,
@@ -1434,6 +1443,9 @@ fn handle_ws_upgrade(
     let hello_deadline = Instant::now() + HELLO_TIMEOUT;
     let mut helloed = false;
     let mut active_subs: HashMap<String, thread::JoinHandle<()>> = HashMap::new();
+    // Per-connection floor between chat.fetch calls (daemon round-trip +
+    // transcript IO each) — a buggy phone poller must not spin the daemon.
+    let mut last_chat_fetch: Option<Instant> = None;
     let stop_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let push_tx = Arc::new(Mutex::new(None::<std::sync::mpsc::SyncSender<String>>));
@@ -1622,6 +1634,17 @@ fn handle_ws_upgrade(
                     }
                     let _ = ws.send(Message::Text(rpc_ok(&id, json!({})).to_string()));
                     continue;
+                }
+
+                if method == "chat.fetch" {
+                    if last_chat_fetch.is_some_and(|prev| prev.elapsed() < CHAT_FETCH_MIN_INTERVAL)
+                    {
+                        let _ = ws.send(Message::Text(
+                            rpc_err(&id, "rate_limited", "chat.fetch too frequent").to_string(),
+                        ));
+                        continue;
+                    }
+                    last_chat_fetch = Some(Instant::now());
                 }
 
                 match dispatch_rpc(&state, &method, &params) {
@@ -2421,6 +2444,63 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
             )?;
             Ok(json!({}))
         }
+        "chat.fetch" => {
+            let surface = req_str(params, "surface_id")?;
+            let since = params.get("cursor").and_then(|v| v.as_u64());
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let resp = call(
+                socket,
+                &Request::AgentChat {
+                    pane: Some(surface),
+                    since,
+                    limit,
+                },
+            )?;
+            Ok(resp.data.unwrap_or(json!({})))
+        }
+        "chat.send" => {
+            let surface = req_str(params, "surface_id")?;
+            let text = params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if text.trim().is_empty() {
+                bail!("text required");
+            }
+            if text.len() > CHAT_SEND_MAX_BYTES {
+                bail!("text too large (max {CHAT_SEND_MAX_BYTES} bytes)");
+            }
+            // Only chat-capable panes accept chat sends — the phone hides the
+            // composer without `has_chat`, this guards direct RPC misuse.
+            let resp = call(socket, &Request::List)?;
+            let data = resp.data.unwrap_or(Value::Null);
+            let pane = data.get("panes").and_then(|p| p.get(&surface));
+            let has_chat = pane
+                .and_then(|p| p.get("agent_transcript"))
+                .is_some_and(|t| t.is_string());
+            if !has_chat {
+                bail!("surface has no agent chat");
+            }
+            if pane.and_then(|p| p.get("status")).and_then(|s| s.as_str()) == Some("exited") {
+                bail!("surface has exited");
+            }
+            // Deliver through the daemon's submit path (paste, settle, then
+            // Enter). Deliberately NO FocusPane, unlike surface.send_text:
+            // chatting from the phone must not yank the desktop UI around.
+            call(
+                socket,
+                &Request::Input {
+                    pane: Some(surface),
+                    data: text,
+                    submit: true,
+                },
+            )?;
+            Ok(json!({}))
+        }
         other => bail!("unsupported method {other}"),
     }
 }
@@ -2626,6 +2706,18 @@ fn surface_list(socket: &Path, workspace_id: &str) -> Result<Value> {
         if let (Some((tab_id, tab_title)), Some(map)) = (tab_meta, surface.as_object_mut()) {
             map.insert("tab_id".into(), json!(tab_id));
             map.insert("tab".into(), json!(tab_title));
+        }
+        // Chat affordance: only a recorded transcript counts (agent hooks
+        // fired at least once). Pane command is useless here — agents run as
+        // children of the pane shell, so `command` is just "/bin/bash".
+        if let (Some(pane), Some(map)) = (panes_map.get(pid), surface.as_object_mut()) {
+            if let Some(status) = pane.get("agent_status") {
+                map.insert("agent_status".into(), status.clone());
+            }
+            let has_chat = pane
+                .get("agent_transcript")
+                .is_some_and(|transcript| transcript.is_string());
+            map.insert("has_chat".into(), json!(has_chat));
         }
         surfaces.push(surface);
     }
