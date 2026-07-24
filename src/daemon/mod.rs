@@ -2696,8 +2696,12 @@ impl Server {
         // Screen-manifest agents (Claude/Codex/…) get status from the live UI,
         // not from "user typed something". A prompt keystroke would otherwise
         // stick 🔄 until Stop even when the screen already shows idle.
+        // Also skip when the agent is a child of a shell pane (command=bash).
         if let Some(session_pane) = self.session.lock_or_recover().panes.get(pane_id) {
-            if crate::detect::screen_is_status_authority(&session_pane.command) {
+            if crate::detect::screen_is_status_authority_for_pane(
+                &session_pane.command,
+                session_pane.pid,
+            ) {
                 return;
             }
         }
@@ -3381,7 +3385,10 @@ impl Server {
                     }
                 } else if !message.is_empty() {
                     // Bare notify without status = needs attention (hooks path).
-                    if !crate::detect::screen_is_status_authority(&target.command) {
+                    if !crate::detect::screen_is_status_authority_for_pane(
+                        &target.command,
+                        target.pid,
+                    ) {
                         touch_agent_status(target, AgentStatus::Attention, true);
                         target.notification_color =
                             color.clone().or_else(|| Some("blue".to_string()));
@@ -3456,7 +3463,10 @@ impl Server {
                         );
                     }
                 } else if !message.is_empty()
-                    && !crate::detect::screen_is_status_authority(&runtime.pane.command)
+                    && !crate::detect::screen_is_status_authority_for_pane(
+                        &runtime.pane.command,
+                        runtime.pane.pid,
+                    )
                 {
                     touch_agent_status(&mut runtime.pane, AgentStatus::Attention, true);
                     runtime.pane.notification_color =
@@ -4160,15 +4170,18 @@ impl Server {
                 // Herdr-style authority: screen manifests win for known
                 // agents (Claude/Codex/…). Hooks + PTY keywords only when
                 // no manifest agent is running in this pane.
-                let screen_authority =
-                    crate::detect::screen_is_status_authority(&runtime.pane.command);
+                let screen_authority = crate::detect::screen_is_status_authority_for_pane(
+                    &runtime.pane.command,
+                    runtime.pane.pid,
+                );
                 // When screen status enters Attention, the session loop
                 // appends a feed card (and event for phone push).
                 let mut screen_attention_feed: Option<String> = None;
                 if screen_authority {
                     let screen = runtime.parser.screen().contents();
-                    if let Some(detection) = crate::detect::detect_for_command(
+                    if let Some(detection) = crate::detect::detect_for_command_or_pid(
                         &runtime.pane.command,
+                        runtime.pane.pid,
                         &screen,
                         &runtime.osc_title_raw,
                         &runtime.osc_progress_raw,
@@ -4322,7 +4335,7 @@ impl Server {
             }
             // OSC 9 desktop notifications → feed only for non-screen agents
             // (Claude/Codex already get Attention from the screen path above).
-            if !crate::detect::screen_is_status_authority(&light.command) {
+            if !crate::detect::screen_is_status_authority_for_pane(&light.command, light.pid) {
                 for message in notifications {
                     if is_non_actionable_attention(&message) {
                         continue;
@@ -4957,34 +4970,66 @@ impl Server {
         }
     }
 
-    /// Background thread: self-heal stale 🔄. Demotes any *unpinned* (heuristic)
-    /// Busy pane that has produced no output for `BUSY_IDLE_DECAY_SECS` back to
-    /// Idle. Pinned Busy (a real hook/CLI signal) is left alone, so a silently
-    /// thinking agent keeps its spinner. Sweeps both the runtime panes (so the
-    /// next output frame merges from Idle, not sticky Busy) and the session copy
-    /// (what the UI shows) — each judged by its own last-output time.
+    /// Background thread: self-heal stale 🔄 and re-apply screen detection for
+    /// agent-in-shell panes (they often stop emitting PTY bytes at the idle
+    /// prompt, so the reader path alone cannot clear a hook-pinned Busy).
     fn agent_status_decay_loop(self: Arc<Self>) {
         loop {
             thread::sleep(Duration::from_secs(DECAY_TICK_SECS));
             let now = unix_time();
+            // Refresh agent-inside flags first so this tick's authority check
+            // sees current children.
+            self.refresh_agent_inside_flags();
             let mut changed = false;
             {
                 let mut panes = self.panes.lock_or_recover();
                 for runtime in panes.values_mut() {
+                    if apply_screen_status_to_runtime(runtime) {
+                        changed = true;
+                    }
                     changed |= decay_stale_busy(&mut runtime.pane, now, BUSY_IDLE_DECAY_SECS);
+                    changed |= decay_pinned_busy_without_agent(
+                        &mut runtime.pane,
+                        now,
+                        BUSY_IDLE_DECAY_SECS,
+                    );
                 }
             }
             {
                 let mut session = self.session.lock_or_recover();
                 for pane in session.panes.values_mut() {
                     changed |= decay_stale_busy(pane, now, BUSY_IDLE_DECAY_SECS);
+                    changed |= decay_pinned_busy_without_agent(pane, now, BUSY_IDLE_DECAY_SECS);
+                }
+            }
+            // Mirror runtime screen-detection results into the session copy
+            // (what the attach UI reads).
+            {
+                let panes = self.panes.lock_or_recover();
+                let mut session = self.session.lock_or_recover();
+                for runtime in panes.values() {
+                    let key = runtime.pane.id.as_str();
+                    if let Some(session_pane) = session.panes.get_mut(key) {
+                        if session_pane.agent_status != runtime.pane.agent_status
+                            || session_pane.agent_status_pinned != runtime.pane.agent_status_pinned
+                            || session_pane.notification_message
+                                != runtime.pane.notification_message
+                        {
+                            session_pane.agent_status = runtime.pane.agent_status.clone();
+                            session_pane.agent_status_pinned = runtime.pane.agent_status_pinned;
+                            session_pane.agent_status_at = runtime.pane.agent_status_at;
+                            session_pane.notification_message =
+                                runtime.pane.notification_message.clone();
+                            session_pane.notification_color =
+                                runtime.pane.notification_color.clone();
+                            changed = true;
+                        }
+                    }
                 }
             }
             // Same tick also reaps expired phone-fit view leases, so a viewer
             // that vanished restores the pane within DECAY_TICK_SECS + lease.
             changed |= self.expire_view_overrides(Instant::now());
-            // Refresh agent-inside flags off the PTY hot path (/proc walk).
-            self.refresh_agent_inside_flags();
             if changed {
                 self.touch();
                 self.save().ok();
@@ -5610,14 +5655,86 @@ fn should_skip_busy_after_settled(
 /// **not** the status authority — screen rules are. Still allow Stop→Done and
 /// Error so ✅/❌ work; ignore busy/attention/idle from hooks so they cannot
 /// fight the live UI (permission dialogs, spinners, prompt box).
+///
+/// Also applies when the agent was launched *inside* a shell pane (command is
+/// still `bash`/`zsh` but a claude/codex child is running) — otherwise hooks
+/// pin 🔄 forever while screen detection never runs.
 fn should_skip_hook_status_for_screen_authority(pane: &Pane, status: &str) -> bool {
-    if !crate::detect::screen_is_status_authority(&pane.command) {
+    if !crate::detect::screen_is_status_authority_for_pane(&pane.command, pane.pid) {
         return false;
     }
     matches!(
         parse_agent_status(status),
         AgentStatus::Busy | AgentStatus::Attention | AgentStatus::Idle | AgentStatus::Unknown
     )
+}
+
+/// Re-run screen-manifest detection on a runtime pane. Idle agents often emit
+/// no PTY bytes while sitting at the prompt, so the reader path alone cannot
+/// clear a hook-pinned Busy when Claude was started from bash.
+fn apply_screen_status_to_runtime(runtime: &mut PaneRuntime) -> bool {
+    if !crate::detect::screen_is_status_authority_for_pane(&runtime.pane.command, runtime.pane.pid)
+    {
+        return false;
+    }
+    let screen = runtime.parser.screen().contents();
+    let Some(detection) = crate::detect::detect_for_command_or_pid(
+        &runtime.pane.command,
+        runtime.pane.pid,
+        &screen,
+        &runtime.osc_title_raw,
+        &runtime.osc_progress_raw,
+    ) else {
+        return false;
+    };
+    let previous = runtime.pane.agent_status.clone();
+    let Some((next, pinned)) = crate::detect::merge_screen_status(previous.clone(), &detection)
+    else {
+        if !matches!(runtime.pane.agent_status, AgentStatus::Attention)
+            && runtime.pane.notification_message.is_some()
+            && matches!(
+                detection.state,
+                crate::detect::DetectedState::Idle | crate::detect::DetectedState::Unknown
+            )
+        {
+            runtime.pane.notification_message = None;
+            runtime.pane.notification_color = None;
+            return true;
+        }
+        return false;
+    };
+    crate::detect::apply_screen_notification_banner(
+        &mut runtime.pane,
+        &previous,
+        &next,
+        &detection,
+    );
+    touch_agent_status(&mut runtime.pane, next, pinned);
+    true
+}
+
+/// Demote a *pinned* Busy on a pane that is not (and does not host) a coding
+/// agent. Hooks can pin 🔄 on a plain shell; without an agent child that pin
+/// would never clear (screen detection does not run, and normal decay skips
+/// pinned Busy).
+fn decay_pinned_busy_without_agent(pane: &mut Pane, now: u64, timeout_secs: u64) -> bool {
+    if !matches!(pane.agent_status, AgentStatus::Busy) || !pane.agent_status_pinned {
+        return false;
+    }
+    if crate::detect::screen_is_status_authority_for_pane(&pane.command, pane.pid) {
+        return false;
+    }
+    if is_coding_agent_command(&pane.command) {
+        return false;
+    }
+    // Age from status change so a one-shot set-status busy clears even if the
+    // shell keeps printing (which would refresh `updated_at`).
+    let since = now.saturating_sub(pane.agent_status_at.max(1));
+    if since < timeout_secs {
+        return false;
+    }
+    touch_agent_status(pane, AgentStatus::Unknown, false);
+    true
 }
 
 /// Apply a hook/CLI status so it sticks in the sidebar (pinned).
@@ -8600,6 +8717,32 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
             );
         }
         fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn decay_pinned_busy_clears_shell_without_agent() {
+        let mut shell = Pane::new(
+            "p".to_string(),
+            "/bin/bash".to_string(),
+            SplitDirection::Right,
+        );
+        shell.pid = Some(u32::MAX - 9); // nonexistent — no agent tree
+        touch_agent_status(&mut shell, AgentStatus::Busy, true);
+        shell.agent_status_at = 100;
+        // Too soon.
+        assert!(!decay_pinned_busy_without_agent(&mut shell, 110, 20));
+        assert_eq!(shell.agent_status, AgentStatus::Busy);
+        // Past timeout, no agent child → demote.
+        assert!(decay_pinned_busy_without_agent(&mut shell, 130, 20));
+        assert_eq!(shell.agent_status, AgentStatus::Unknown);
+        assert!(!shell.agent_status_pinned);
+
+        // Coding-agent command: leave pinned busy alone (hooks / screen own it).
+        let mut agent = Pane::new("a".to_string(), "claude".to_string(), SplitDirection::Right);
+        touch_agent_status(&mut agent, AgentStatus::Busy, true);
+        agent.agent_status_at = 100;
+        assert!(!decay_pinned_busy_without_agent(&mut agent, 9999, 20));
+        assert_eq!(agent.agent_status, AgentStatus::Busy);
     }
 
     #[test]

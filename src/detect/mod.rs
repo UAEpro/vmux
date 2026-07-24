@@ -145,6 +145,87 @@ pub fn screen_is_status_authority(command: &str) -> bool {
     agent_from_command(command).is_some()
 }
 
+/// True when screen manifests should own status for this pane — either the
+/// pane command *is* the agent (`vmux new --command claude`) or an agent is
+/// running *inside* the shell (the common case: open pane, type `claude`).
+pub fn screen_is_status_authority_for_pane(command: &str, pane_pid: Option<u32>) -> bool {
+    if screen_is_status_authority(command) {
+        return true;
+    }
+    pane_pid.and_then(agent_from_process_tree).is_some()
+}
+
+/// Resolve which screen-manifest agent is running under a pane root PID.
+///
+/// Users almost always start a shell first, then launch `claude`/`codex` as a
+/// child. Walk the process tree and match agent binaries / interpreter scripts.
+#[cfg(target_os = "linux")]
+pub fn agent_from_process_tree(root_pid: u32) -> Option<ManifestAgent> {
+    for child in descendant_pids_linux(root_pid) {
+        if child == root_pid {
+            continue;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{child}/comm")).unwrap_or_default();
+        if let Some(agent) = ManifestAgent::parse(comm.trim()) {
+            return Some(agent);
+        }
+        let cmdline = std::fs::read(format!("/proc/{child}/cmdline")).unwrap_or_default();
+        let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+        if let Some(agent) = agent_from_command(cmdline.trim()) {
+            return Some(agent);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn agent_from_process_tree(_root_pid: u32) -> Option<ManifestAgent> {
+    None
+}
+
+/// Linux process-tree walk (root + descendants via `/proc/*/stat` ppid).
+#[cfg(target_os = "linux")]
+fn descendant_pids_linux(root: u32) -> Vec<u32> {
+    use std::collections::BTreeSet;
+    use std::fs;
+    let mut owned = BTreeSet::from([root]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let Ok(entries) = fs::read_dir("/proc") else {
+            break;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if owned.contains(&pid) {
+                continue;
+            }
+            let stat = fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
+            if let Some(ppid) = proc_stat_ppid_linux(&stat) {
+                if owned.contains(&ppid) {
+                    owned.insert(pid);
+                    changed = true;
+                }
+            }
+        }
+    }
+    owned.into_iter().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_ppid_linux(stat: &str) -> Option<u32> {
+    let rest = stat.rsplit_once(") ")?.1;
+    let mut fields = rest.split_whitespace();
+    fields.next()?; // state
+    fields.next()?.parse().ok() // ppid
+}
+
 /// Run detection for a known agent against live screen + OSC strings.
 pub fn detect_agent(
     agent: ManifestAgent,
@@ -172,15 +253,20 @@ pub fn detect_agent(
     }
 }
 
-/// Detect from pane command + screen. Returns `None` when the command is not a
-/// known screen-manifest agent (caller should use hooks/keywords).
-pub fn detect_for_command(
+/// Detect from pane command and/or process tree + screen.
+///
+/// Looks up an agent under `pane_pid` when the pane command is a plain shell
+/// (the common "open pane, type claude" case). Returns `None` when no known
+/// screen-manifest agent is identified (caller should use hooks/keywords).
+pub fn detect_for_command_or_pid(
     command: &str,
+    pane_pid: Option<u32>,
     screen: &str,
     osc_title: &str,
     osc_progress: &str,
 ) -> Option<Detection> {
-    let agent = agent_from_command(command)?;
+    let agent =
+        agent_from_command(command).or_else(|| pane_pid.and_then(agent_from_process_tree))?;
     Some(detect_agent(agent, screen, osc_title, osc_progress))
 }
 
@@ -322,6 +408,38 @@ Do you want to proceed?
         let d = detect_agent(ManifestAgent::Claude, "anything on screen", title, "");
         assert_eq!(d.state, DetectedState::Working, "{d:?}");
         assert!(d.visible_working);
+    }
+
+    #[test]
+    fn screen_authority_requires_agent_command_or_tree() {
+        assert!(screen_is_status_authority("claude"));
+        assert!(!screen_is_status_authority("bash"));
+        assert!(!screen_is_status_authority_for_pane("bash", None));
+        // Nonexistent pid: no process tree → bash is not authority.
+        // (Do not use pid 1 — walking init's descendants is the whole machine.)
+        assert!(!screen_is_status_authority_for_pane(
+            "/bin/bash",
+            Some(u32::MAX - 7)
+        ));
+    }
+
+    #[test]
+    fn detect_for_command_or_pid_falls_back_to_command() {
+        let screen = "\
+─────────────────────
+ ❯  
+─────────────────────
+";
+        let d = detect_for_command_or_pid("claude", None, screen, "✳ claude", "")
+            .expect("claude command");
+        assert_eq!(d.state, DetectedState::Idle, "{d:?}");
+        assert!(detect_for_command_or_pid("bash", None, screen, "", "").is_none());
+        // CLI diagnose path: command-only still works.
+        assert_eq!(
+            detect_for_command_or_pid("codex", None, "• Working (esc to interrupt)", "", "")
+                .map(|d| d.state),
+            Some(DetectedState::Working)
+        );
     }
 
     #[test]
