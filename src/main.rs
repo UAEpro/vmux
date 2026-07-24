@@ -710,6 +710,7 @@ fn relay_command(session: &str, command: RelayCommand) -> Result<()> {
                 allow_localhost,
             )
         }
+        RelayCommand::Stop => relay::stop(session),
         RelayCommand::Status { config } => relay::status(config.map(std::path::PathBuf::from)),
         RelayCommand::Devices { command } => match command {
             RelayDevicesCommand::List => relay::devices_list(),
@@ -1097,13 +1098,18 @@ fn hook_event_defaults(event: &str) -> (&'static str, &'static str, &'static str
         // Needs user (approval / notification)
         "permissionrequest" | "notification" | "elicitation" | "elicitationresult"
         | "permissiondenied" => ("attention", "blue", "agent needs input"),
+        // A session that just launched is waiting for a prompt, not working.
+        // vmux installs this hook to learn the conversation's transcript path
+        // up front (so the chat view has something to show before the first
+        // prompt); painting 🔄 for merely existing would be a lie that sticks,
+        // because hook-set status is pinned.
+        "sessionstart" => ("idle", "gray", "agent session started"),
         // Actively working
         "userpromptsubmit"
         | "userpromptexpansion"
         | "pretooluse"
         | "posttooluse"
         | "posttoolbatch"
-        | "sessionstart"
         | "subagentstart"
         | "subagentstop"
         | "precompact"

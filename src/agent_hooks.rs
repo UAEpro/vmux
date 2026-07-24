@@ -288,9 +288,19 @@ fn claude_status(home: &Path) -> IntegrationStatus {
                 .to_string(),
         )
     } else if has_stop && has_notification && has_prompt {
+        // Status hooks are complete either way; SessionStart is what lets the
+        // chat view know a conversation before its first prompt, so say so
+        // instead of reporting a bare "Installed" that hides the upgrade.
+        let has_session_start = content.contains("\"SessionStart\"");
         (
             InstallState::Installed,
-            "UserPromptSubmit→🔄 Stop→✅ Notification→🙋".to_string(),
+            if has_session_start {
+                "UserPromptSubmit→🔄 Stop→✅ Notification→🙋".to_string()
+            } else {
+                "UserPromptSubmit→🔄 Stop→✅ Notification→🙋 (no SessionStart — \
+                 chat waits for the first prompt; reinstall to add it)"
+                    .to_string()
+            },
         )
     } else if has_marker {
         (
@@ -634,6 +644,11 @@ fn install_claude(home: &Path) -> Result<InstallResult> {
         );
     }
     let hooks_obj = hooks.as_object_mut().unwrap();
+    // SessionStart carries `transcript_path` for the conversation that just
+    // began, so `vmux chat` / the phone's chat view have something to show
+    // before the first prompt — and a restarted or `/clear`ed session
+    // re-points the pane instead of serving the previous conversation.
+    ensure_event_hook(hooks_obj, "SessionStart");
     ensure_event_hook(hooks_obj, "Notification");
     ensure_event_hook(hooks_obj, "UserPromptSubmit");
     ensure_event_hook(hooks_obj, "PreToolUse");

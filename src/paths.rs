@@ -111,6 +111,24 @@ pub fn log_path(session: &str) -> Result<PathBuf> {
     Ok(runtime_dir()?.join(format!("{session}.log")))
 }
 
+/// Where `vmux relay serve` records that a relay is wanted for this session
+/// (listen address, config path, pid). The daemon reads it to bring the relay
+/// back after a restart, and stops it on shutdown.
+///
+/// Lives in the runtime dir, not the state dir: it is per-boot, and
+/// `list_sessions` only enumerates `*.json` under the state dir, so this
+/// cannot masquerade as a session.
+pub fn relay_autostart_path(session: &str) -> Result<PathBuf> {
+    validate_session_name(session)?;
+    Ok(runtime_dir()?.join(format!("{session}.relay.json")))
+}
+
+/// The relay's log when the daemon (re)starts it unattended.
+pub fn relay_log_path(session: &str) -> Result<PathBuf> {
+    validate_session_name(session)?;
+    Ok(runtime_dir()?.join(format!("{session}.relay.log")))
+}
+
 pub fn state_dir() -> Result<PathBuf> {
     let dir = dirs::state_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))

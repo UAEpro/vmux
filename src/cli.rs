@@ -910,6 +910,11 @@ pub enum RelayCommand {
         )]
         allow_localhost: bool,
     },
+    /// Stop the relay and stop restarting it with the session.
+    ///
+    /// The daemon restarts the relay whenever the session comes back; this
+    /// withdraws that standing intent as well as killing the process.
+    Stop,
     /// Show relay config, paired devices, and health probe.
     Status {
         #[arg(long)]

@@ -336,6 +336,53 @@ const MAX_RELAY_CONNECTIONS: usize = 64;
 
 // ─── Public CLI entry points ────────────────────────────────────────────────
 
+/// "A relay is wanted for this session, started like *this*."
+///
+/// Written by [`serve`] at startup and read by the daemon, which stops the
+/// relay when the session shuts down and starts it again — from the daemon's
+/// own (current) binary — when the session comes back. Without it a relay
+/// outlives every upgrade and keeps serving whatever it was built from, which
+/// is exactly how a week-old relay ends up hiding features the daemon has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayAutostart {
+    pub listen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_localhost: bool,
+    /// Pid of the relay that wrote this record (0 when unknown).
+    #[serde(default)]
+    pub pid: u32,
+}
+
+impl RelayAutostart {
+    /// Read the record for a session, if a relay ever registered one.
+    pub fn load(session: &str) -> Option<Self> {
+        let path = paths::relay_autostart_path(session).ok()?;
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    pub fn save(&self, session: &str) -> Result<()> {
+        let path = paths::relay_autostart_path(session)?;
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    pub fn forget(session: &str) {
+        if let Ok(path) = paths::relay_autostart_path(session) {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// True when the recorded pid is still a live vmux relay — so callers do
+    /// not start a second one that would fail to bind the port.
+    pub fn is_running(&self) -> bool {
+        self.pid != 0
+            && paths::process_exists(self.pid)
+            && paths::process_cmdline_contains(self.pid, "relay")
+    }
+}
+
 pub fn serve(
     session: &str,
     config_path: Option<PathBuf>,
@@ -381,6 +428,16 @@ pub fn serve(
 
     let listener = TcpListener::bind(&config.listen)
         .with_context(|| format!("bind relay on {}", config.listen))?;
+    // Only register after the bind succeeds: a relay that could not take the
+    // port must not teach the daemon to keep respawning it.
+    RelayAutostart {
+        listen: config.listen.clone(),
+        config: Some(path.display().to_string()),
+        allow_localhost: config.allow_localhost,
+        pid: std::process::id(),
+    }
+    .save(&config.session)
+    .ok();
     eprintln!(
         "vmux relay listening on {} (session={}, socket={})",
         config.listen,
@@ -448,6 +505,30 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Stop the relay for a session and forget its autostart intent, so the
+/// daemon stops bringing it back on restart.
+pub fn stop(session: &str) -> Result<()> {
+    let record = RelayAutostart::load(session);
+    let stopped = match &record {
+        Some(record) if record.is_running() => {
+            unsafe { libc::kill(record.pid as libc::pid_t, libc::SIGTERM) };
+            true
+        }
+        _ => false,
+    };
+    RelayAutostart::forget(session);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&protocol::Response::ok(json!({
+            "session": session,
+            "stopped": stopped,
+            "listen": record.as_ref().map(|r| r.listen.clone()),
+            "autostart": false,
+        })))?
+    );
+    Ok(())
 }
 
 pub fn status(config_path: Option<PathBuf>) -> Result<()> {

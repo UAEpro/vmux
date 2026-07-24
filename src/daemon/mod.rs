@@ -760,6 +760,13 @@ impl Server {
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )
         .ok();
+        {
+            // Bring the phone relay back after a restart — from *this* binary,
+            // so an upgraded daemon is never fronted by a stale relay. Off the
+            // startup path: it waits for the socket to accept connections.
+            let server = Arc::clone(&self);
+            thread::spawn(move || server.restore_relay());
+        }
 
         // Soft cap: extra connections get a JSON error instead of a thread.
         const MAX_DAEMON_CONNECTIONS: usize = 256;
@@ -1522,6 +1529,16 @@ impl Server {
                 agent_session,
                 agent_transcript,
             } => {
+                // A hook that names no pane resolves to the *active* one. That
+                // guess is fine for a status glyph, but binding a conversation
+                // to a guessed pane makes one pane display another agent's
+                // chat — so the transcript is only recorded when the hook
+                // identified its pane itself.
+                let named_pane = pane
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string);
                 let note = self.notify(pane, workspace, status, color, clear, message, title)?;
                 // The note carries the resolved pane id, so hook payloads that
                 // omit --pane still attach the session id to the right pane.
@@ -1529,7 +1546,7 @@ impl Server {
                     self.record_agent_session(note.pane.as_deref(), &agent_session);
                 }
                 if let Some(agent_transcript) = agent_transcript {
-                    self.record_agent_transcript(note.pane.as_deref(), &agent_transcript);
+                    self.record_agent_transcript(named_pane.as_deref(), &agent_transcript);
                 }
                 Ok(Response::ok(note))
             }
@@ -1671,6 +1688,10 @@ impl Server {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.save()?;
                 self.log("daemon shutting down").ok();
+                // The relay serves this daemon; leaving it up means a phone
+                // holding a socket to a corpse. Its autostart record survives,
+                // so the next daemon start brings it back.
+                self.stop_relay();
                 self.cleanup_runtime_files();
                 self.release_session_lock();
                 thread::spawn(|| {
@@ -3552,6 +3573,13 @@ impl Server {
     /// Remember the agent CLI's conversation id for a pane (from hook JSON via
     /// `Request::Notify`). Saves only when the id actually changes — hooks
     /// repeat it on every lifecycle event.
+    ///
+    /// A *changed* id means a different conversation (restart, `/clear`,
+    /// resume), so the recorded transcript is dropped at the same time: the
+    /// path still on the pane belongs to the previous session, and serving it
+    /// would show the wrong chat. The same hook payload carries the new
+    /// `transcript_path`, which [`Self::record_agent_transcript`] stores right
+    /// after this — and if it does not, "no chat yet" beats "someone else's".
     fn record_agent_session(&self, pane_id: Option<&str>, agent_session: &str) {
         let Some(pane_id) = pane_id else {
             return;
@@ -3561,6 +3589,7 @@ impl Server {
             match session.panes.get_mut(pane_id) {
                 Some(pane) if pane.agent_session.as_deref() != Some(agent_session) => {
                     pane.agent_session = Some(agent_session.to_string());
+                    pane.agent_transcript = None;
                     true
                 }
                 _ => false,
@@ -3571,6 +3600,7 @@ impl Server {
             for runtime in panes.values_mut() {
                 if runtime.pane.id == pane_id {
                     runtime.pane.agent_session = Some(agent_session.to_string());
+                    runtime.pane.agent_transcript = None;
                 }
             }
             drop(panes);
@@ -5223,6 +5253,90 @@ impl Server {
 
     fn write_pid_file(&self) -> Result<()> {
         paths::write_pid_record(&self.pid_path, std::process::id())
+    }
+
+    /// Stop the phone relay that fronts this session (shutdown path).
+    ///
+    /// The autostart record is deliberately left behind: it is the standing
+    /// intent "this session has a relay", which [`Self::restore_relay`] acts
+    /// on next start. `vmux relay stop` is the way to withdraw that intent.
+    fn stop_relay(&self) {
+        let Some(record) = crate::relay::RelayAutostart::load(&self.session_name) else {
+            return;
+        };
+        if !record.is_running() {
+            return;
+        }
+        // SIGTERM: the relay has no state to flush, and its listener dies with
+        // it. SIGKILL would be no cleaner and skips any future graceful path.
+        unsafe { libc::kill(record.pid as libc::pid_t, libc::SIGTERM) };
+        self.log(&format!("stopped relay pid {}", record.pid)).ok();
+    }
+
+    /// Start the phone relay again if this session had one before the restart.
+    ///
+    /// Runs on its own thread a moment after the socket is up, because the
+    /// relay's own `ensure_running` would otherwise race this daemon's bind.
+    fn restore_relay(&self) {
+        thread::sleep(Duration::from_millis(300));
+        let Some(record) = crate::relay::RelayAutostart::load(&self.session_name) else {
+            return;
+        };
+        if record.is_running() {
+            return; // a relay survived (or beat us to it) — leave it alone
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut command = Command::new(exe);
+        command
+            .arg("--session")
+            .arg(&self.session_name)
+            .arg("relay")
+            .arg("serve")
+            .arg("--listen")
+            .arg(&record.listen);
+        if let Some(config) = &record.config {
+            command.arg("--config").arg(config);
+        }
+        if record.allow_localhost {
+            command.arg("--allow-localhost");
+        }
+        let log = paths::relay_log_path(&self.session_name)
+            .ok()
+            .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok());
+        match log {
+            Some(file) => {
+                let errors = match file.try_clone() {
+                    Ok(clone) => Stdio::from(clone),
+                    Err(_) => Stdio::null(),
+                };
+                command.stdout(Stdio::from(file)).stderr(errors);
+            }
+            None => {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+        }
+        // VMUX_DAEMONIZE would make the relay's ensure_running daemonize
+        // *itself* instead of starting a daemon (this process is the daemon,
+        // and it carries that variable).
+        match command
+            .stdin(Stdio::null())
+            .env_remove("VMUX_DAEMONIZE")
+            .spawn()
+        {
+            Ok(child) => {
+                self.log(&format!(
+                    "restarted relay on {} (pid {})",
+                    record.listen,
+                    child.id()
+                ))
+                .ok();
+            }
+            Err(err) => {
+                self.log(&format!("relay restart failed: {err}")).ok();
+            }
+        }
     }
 
     fn log(&self, message: &str) -> Result<()> {
@@ -7663,6 +7777,92 @@ mod tests {
             );
         }
         fs::remove_file(reloaded.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn new_agent_session_drops_the_previous_transcript() {
+        // Restart / `/clear` / resume gives the pane a different conversation.
+        // Keeping the old path would show the *previous* chat in the new
+        // session's pane, which is worse than showing nothing.
+        let session = TestSession::new("agent-conv-swap");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut state = server.session.lock_or_recover();
+            state.panes.insert(
+                "pane-1".to_string(),
+                Pane::new(
+                    "pane-1".to_string(),
+                    "claude".to_string(),
+                    SplitDirection::Right,
+                ),
+            );
+        }
+        server.record_agent_session(Some("pane-1"), "sess-1");
+        server.record_agent_transcript(Some("pane-1"), "/tmp/one.jsonl");
+        // Same id repeated (hooks do this constantly) must not drop anything.
+        server.record_agent_session(Some("pane-1"), "sess-1");
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"]
+                .agent_transcript
+                .as_deref(),
+            Some("/tmp/one.jsonl")
+        );
+
+        server.record_agent_session(Some("pane-1"), "sess-2");
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"].agent_transcript,
+            None,
+            "a new conversation must not inherit the old transcript"
+        );
+        server.record_agent_transcript(Some("pane-1"), "/tmp/two.jsonl");
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"]
+                .agent_transcript
+                .as_deref(),
+            Some("/tmp/two.jsonl")
+        );
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn hook_without_a_pane_does_not_bind_a_transcript_to_the_active_pane() {
+        // `Notify` falls back to the active pane when a hook names none — fine
+        // for a status glyph, but it would make one pane serve another agent's
+        // conversation. Guard lives in the Notify dispatch arm.
+        let session = TestSession::new("agent-conv-guess");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut state = server.session.lock_or_recover();
+            state.panes.insert(
+                "pane-1".to_string(),
+                Pane::new(
+                    "pane-1".to_string(),
+                    "claude".to_string(),
+                    SplitDirection::Right,
+                ),
+            );
+            state.active_workspace_mut().active_pane = Some("pane-1".to_string());
+        }
+        let response = server
+            .dispatch(Request::Notify {
+                pane: Some("   ".to_string()), // legacy empty ${VMUX_PANE_ID}
+                workspace: None,
+                status: Some("busy".to_string()),
+                color: None,
+                clear: false,
+                message: "agent working".to_string(),
+                title: None,
+                agent_session: Some("sess-x".to_string()),
+                agent_transcript: Some("/tmp/somebody-elses.jsonl".to_string()),
+            })
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"].agent_transcript,
+            None,
+            "a pane-less hook must not claim the active pane's chat"
+        );
+        fs::remove_file(server.state_path.clone()).ok();
     }
 
     #[test]
