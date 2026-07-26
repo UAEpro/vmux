@@ -986,6 +986,11 @@ pub struct Pane {
     /// `--resume <id>` (`ui.resume_agents`) instead of a fresh conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<String>,
+    /// Absolute path of the agent CLI's transcript file (Claude Code
+    /// `transcript_path` from hook payloads). Lets the daemon serve the pane's
+    /// conversation as structured chat without scraping the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_transcript: Option<String>,
     #[serde(default)]
     pub progress: Option<u8>,
     #[serde(default)]
@@ -1062,6 +1067,7 @@ impl Pane {
             agent_status_pinned: false,
             agent_status_at: now,
             agent_session: None,
+            agent_transcript: None,
             progress: None,
             notification_color: None,
             notification_message: None,

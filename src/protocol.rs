@@ -277,6 +277,14 @@ pub enum Request {
     Input {
         pane: Option<String>,
         data: String,
+        /// Deliver `data` as a paste and then press Enter for the caller.
+        /// Unlike appending `\r` to `data` (which TUIs with paste heuristics
+        /// swallow into the composer — text and CR arrive in one read), the
+        /// daemon wraps the text in bracketed paste when the pane enabled it,
+        /// lets the app ingest it, then sends Enter separately. Additive: old
+        /// clients omit it and keep raw-write semantics.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        submit: bool,
     },
     SendKey {
         pane: Option<String>,
@@ -304,6 +312,11 @@ pub enum Request {
         /// agent with `--resume <id>` instead of a blank conversation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_session: Option<String>,
+        /// Absolute path of the agent CLI's transcript file (Claude Code
+        /// `transcript_path` from hook JSON). Stored on the pane so
+        /// `Request::AgentChat` can serve the conversation as structured chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_transcript: Option<String>,
     },
     /// The attach client's outer-terminal default colors (`#rrggbb`), learned
     /// via OSC 10/11 at startup. The daemon uses them to answer panes'
@@ -349,6 +362,20 @@ pub enum Request {
         /// fragments; the live grid never forgot them.
         #[serde(default, skip_serializing_if = "is_zero_usize")]
         history_lines: usize,
+    },
+    /// Structured agent conversation for a pane, parsed on demand from its
+    /// transcript file (`Pane::agent_transcript`, reported by agent hooks).
+    /// NOT the snapshot hot path: each request reads the file on the caller's
+    /// own connection thread. `since` is the byte-offset `cursor` returned by
+    /// a previous call — pass it back for a cheap incremental tail.
+    AgentChat {
+        pane: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        /// Cap on items returned by the initial (`since: None`) fetch;
+        /// defaults to 200.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
     },
     Search {
         pane: Option<String>,
@@ -439,6 +466,52 @@ fn default_forward_via() -> String {
 pub struct PaneSize {
     pub rows: u16,
     pub cols: u16,
+}
+
+/// One entry in a pane's structured agent conversation (`Request::AgentChat`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatItem {
+    /// "user" | "assistant" | "activity"
+    pub kind: String,
+    pub text: String,
+    /// Stable id from the transcript (message uuid; activity items append the
+    /// content-block index as "<uuid>:<index>"). Clients key/dedupe on this.
+    pub id: String,
+    /// Unix milliseconds parsed from the transcript timestamp; 0 if absent.
+    #[serde(default)]
+    pub ts: u64,
+    /// Tool name for activity items ("Bash", "Edit", …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Activity item represents a failed tool call (surfaced so unexpected
+    /// in-turn errors are visible in chat; successful results are omitted).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub error: bool,
+}
+
+/// Payload of a successful `Request::AgentChat`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChatData {
+    pub pane: String,
+    pub items: Vec<ChatItem>,
+    /// Byte offset to pass back as `since` on the next call.
+    #[serde(default)]
+    pub cursor: u64,
+    /// True when `since` could not be honoured (file replaced/truncated, or
+    /// the initial fetch was capped): the client must replace its list, not
+    /// append.
+    #[serde(default)]
+    pub reset: bool,
+    /// Pane's live agent status ("busy" → show a typing indicator).
+    pub agent_status: crate::model::AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
+    /// False when the pane has no known transcript; clients hide the chat UI.
+    pub available: bool,
+    /// Current notification banner (permission prompts / questions shown by
+    /// the agent TUI which never reach the transcript file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1293,6 +1366,7 @@ mod tests {
             message: "agents running".to_string(),
             title: None,
             agent_session: None,
+            agent_transcript: None,
         })
         .unwrap();
         assert_eq!(
@@ -1309,6 +1383,7 @@ mod tests {
             message: "agent working".to_string(),
             title: Some("fixing parser".to_string()),
             agent_session: None,
+            agent_transcript: None,
         })
         .unwrap();
         assert_eq!(

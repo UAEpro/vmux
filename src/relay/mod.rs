@@ -38,6 +38,11 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:4399";
 const DEFAULT_FPS: u32 = 15;
 const DEFAULT_IDLE_FPS: u32 = 5;
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+/// Cap on a `chat.send` message (paste-bomb guard).
+const CHAT_SEND_MAX_BYTES: usize = 16 * 1024;
+/// Per-connection floor between `chat.fetch` calls: each one is a daemon
+/// round-trip plus transcript file IO, so a buggy poller must not spin.
+const CHAT_FETCH_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_PUSH_GATEWAY: &str = "https://push.vmux.sh";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -331,6 +336,53 @@ const MAX_RELAY_CONNECTIONS: usize = 64;
 
 // ─── Public CLI entry points ────────────────────────────────────────────────
 
+/// "A relay is wanted for this session, started like *this*."
+///
+/// Written by [`serve`] at startup and read by the daemon, which stops the
+/// relay when the session shuts down and starts it again — from the daemon's
+/// own (current) binary — when the session comes back. Without it a relay
+/// outlives every upgrade and keeps serving whatever it was built from, which
+/// is exactly how a week-old relay ends up hiding features the daemon has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayAutostart {
+    pub listen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_localhost: bool,
+    /// Pid of the relay that wrote this record (0 when unknown).
+    #[serde(default)]
+    pub pid: u32,
+}
+
+impl RelayAutostart {
+    /// Read the record for a session, if a relay ever registered one.
+    pub fn load(session: &str) -> Option<Self> {
+        let path = paths::relay_autostart_path(session).ok()?;
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    pub fn save(&self, session: &str) -> Result<()> {
+        let path = paths::relay_autostart_path(session)?;
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    pub fn forget(session: &str) {
+        if let Ok(path) = paths::relay_autostart_path(session) {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// True when the recorded pid is still a live vmux relay — so callers do
+    /// not start a second one that would fail to bind the port.
+    pub fn is_running(&self) -> bool {
+        self.pid != 0
+            && paths::process_exists(self.pid)
+            && paths::process_cmdline_contains(self.pid, "relay")
+    }
+}
+
 pub fn serve(
     session: &str,
     config_path: Option<PathBuf>,
@@ -376,6 +428,16 @@ pub fn serve(
 
     let listener = TcpListener::bind(&config.listen)
         .with_context(|| format!("bind relay on {}", config.listen))?;
+    // Only register after the bind succeeds: a relay that could not take the
+    // port must not teach the daemon to keep respawning it.
+    RelayAutostart {
+        listen: config.listen.clone(),
+        config: Some(path.display().to_string()),
+        allow_localhost: config.allow_localhost,
+        pid: std::process::id(),
+    }
+    .save(&config.session)
+    .ok();
     eprintln!(
         "vmux relay listening on {} (session={}, socket={})",
         config.listen,
@@ -443,6 +505,30 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Stop the relay for a session and forget its autostart intent, so the
+/// daemon stops bringing it back on restart.
+pub fn stop(session: &str) -> Result<()> {
+    let record = RelayAutostart::load(session);
+    let stopped = match &record {
+        Some(record) if record.is_running() => {
+            unsafe { libc::kill(record.pid as libc::pid_t, libc::SIGTERM) };
+            true
+        }
+        _ => false,
+    };
+    RelayAutostart::forget(session);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&protocol::Response::ok(json!({
+            "session": session,
+            "stopped": stopped,
+            "listen": record.as_ref().map(|r| r.listen.clone()),
+            "autostart": false,
+        })))?
+    );
+    Ok(())
 }
 
 pub fn status(config_path: Option<PathBuf>) -> Result<()> {
@@ -1156,6 +1242,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()
                 "session": state.config.session,
                 "boot_id": state.boot_id,
                 "push_notifications": true,
+                // Capability flag: phones only show the chat UI when the
+                // relay actually speaks chat.fetch/chat.send, so an older
+                // relay never renders a dead chat icon.
+                "chat": true,
             });
             write_http(
                 &mut stream,
@@ -1434,6 +1524,9 @@ fn handle_ws_upgrade(
     let hello_deadline = Instant::now() + HELLO_TIMEOUT;
     let mut helloed = false;
     let mut active_subs: HashMap<String, thread::JoinHandle<()>> = HashMap::new();
+    // Per-connection floor between chat.fetch calls (daemon round-trip +
+    // transcript IO each) — a buggy phone poller must not spin the daemon.
+    let mut last_chat_fetch: Option<Instant> = None;
     let stop_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let push_tx = Arc::new(Mutex::new(None::<std::sync::mpsc::SyncSender<String>>));
@@ -1622,6 +1715,17 @@ fn handle_ws_upgrade(
                     }
                     let _ = ws.send(Message::Text(rpc_ok(&id, json!({})).to_string()));
                     continue;
+                }
+
+                if method == "chat.fetch" {
+                    if last_chat_fetch.is_some_and(|prev| prev.elapsed() < CHAT_FETCH_MIN_INTERVAL)
+                    {
+                        let _ = ws.send(Message::Text(
+                            rpc_err(&id, "rate_limited", "chat.fetch too frequent").to_string(),
+                        ));
+                        continue;
+                    }
+                    last_chat_fetch = Some(Instant::now());
                 }
 
                 match dispatch_rpc(&state, &method, &params) {
@@ -2244,6 +2348,7 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                 &Request::Input {
                     pane: Some(surface),
                     data: text,
+                    submit: false,
                 },
             )?;
             Ok(json!({}))
@@ -2415,6 +2520,64 @@ fn dispatch_rpc(state: &RelayState, method: &str, params: &Value) -> Result<Valu
                     message,
                     title: None,
                     agent_session: None,
+                    agent_transcript: None,
+                },
+            )?;
+            Ok(json!({}))
+        }
+        "chat.fetch" => {
+            let surface = req_str(params, "surface_id")?;
+            let since = params.get("cursor").and_then(|v| v.as_u64());
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let resp = call(
+                socket,
+                &Request::AgentChat {
+                    pane: Some(surface),
+                    since,
+                    limit,
+                },
+            )?;
+            Ok(resp.data.unwrap_or(json!({})))
+        }
+        "chat.send" => {
+            let surface = req_str(params, "surface_id")?;
+            let text = params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if text.trim().is_empty() {
+                bail!("text required");
+            }
+            if text.len() > CHAT_SEND_MAX_BYTES {
+                bail!("text too large (max {CHAT_SEND_MAX_BYTES} bytes)");
+            }
+            // Only chat-capable panes accept chat sends — the phone hides the
+            // composer without `has_chat`, this guards direct RPC misuse.
+            let resp = call(socket, &Request::List)?;
+            let data = resp.data.unwrap_or(Value::Null);
+            let pane = data.get("panes").and_then(|p| p.get(&surface));
+            let has_chat = pane
+                .and_then(|p| p.get("agent_transcript"))
+                .is_some_and(|t| t.is_string());
+            if !has_chat {
+                bail!("surface has no agent chat");
+            }
+            if pane.and_then(|p| p.get("status")).and_then(|s| s.as_str()) == Some("exited") {
+                bail!("surface has exited");
+            }
+            // Deliver through the daemon's submit path (paste, settle, then
+            // Enter). Deliberately NO FocusPane, unlike surface.send_text:
+            // chatting from the phone must not yank the desktop UI around.
+            call(
+                socket,
+                &Request::Input {
+                    pane: Some(surface),
+                    data: text,
+                    submit: true,
                 },
             )?;
             Ok(json!({}))
@@ -2625,6 +2788,18 @@ fn surface_list(socket: &Path, workspace_id: &str) -> Result<Value> {
             map.insert("tab_id".into(), json!(tab_id));
             map.insert("tab".into(), json!(tab_title));
         }
+        // Chat affordance: only a recorded transcript counts (agent hooks
+        // fired at least once). Pane command is useless here — agents run as
+        // children of the pane shell, so `command` is just "/bin/bash".
+        if let (Some(pane), Some(map)) = (panes_map.get(pid), surface.as_object_mut()) {
+            if let Some(status) = pane.get("agent_status") {
+                map.insert("agent_status".into(), status.clone());
+            }
+            let has_chat = pane
+                .get("agent_transcript")
+                .is_some_and(|transcript| transcript.is_string());
+            map.insert("has_chat".into(), json!(has_chat));
+        }
         surfaces.push(surface);
     }
     Ok(json!({ "surfaces": surfaces, "workspace_id": workspace_id }))
@@ -2804,7 +2979,14 @@ fn paste_upload(state: &RelayState, target: &str, body: &[u8]) -> Result<Value> 
     if enter {
         data.push('\r');
     }
-    call(&state.socket, &Request::Input { pane, data })?;
+    call(
+        &state.socket,
+        &Request::Input {
+            pane,
+            data,
+            submit: false,
+        },
+    )?;
     Ok(json!({
         "path": path.display().to_string(),
         "bytes": body.len(),

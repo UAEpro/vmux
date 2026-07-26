@@ -1410,6 +1410,7 @@ impl Ui {
                     self.rpc(&Request::Input {
                         pane: Some(pane),
                         data: text,
+                        submit: false,
                     })?;
                 }
             }
@@ -1439,6 +1440,7 @@ impl Ui {
             return self.rpc(&Request::Input {
                 pane: Some(pane),
                 data,
+                submit: false,
             });
         }
         if self.input_batch_pane.as_ref() != Some(&pane) {
@@ -1473,6 +1475,7 @@ impl Ui {
             self.rpc(&Request::Input {
                 pane: Some(pane),
                 data,
+                submit: false,
             })?;
         }
         Ok(())
@@ -1775,6 +1778,7 @@ impl Ui {
             message: message.to_string(),
             title: None,
             agent_session: None,
+            agent_transcript: None,
         })
     }
 
@@ -3725,6 +3729,7 @@ impl Ui {
         self.rpc(&Request::Input {
             pane: Some(pane_id),
             data,
+            submit: false,
         })?;
         Ok(true)
     }

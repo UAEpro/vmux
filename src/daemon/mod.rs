@@ -255,6 +255,18 @@ const DECAY_TICK_SECS: u64 = 4;
 /// parks one connection thread, so cap how long that can be.
 const SNAPSHOT_WAIT_CAP_MS: u64 = 30_000;
 
+/// Pause between pasting text and pressing Enter in `deliver_text_submit`,
+/// so the target app's event loop ingests the paste before the submit. Runs
+/// on the requesting connection's own thread — nothing else waits on it.
+const SUBMIT_SETTLE_MS: u64 = 75;
+
+/// `AgentChat` with no cursor on a huge transcript reads only this much of
+/// the file's tail (then trims to the item limit).
+const CHAT_INITIAL_READ_MAX: u64 = 4 * 1024 * 1024;
+
+/// Default item cap for an initial (`since: None`) `AgentChat` fetch.
+const CHAT_INITIAL_ITEM_LIMIT: usize = 200;
+
 /// 8-bit color components.
 type Rgb8 = (u8, u8, u8);
 /// Outer-terminal default (fg, bg) as reported by an attach client.
@@ -748,6 +760,13 @@ impl Server {
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )
         .ok();
+        {
+            // Bring the phone relay back after a restart — from *this* binary,
+            // so an upgraded daemon is never fronted by a stale relay. Off the
+            // startup path: it waits for the socket to accept connections.
+            let server = Arc::clone(&self);
+            thread::spawn(move || server.restore_relay());
+        }
 
         // Soft cap: extra connections get a JSON error instead of a thread.
         const MAX_DAEMON_CONNECTIONS: usize = 256;
@@ -1482,8 +1501,12 @@ impl Server {
                 self.resize_active(direction, amount)?;
                 Ok(Response::empty())
             }
-            Request::Input { pane, data } => {
-                self.write_input(pane, data)?;
+            Request::Input { pane, data, submit } => {
+                if submit {
+                    self.deliver_text_submit(pane, data)?;
+                } else {
+                    self.write_input(pane, data)?;
+                }
                 Ok(Response::empty())
             }
             Request::SendKey { pane, keys } => {
@@ -1504,12 +1527,26 @@ impl Server {
                 message,
                 title,
                 agent_session,
+                agent_transcript,
             } => {
+                // A hook that names no pane resolves to the *active* one. That
+                // guess is fine for a status glyph, but binding a conversation
+                // to a guessed pane makes one pane display another agent's
+                // chat — so the transcript is only recorded when the hook
+                // identified its pane itself.
+                let named_pane = pane
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string);
                 let note = self.notify(pane, workspace, status, color, clear, message, title)?;
                 // The note carries the resolved pane id, so hook payloads that
                 // omit --pane still attach the session id to the right pane.
                 if let Some(agent_session) = agent_session {
                     self.record_agent_session(note.pane.as_deref(), &agent_session);
+                }
+                if let Some(agent_transcript) = agent_transcript {
+                    self.record_agent_transcript(named_pane.as_deref(), &agent_transcript);
                 }
                 Ok(Response::ok(note))
             }
@@ -1549,6 +1586,10 @@ impl Server {
                 history_lines,
             } => {
                 let data = self.read_screen(pane, scrollback, limit_bytes, ansi, history_lines)?;
+                Ok(Response::ok(data))
+            }
+            Request::AgentChat { pane, since, limit } => {
+                let data = self.agent_chat(pane, since, limit)?;
                 Ok(Response::ok(data))
             }
             Request::Search { pane, query } => {
@@ -1647,6 +1688,10 @@ impl Server {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.save()?;
                 self.log("daemon shutting down").ok();
+                // The relay serves this daemon; leaving it up means a phone
+                // holding a socket to a corpse. Its autostart record survives,
+                // so the next daemon start brings it back.
+                self.stop_relay();
                 self.cleanup_runtime_files();
                 self.release_session_lock();
                 thread::spawn(|| {
@@ -2692,6 +2737,39 @@ impl Server {
         Ok(())
     }
 
+    /// Deliver text as a paste, then press Enter (`Request::Input`'s
+    /// `submit`). Appending `\r` to the text does NOT work against agent
+    /// composers: text and CR arriving in a single PTY read trip their paste
+    /// heuristics and the CR becomes a newline in the composer instead of a
+    /// submit (observed live against Claude Code). So: wrap in bracketed
+    /// paste when the pane's app enabled it (also keeps multi-line text one
+    /// message), give the app's event loop a moment to ingest, then send
+    /// Enter as its own write.
+    fn deliver_text_submit(&self, pane: Option<String>, text: String) -> Result<()> {
+        let pane_id = self.resolve_pane(pane)?;
+        let runtime_key = self.active_runtime_key(&pane_id)?;
+        let bracketed = {
+            let panes = self.panes.lock_or_recover();
+            let key = if panes.contains_key(&runtime_key) {
+                runtime_key
+            } else {
+                legacy_runtime_key(&pane_id)
+            };
+            panes
+                .get(&key)
+                .map(|runtime| runtime.parser.screen().bracketed_paste())
+                .unwrap_or(false)
+        };
+        let data = if bracketed {
+            format!("\x1b[200~{text}\x1b[201~")
+        } else {
+            text
+        };
+        self.write_input(Some(pane_id.clone()), data)?;
+        thread::sleep(Duration::from_millis(SUBMIT_SETTLE_MS));
+        self.write_input(Some(pane_id), "\r".to_string())
+    }
+
     fn mark_coding_agent_busy(&self, pane_id: &str, runtime_key: &str) {
         // Screen-manifest agents (Claude/Codex/…) get status from the live UI,
         // not from "user typed something". A prompt keystroke would otherwise
@@ -3495,6 +3573,13 @@ impl Server {
     /// Remember the agent CLI's conversation id for a pane (from hook JSON via
     /// `Request::Notify`). Saves only when the id actually changes — hooks
     /// repeat it on every lifecycle event.
+    ///
+    /// A *changed* id means a different conversation (restart, `/clear`,
+    /// resume), so the recorded transcript is dropped at the same time: the
+    /// path still on the pane belongs to the previous session, and serving it
+    /// would show the wrong chat. The same hook payload carries the new
+    /// `transcript_path`, which [`Self::record_agent_transcript`] stores right
+    /// after this — and if it does not, "no chat yet" beats "someone else's".
     fn record_agent_session(&self, pane_id: Option<&str>, agent_session: &str) {
         let Some(pane_id) = pane_id else {
             return;
@@ -3504,6 +3589,7 @@ impl Server {
             match session.panes.get_mut(pane_id) {
                 Some(pane) if pane.agent_session.as_deref() != Some(agent_session) => {
                     pane.agent_session = Some(agent_session.to_string());
+                    pane.agent_transcript = None;
                     true
                 }
                 _ => false,
@@ -3514,6 +3600,37 @@ impl Server {
             for runtime in panes.values_mut() {
                 if runtime.pane.id == pane_id {
                     runtime.pane.agent_session = Some(agent_session.to_string());
+                    runtime.pane.agent_transcript = None;
+                }
+            }
+            drop(panes);
+            self.save().ok();
+        }
+    }
+
+    /// Remember the agent CLI's transcript path for a pane (Claude Code
+    /// `transcript_path` from hook JSON via `Request::Notify`). Same shape as
+    /// [`Self::record_agent_session`]: saves only on change, and never holds
+    /// the `session` and `panes` locks at once.
+    fn record_agent_transcript(&self, pane_id: Option<&str>, agent_transcript: &str) {
+        let Some(pane_id) = pane_id else {
+            return;
+        };
+        let changed = {
+            let mut session = self.session.lock_or_recover();
+            match session.panes.get_mut(pane_id) {
+                Some(pane) if pane.agent_transcript.as_deref() != Some(agent_transcript) => {
+                    pane.agent_transcript = Some(agent_transcript.to_string());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            let mut panes = self.panes.lock_or_recover();
+            for runtime in panes.values_mut() {
+                if runtime.pane.id == pane_id {
+                    runtime.pane.agent_transcript = Some(agent_transcript.to_string());
                 }
             }
             drop(panes);
@@ -3808,6 +3925,103 @@ impl Server {
             value["scrollback"] = serde_json::json!(trim_output(output, limit));
         }
         Ok(value)
+    }
+
+    /// Serve a pane's conversation as structured chat, parsed from its
+    /// transcript file (`Request::AgentChat`). Per-request file IO on the
+    /// caller's own connection thread — this is deliberately NOT the snapshot
+    /// hot path, and no lock is held across the read.
+    fn agent_chat(
+        &self,
+        pane: Option<String>,
+        since: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<protocol::AgentChatData> {
+        use std::io::{Read as _, Seek, SeekFrom};
+
+        let pane_id = self.resolve_pane(pane)?;
+        let (transcript, agent_status, agent_session, attention) = {
+            let session = self.session.lock_or_recover();
+            let pane = session
+                .panes
+                .get(&pane_id)
+                .ok_or_else(|| anyhow!("unknown pane {pane_id}"))?;
+            (
+                pane.agent_transcript.clone(),
+                pane.agent_status.clone(),
+                pane.agent_session.clone(),
+                pane.notification_message.clone().filter(|m| !m.is_empty()),
+            )
+        };
+        let unavailable = |cursor| protocol::AgentChatData {
+            pane: pane_id.clone(),
+            items: Vec::new(),
+            cursor,
+            reset: false,
+            agent_status: agent_status.clone(),
+            agent_session: agent_session.clone(),
+            available: false,
+            attention: attention.clone(),
+        };
+        let Some(transcript) = transcript else {
+            return Ok(unavailable(0));
+        };
+        // Missing/rotated file is a soft state (agent restarted, cleanup),
+        // not an error: report unavailable but keep the caller's cursor.
+        let Ok(file_len) = std::fs::metadata(&transcript).map(|meta| meta.len()) else {
+            return Ok(unavailable(since.unwrap_or(0)));
+        };
+        // A cursor past EOF means the file was replaced or truncated (e.g.
+        // `--resume` wrote a shorter file at the same path): restart from 0
+        // and tell the client to drop what it has.
+        let stale_cursor = since.is_some_and(|offset| offset > file_len);
+        let initial = since.is_none() || stale_cursor;
+        let mut offset = if initial { 0 } else { since.unwrap_or(0) };
+        let mut reset = stale_cursor;
+        if initial && file_len > CHAT_INITIAL_READ_MAX {
+            offset = file_len - CHAT_INITIAL_READ_MAX;
+            reset = true;
+        }
+        let mut file = std::fs::File::open(&transcript)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        // A mid-file start lands mid-line: skip to the first newline so the
+        // parser only ever sees whole lines.
+        let skipped = if offset > 0 && initial {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(newline) => {
+                    bytes.drain(..=newline);
+                    newline as u64 + 1
+                }
+                None => {
+                    let len = bytes.len() as u64;
+                    bytes.clear();
+                    len
+                }
+            }
+        } else {
+            0
+        };
+        let outcome = crate::agent_chat::parse_transcript_chunk(&bytes, offset + skipped);
+        let mut items = outcome.items;
+        if initial {
+            let cap = limit.unwrap_or(CHAT_INITIAL_ITEM_LIMIT);
+            if items.len() > cap {
+                items.drain(..items.len() - cap);
+                reset = true;
+            }
+        }
+        Ok(protocol::AgentChatData {
+            pane: pane_id,
+            items,
+            cursor: offset + skipped + outcome.consumed,
+            reset,
+            agent_status,
+            agent_session,
+            available: true,
+            attention,
+        })
     }
 
     fn search_pane(&self, pane: Option<String>, query: String) -> Result<serde_json::Value> {
@@ -5039,6 +5253,90 @@ impl Server {
 
     fn write_pid_file(&self) -> Result<()> {
         paths::write_pid_record(&self.pid_path, std::process::id())
+    }
+
+    /// Stop the phone relay that fronts this session (shutdown path).
+    ///
+    /// The autostart record is deliberately left behind: it is the standing
+    /// intent "this session has a relay", which [`Self::restore_relay`] acts
+    /// on next start. `vmux relay stop` is the way to withdraw that intent.
+    fn stop_relay(&self) {
+        let Some(record) = crate::relay::RelayAutostart::load(&self.session_name) else {
+            return;
+        };
+        if !record.is_running() {
+            return;
+        }
+        // SIGTERM: the relay has no state to flush, and its listener dies with
+        // it. SIGKILL would be no cleaner and skips any future graceful path.
+        unsafe { libc::kill(record.pid as libc::pid_t, libc::SIGTERM) };
+        self.log(&format!("stopped relay pid {}", record.pid)).ok();
+    }
+
+    /// Start the phone relay again if this session had one before the restart.
+    ///
+    /// Runs on its own thread a moment after the socket is up, because the
+    /// relay's own `ensure_running` would otherwise race this daemon's bind.
+    fn restore_relay(&self) {
+        thread::sleep(Duration::from_millis(300));
+        let Some(record) = crate::relay::RelayAutostart::load(&self.session_name) else {
+            return;
+        };
+        if record.is_running() {
+            return; // a relay survived (or beat us to it) — leave it alone
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut command = Command::new(exe);
+        command
+            .arg("--session")
+            .arg(&self.session_name)
+            .arg("relay")
+            .arg("serve")
+            .arg("--listen")
+            .arg(&record.listen);
+        if let Some(config) = &record.config {
+            command.arg("--config").arg(config);
+        }
+        if record.allow_localhost {
+            command.arg("--allow-localhost");
+        }
+        let log = paths::relay_log_path(&self.session_name)
+            .ok()
+            .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok());
+        match log {
+            Some(file) => {
+                let errors = match file.try_clone() {
+                    Ok(clone) => Stdio::from(clone),
+                    Err(_) => Stdio::null(),
+                };
+                command.stdout(Stdio::from(file)).stderr(errors);
+            }
+            None => {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+        }
+        // VMUX_DAEMONIZE would make the relay's ensure_running daemonize
+        // *itself* instead of starting a daemon (this process is the daemon,
+        // and it carries that variable).
+        match command
+            .stdin(Stdio::null())
+            .env_remove("VMUX_DAEMONIZE")
+            .spawn()
+        {
+            Ok(child) => {
+                self.log(&format!(
+                    "restarted relay on {} (pid {})",
+                    record.listen,
+                    child.id()
+                ))
+                .ok();
+            }
+            Err(err) => {
+                self.log(&format!("relay restart failed: {err}")).ok();
+            }
+        }
     }
 
     fn log(&self, message: &str) -> Result<()> {
@@ -7442,6 +7740,229 @@ mod tests {
         // Unknown panes and missing ids are ignored, not errors.
         server.record_agent_session(Some("pane-404"), "sess-x");
         server.record_agent_session(None, "sess-x");
+
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn record_agent_transcript_persists_across_reload() {
+        // Gate check for agent chat: the transcript path a hook reports must
+        // land in the session JSON and survive save → drop → reload, or the
+        // phone app's chat has nothing to read after a daemon restart.
+        let session = TestSession::new("agent-transcript");
+        {
+            let server = Arc::new(Server::load(session.as_str()).unwrap());
+            {
+                let mut state = server.session.lock_or_recover();
+                let pane = Pane::new(
+                    "pane-1".to_string(),
+                    "claude".to_string(),
+                    SplitDirection::Right,
+                );
+                state.panes.insert("pane-1".to_string(), pane);
+            }
+            server.record_agent_transcript(Some("pane-1"), "/tmp/transcript.jsonl");
+            // Repeats (hooks resend on every event) must be no-ops.
+            server.record_agent_transcript(Some("pane-1"), "/tmp/transcript.jsonl");
+            server.record_agent_transcript(Some("pane-404"), "/nope");
+            server.record_agent_transcript(None, "/nope");
+            server.save().unwrap();
+        }
+        let reloaded = Server::load(session.as_str()).unwrap();
+        {
+            let state = reloaded.session.lock_or_recover();
+            assert_eq!(
+                state.panes["pane-1"].agent_transcript.as_deref(),
+                Some("/tmp/transcript.jsonl")
+            );
+        }
+        fs::remove_file(reloaded.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn new_agent_session_drops_the_previous_transcript() {
+        // Restart / `/clear` / resume gives the pane a different conversation.
+        // Keeping the old path would show the *previous* chat in the new
+        // session's pane, which is worse than showing nothing.
+        let session = TestSession::new("agent-conv-swap");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut state = server.session.lock_or_recover();
+            state.panes.insert(
+                "pane-1".to_string(),
+                Pane::new(
+                    "pane-1".to_string(),
+                    "claude".to_string(),
+                    SplitDirection::Right,
+                ),
+            );
+        }
+        server.record_agent_session(Some("pane-1"), "sess-1");
+        server.record_agent_transcript(Some("pane-1"), "/tmp/one.jsonl");
+        // Same id repeated (hooks do this constantly) must not drop anything.
+        server.record_agent_session(Some("pane-1"), "sess-1");
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"]
+                .agent_transcript
+                .as_deref(),
+            Some("/tmp/one.jsonl")
+        );
+
+        server.record_agent_session(Some("pane-1"), "sess-2");
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"].agent_transcript,
+            None,
+            "a new conversation must not inherit the old transcript"
+        );
+        server.record_agent_transcript(Some("pane-1"), "/tmp/two.jsonl");
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"]
+                .agent_transcript
+                .as_deref(),
+            Some("/tmp/two.jsonl")
+        );
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn hook_without_a_pane_does_not_bind_a_transcript_to_the_active_pane() {
+        // `Notify` falls back to the active pane when a hook names none — fine
+        // for a status glyph, but it would make one pane serve another agent's
+        // conversation. Guard lives in the Notify dispatch arm.
+        let session = TestSession::new("agent-conv-guess");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        {
+            let mut state = server.session.lock_or_recover();
+            state.panes.insert(
+                "pane-1".to_string(),
+                Pane::new(
+                    "pane-1".to_string(),
+                    "claude".to_string(),
+                    SplitDirection::Right,
+                ),
+            );
+            state.active_workspace_mut().active_pane = Some("pane-1".to_string());
+        }
+        let response = server
+            .dispatch(Request::Notify {
+                pane: Some("   ".to_string()), // legacy empty ${VMUX_PANE_ID}
+                workspace: None,
+                status: Some("busy".to_string()),
+                color: None,
+                clear: false,
+                message: "agent working".to_string(),
+                title: None,
+                agent_session: Some("sess-x".to_string()),
+                agent_transcript: Some("/tmp/somebody-elses.jsonl".to_string()),
+            })
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            server.session.lock_or_recover().panes["pane-1"].agent_transcript,
+            None,
+            "a pane-less hook must not claim the active pane's chat"
+        );
+        fs::remove_file(server.state_path.clone()).ok();
+    }
+
+    #[test]
+    fn agent_chat_serves_items_and_tails_incrementally() {
+        let session = TestSession::new("agent-chat");
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let transcript =
+            std::env::temp_dir().join(format!("{}-transcript.jsonl", session.as_str()));
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","uuid":"u1","message":{"content":"hello"}}"#,
+                "\n",
+                r#"{"type":"file-history-snapshot"}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"hi!"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        {
+            let mut state = server.session.lock_or_recover();
+            let mut pane = Pane::new(
+                "pane-1".to_string(),
+                "claude".to_string(),
+                SplitDirection::Right,
+            );
+            pane.notification_message = Some("Do you want to proceed?".to_string());
+            state.panes.insert("pane-1".to_string(), pane);
+            state.active_workspace_mut().active_pane = Some("pane-1".to_string());
+        }
+
+        // Pane without a recorded transcript → soft unavailable, not an error.
+        let before = server
+            .agent_chat(Some("pane-1".to_string()), None, None)
+            .unwrap();
+        assert!(!before.available);
+        assert!(before.items.is_empty());
+
+        server.record_agent_transcript(Some("pane-1"), &transcript.display().to_string());
+        let first = server
+            .agent_chat(Some("pane-1".to_string()), None, None)
+            .unwrap();
+        assert!(first.available);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+        assert_eq!(first.attention.as_deref(), Some("Do you want to proceed?"));
+        assert!(first.cursor > 0);
+        assert!(!first.reset);
+
+        // Nothing new → empty incremental fetch, same cursor.
+        let idle = server
+            .agent_chat(Some("pane-1".to_string()), Some(first.cursor), None)
+            .unwrap();
+        assert!(idle.items.is_empty());
+        assert_eq!(idle.cursor, first.cursor);
+
+        // Append one turn → only the new item comes back.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","uuid":"a2","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"cargo test"}}}}]}}}}"#
+        )
+        .unwrap();
+        let second = server
+            .agent_chat(Some("pane-1".to_string()), Some(first.cursor), None)
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].kind, "activity");
+        assert_eq!(second.items[0].tool.as_deref(), Some("Bash"));
+        assert!(second.cursor > first.cursor);
+        assert!(!second.reset);
+
+        // Cursor past EOF (file replaced/truncated) → full restart + reset.
+        let stale = server
+            .agent_chat(
+                Some("pane-1".to_string()),
+                Some(second.cursor + 10_000),
+                None,
+            )
+            .unwrap();
+        assert!(stale.reset);
+        assert_eq!(stale.items.len(), 3);
+
+        // Missing file after recording → soft unavailable, cursor preserved.
+        fs::remove_file(&transcript).unwrap();
+        let gone = server
+            .agent_chat(Some("pane-1".to_string()), Some(second.cursor), None)
+            .unwrap();
+        assert!(!gone.available);
+        assert_eq!(gone.cursor, second.cursor);
 
         fs::remove_file(server.state_path.clone()).ok();
     }

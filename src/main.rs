@@ -1,3 +1,4 @@
+mod agent_chat;
 mod agent_hooks;
 mod cli;
 mod config;
@@ -135,13 +136,16 @@ fn main() -> Result<()> {
         Command::Config { command } => config_command(command),
         Command::Send { pane, enter, text } => {
             daemon::ensure_running(session)?;
-            let mut data = text.join(" ");
-            if enter {
-                data.push('\r');
-            }
+            let data = text.join(" ");
+            // `submit` (not an appended '\r') so agent composers with paste
+            // heuristics actually submit — see Request::Input docs.
             let response = protocol::request(
                 &paths::socket_path(session)?,
-                &protocol::Request::Input { pane, data },
+                &protocol::Request::Input {
+                    pane,
+                    data,
+                    submit: enter,
+                },
             )?;
             print_response(response)
         }
@@ -153,6 +157,14 @@ fn main() -> Result<()> {
             )?;
             print_response(response)
         }
+        Command::Chat { pane, since, limit } => {
+            daemon::ensure_running(session)?;
+            let response = protocol::request(
+                &paths::socket_path(session)?,
+                &protocol::Request::AgentChat { pane, since, limit },
+            )?;
+            print_response(response)
+        }
         Command::SendImage { file, pane, enter } => {
             daemon::ensure_running(session)?;
             let bytes = read_image_input(&file)?;
@@ -160,13 +172,14 @@ fn main() -> Result<()> {
                 anyhow!("input does not look like an image (expected png, jpeg, gif, webp, or bmp)")
             })?;
             let path = save_send_image(&bytes, ext)?;
-            let mut data = format!("{} ", path.display());
-            if enter {
-                data.push('\r');
-            }
+            let data = format!("{} ", path.display());
             let response = protocol::request(
                 &paths::socket_path(session)?,
-                &protocol::Request::Input { pane, data },
+                &protocol::Request::Input {
+                    pane,
+                    data,
+                    submit: enter,
+                },
             )?;
             if !response.ok {
                 return Err(anyhow!(response
@@ -541,6 +554,7 @@ fn main() -> Result<()> {
                     message,
                     title: None,
                     agent_session: None,
+                    agent_transcript: None,
                 },
             )?;
             print_response(response)
@@ -565,6 +579,7 @@ fn main() -> Result<()> {
                     message,
                     title: None,
                     agent_session: None,
+                    agent_transcript: None,
                 },
             )?;
             print_response(response)
@@ -695,6 +710,7 @@ fn relay_command(session: &str, command: RelayCommand) -> Result<()> {
                 allow_localhost,
             )
         }
+        RelayCommand::Stop => relay::stop(session),
         RelayCommand::Status { config } => relay::status(config.map(std::path::PathBuf::from)),
         RelayCommand::Devices { command } => match command {
             RelayDevicesCommand::List => relay::devices_list(),
@@ -980,6 +996,12 @@ fn hook_event_request(
     let agent_session = payload
         .as_ref()
         .and_then(|value| hook_payload_string(value, &["session_id", "sessionId"]));
+    // The conversation's transcript file (Claude Code sends `transcript_path`
+    // in every hook payload). The daemon stores it so `AgentChat` can serve
+    // the pane's conversation as structured chat.
+    let agent_transcript = payload
+        .as_ref()
+        .and_then(|value| hook_payload_string(value, &["transcript_path", "transcriptPath"]));
     // Blank `--pane ""` (legacy empty LMUX_PANE_ID) must not become "unknown pane ".
     Ok(protocol::Request::Notify {
         pane: non_empty(pane),
@@ -990,6 +1012,7 @@ fn hook_event_request(
         message,
         title,
         agent_session,
+        agent_transcript,
     })
 }
 
@@ -1075,13 +1098,18 @@ fn hook_event_defaults(event: &str) -> (&'static str, &'static str, &'static str
         // Needs user (approval / notification)
         "permissionrequest" | "notification" | "elicitation" | "elicitationresult"
         | "permissiondenied" => ("attention", "blue", "agent needs input"),
+        // A session that just launched is waiting for a prompt, not working.
+        // vmux installs this hook to learn the conversation's transcript path
+        // up front (so the chat view has something to show before the first
+        // prompt); painting 🔄 for merely existing would be a lie that sticks,
+        // because hook-set status is pinned.
+        "sessionstart" => ("idle", "gray", "agent session started"),
         // Actively working
         "userpromptsubmit"
         | "userpromptexpansion"
         | "pretooluse"
         | "posttooluse"
         | "posttoolbatch"
-        | "sessionstart"
         | "subagentstart"
         | "subagentstop"
         | "precompact"
@@ -1496,15 +1524,12 @@ fn surface_command(session: &str, command: SurfaceCommand) -> Result<()> {
             enter,
             text,
         } => {
-            let mut data = text.join(" ");
-            if enter {
-                data.push('\r');
-            }
             let response = protocol::request(
                 &socket,
                 &protocol::Request::Input {
                     pane: surface,
-                    data,
+                    data: text.join(" "),
+                    submit: enter,
                 },
             )?;
             print_response(response)
@@ -1835,12 +1860,14 @@ fn agent_command(session: &str, command: AgentCommand) -> Result<()> {
             print_response(response)
         }
         AgentCommand::Send { agent, enter, text } => {
-            let mut data = text.join(" ");
-            if enter {
-                data.push('\r');
-            }
-            let response =
-                protocol::request(&socket, &protocol::Request::Input { pane: agent, data })?;
+            let response = protocol::request(
+                &socket,
+                &protocol::Request::Input {
+                    pane: agent,
+                    data: text.join(" "),
+                    submit: enter,
+                },
+            )?;
             print_response(response)
         }
         AgentCommand::Read {
@@ -1877,6 +1904,7 @@ fn agent_command(session: &str, command: AgentCommand) -> Result<()> {
                     message,
                     title: None,
                     agent_session: None,
+                    agent_transcript: None,
                 },
             )?;
             print_response(response)
@@ -2745,6 +2773,7 @@ fn smoke(keep: bool) -> Result<()> {
                 message: "smoke notification".to_string(),
                 title: None,
                 agent_session: None,
+                agent_transcript: None,
             },
         )?;
         checks.push(smoke_check("notify", notify.ok));
@@ -3198,6 +3227,7 @@ fn events_follow_contains(session: &str, socket: &std::path::Path, pane_id: &str
             message: "smoke follow event".to_string(),
             title: None,
             agent_session: None,
+            agent_transcript: None,
         },
     )?;
     if !response.ok {
