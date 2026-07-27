@@ -880,6 +880,15 @@ fn hooks_command(session: &str, command: HooksCommand) -> Result<()> {
             if !daemon::is_running(session) {
                 return Ok(());
             }
+            // No pane and no workspace means the agent is not running inside a
+            // vmux pane at all: panes export VMUX_PANE_ID (and legacy
+            // LMUX_PANE_ID), so the hook's `--pane ""` can only come from a
+            // terminal vmux does not own. The daemon would fall back to the
+            // *active* pane and paint someone else's 🔄 / bind someone else's
+            // conversation there. An agent outside vmux has nothing to report.
+            if non_empty(pane.clone()).is_none() && non_empty(workspace.clone()).is_none() {
+                return Ok(());
+            }
             let mut payload = String::new();
             if !std::io::stdin().is_terminal() {
                 std::io::stdin().read_to_string(&mut payload)?;
