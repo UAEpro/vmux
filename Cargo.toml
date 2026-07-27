@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
 daemonize = "0.5"
 dirs = "5"
-getrandom = "0.2"
+getrandom = "0.4"
 libc = "0.2"
 portable-pty = "0.9"
 ratatui = "0.30"
