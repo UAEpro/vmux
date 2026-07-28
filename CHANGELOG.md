@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.7.0 — 2026-07-28
+
+Feature release: structured agent chat (host + phone), transcript/env
+hygiene so Claude/Codex sessions stay real, and daemon reliability for
+locks and cleanup. Upgrade with the install one-liner, `cargo install
+vmux-tui`, or wait for the in-app update notice.
+
+### Added
+
+- **Structured agent chat.** Session hooks record `transcript_path`;
+  `AgentChat` RPC tails the JSONL; relay exposes `chat.fetch` /
+  `chat.send` with `has_chat` + `agent_status` on surfaces so the phone
+  app can show a WhatsApp-style conversation without a terminal.
+- **Chat adapters for Codex and Grok** (and stop guessing panes for
+  stray hooks that only mention a foreign session).
+- **Default color palette `tokyo-night`**, with herdr credit in the
+  README.
+
+### Fixed
+
+- **Claude “Transcript saving is off”** when the daemon was started from
+  inside an agent: parent session markers (`CLAUDE_CODE_CHILD_SESSION`,
+  …) are scrubbed from the daemon and every pane PTY.
+- **Monochrome Claude in panes** when the daemon inherited host
+  `NO_COLOR` / `FORCE_COLOR=0` / `CLICOLOR=0` from an agent shell —
+  those are scrubbed the same way.
+- **False busy (🔄) under a shell** when the agent runs inside bash:
+  process-tree authority and decay so status does not stick on the
+  outer shell.
+- **Session lock flakes**: `flock` can briefly look held after release
+  when a forked child still has the fd; `Server::load` waits that out
+  (`LOCK_WAIT`), and non-contention flock errors fail immediately.
+- **Phantom sessions after tests/smoke/shutdown**: reader-thread
+  `mark_exited` → `save()` can no longer re-create a deleted state
+  file; `stop_saving` fences persistence, and shutdown still tears
+  down if the final save fails.
+
 ## v0.6.0 — 2026-07-22
 
 Feature release: layout skins separate from color palettes, herdr-style
