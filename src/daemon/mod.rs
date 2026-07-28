@@ -34,6 +34,48 @@ use view_size::{
     upsert_override, ViewOverride,
 };
 
+/// Parent-agent session markers. Coding agents (Claude Code, Codex companion,
+/// …) inject these into their process tree so nested launches know they are
+/// children. If the daemon inherits them (started from inside an agent
+/// session), every pane shell inherits them too — and every `claude` started
+/// in a pane silently disables transcript writing ("Transcript saving is off —
+/// inherited CLAUDE_CODE_CHILD_SESSION marker"). Same class of leak as
+/// [`VMUX_DAEMONIZE`](start_detached_or_daemonize).
+const INHERITED_AGENT_ENV: &[&str] = &[
+    // Claude Code
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_PID",
+    // Codex companion (also set when Claude hosts the codex plugin)
+    "CODEX_COMPANION_SESSION_ID",
+    "CODEX_COMPANION_TRANSCRIPT_PATH",
+    // Generic agent tag some launchers inject
+    "AI_AGENT",
+];
+
+/// Drop parent-agent session markers from *this* process so anything we later
+/// spawn (pane shells, the relay, helper daemons) starts clean. Call only
+/// before the daemon goes multi-threaded (`serve` spawns workers).
+fn scrub_inherited_agent_env() {
+    for key in INHERITED_AGENT_ENV {
+        std::env::remove_var(key);
+    }
+}
+
+fn command_scrub_inherited_agent(cmd: &mut Command) {
+    for key in INHERITED_AGENT_ENV {
+        cmd.env_remove(key);
+    }
+}
+
+fn builder_scrub_inherited_agent(builder: &mut CommandBuilder) {
+    for key in INHERITED_AGENT_ENV {
+        builder.env_remove(key);
+    }
+}
+
 pub fn ensure_running(session: &str) -> Result<()> {
     if is_running(session) {
         return Ok(());
@@ -84,7 +126,8 @@ pub fn start_detached(session: &str) -> Result<()> {
     // Capture the client's cwd *before* the daemon chdirs to `/` so new panes
     // open in the directory the user was in when they ran `vmux`.
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut child = Command::new(std::env::current_exe().context("resolve vmux executable")?)
+    let mut command = Command::new(std::env::current_exe().context("resolve vmux executable")?);
+    command
         .arg("--session")
         .arg(session)
         .arg("daemon")
@@ -92,9 +135,11 @@ pub fn start_detached(session: &str) -> Result<()> {
         .env("VMUX_LAUNCH_CWD", &launch_cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn vmux daemon helper")?;
+        .stderr(Stdio::null());
+    // Don't hand the helper a parent Claude/Codex session identity just
+    // because `vmux daemon` was invoked from inside an agent pane.
+    command_scrub_inherited_agent(&mut command);
+    let mut child = command.spawn().context("spawn vmux daemon helper")?;
 
     if wait_until_running(session, Duration::from_secs(3)) {
         return Ok(());
@@ -142,6 +187,9 @@ fn daemonize_current_process(session: &str) -> Result<()> {
     // VMUX_DAEMONIZE=1 would make any `vmux` command that starts a new
     // session daemonize itself instead of spawning a proper helper.
     std::env::remove_var("VMUX_DAEMONIZE");
+    // Same idea for parent-agent session markers (Claude's
+    // CLAUDE_CODE_CHILD_SESSION, …): they must not leak into every pane.
+    scrub_inherited_agent_env();
     ignore_hangup_signal()?;
     let err = serve_foreground(session).err();
     if let Some(err) = err {
@@ -181,6 +229,10 @@ pub fn serve_foreground(session: &str) -> Result<()> {
              Use `vmux --session {session} stop` first, or attach instead of daemon --foreground"
         );
     }
+    // Foreground path never hits `daemonize_current_process`, so scrub here
+    // too — `vmux daemon --foreground` from inside Claude must not poison
+    // every pane the same way a detached daemon would.
+    scrub_inherited_agent_env();
     let server = Arc::new(Server::load(session)?);
     server.reap_orphan_panes()?;
     server.restore_saved_panes()?;
@@ -2155,6 +2207,11 @@ impl Server {
         builder.env("LMUX_PANE_ID", &pane.id);
         builder.env("LMUX_SURFACE_ID", &pane.id);
         builder.env("LMUX_SOCKET_PATH", self.socket_path.display().to_string());
+        // Defense in depth: even if the daemon process still carries parent
+        // agent markers (upgrade mid-session, or a future spawn path that
+        // skipped scrub_inherited_agent_env), strip them from the pane PTY
+        // so Claude/Codex started inside write their own transcripts.
+        builder_scrub_inherited_agent(&mut builder);
         let mut child = pair.slave.spawn_command(builder)?;
         let child_pid = child.process_id();
         drop(pair.slave);
@@ -5319,12 +5376,11 @@ impl Server {
         }
         // VMUX_DAEMONIZE would make the relay's ensure_running daemonize
         // *itself* instead of starting a daemon (this process is the daemon,
-        // and it carries that variable).
-        match command
-            .stdin(Stdio::null())
-            .env_remove("VMUX_DAEMONIZE")
-            .spawn()
-        {
+        // and it carries that variable). Parent-agent session markers must
+        // not ride along either.
+        command.stdin(Stdio::null()).env_remove("VMUX_DAEMONIZE");
+        command_scrub_inherited_agent(&mut command);
+        match command.spawn() {
             Ok(child) => {
                 self.log(&format!(
                     "restarted relay on {} (pid {})",
@@ -9811,5 +9867,108 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         fs::remove_file(lock_path).ok();
         fs::remove_file(paths::pid_path(&session_name).unwrap()).ok();
         fs::remove_file(paths::socket_path(&session_name).unwrap()).ok();
+    }
+
+    #[test]
+    fn scrub_inherited_agent_env_drops_claude_child_session_markers() {
+        // Simulate a daemon that was started from inside Claude Code.
+        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
+        std::env::set_var("CLAUDE_CODE_SESSION_ID", "parent-session-id");
+        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("CLAUDE_PID", "999");
+        std::env::set_var("CODEX_COMPANION_SESSION_ID", "parent-session-id");
+        // Unrelated var must survive.
+        std::env::set_var("VMUX_SCRUB_TEST_KEEP", "yes");
+
+        super::scrub_inherited_agent_env();
+
+        assert!(
+            std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_none(),
+            "CLAUDE_CODE_CHILD_SESSION must be scrubbed"
+        );
+        assert!(std::env::var_os("CLAUDE_CODE_SESSION_ID").is_none());
+        assert!(std::env::var_os("CLAUDECODE").is_none());
+        assert!(std::env::var_os("CLAUDE_PID").is_none());
+        assert!(std::env::var_os("CODEX_COMPANION_SESSION_ID").is_none());
+        assert_eq!(
+            std::env::var("VMUX_SCRUB_TEST_KEEP").ok().as_deref(),
+            Some("yes"),
+            "unrelated env must not be touched"
+        );
+        std::env::remove_var("VMUX_SCRUB_TEST_KEEP");
+    }
+
+    /// Pane PTYs must not inherit Claude's child-session markers even when the
+    /// daemon process itself still carries them (upgrade mid-session).
+    #[test]
+    fn pane_pty_scrubs_claude_child_session_marker() {
+        let session = TestSession::new("scrub-claude");
+        // Poison *this* process the way a Claude-spawned daemon is poisoned.
+        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
+        std::env::set_var("CLAUDE_CODE_SESSION_ID", "parent-session-id");
+        std::env::set_var("CLAUDECODE", "1");
+
+        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        // Print only the markers (empty if scrubbed) plus a sentinel so we
+        // know the command ran. Use env - not a shell that re-exports.
+        let cmd = "sh -c 'printf \"child=[%s] session=[%s] claudecode=[%s] SENTINEL\\n\" \
+            \"${CLAUDE_CODE_CHILD_SESSION-}\" \
+            \"${CLAUDE_CODE_SESSION_ID-}\" \
+            \"${CLAUDECODE-}\"'"
+            .to_string();
+        let pane = server
+            .new_pane(SplitDirection::Right, cmd, None, None, None)
+            .unwrap();
+        let pane_id = pane.id.clone();
+
+        let mut saw_sentinel = false;
+        let mut last_output = String::new();
+        for _ in 0..200 {
+            let snap = server.snapshot(true).unwrap();
+            let pane = snap.panes.get(&pane_id).expect("pane in snapshot");
+            last_output = format!("{}{}", pane.output, pane.scrollback);
+            if last_output.contains("SENTINEL") {
+                saw_sentinel = true;
+                break;
+            }
+            if matches!(pane.status, PaneStatus::Exited) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_sentinel,
+            "pane should print the sentinel; got {last_output:?}"
+        );
+        assert!(
+            !last_output.contains("child=[1]"),
+            "CLAUDE_CODE_CHILD_SESSION must not reach the pane: {last_output}"
+        );
+        assert!(
+            !last_output.contains("session=[parent-session-id]"),
+            "CLAUDE_CODE_SESSION_ID must not reach the pane: {last_output}"
+        );
+        assert!(
+            !last_output.contains("claudecode=[1]"),
+            "CLAUDECODE must not reach the pane: {last_output}"
+        );
+        assert!(
+            last_output.contains("child=[]")
+                && last_output.contains("session=[]")
+                && last_output.contains("claudecode=[]"),
+            "markers should expand empty: {last_output}"
+        );
+
+        // Leave the process env clean for other tests in this binary.
+        std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
+        std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+        std::env::remove_var("CLAUDECODE");
+
+        if let Some(mut runtime) = server.panes.lock_or_recover().remove(&pane_id) {
+            if let Some(mut killer) = runtime.killer.take() {
+                killer.kill().ok();
+            }
+        }
+        server.cleanup_runtime_files();
     }
 }
