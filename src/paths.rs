@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub fn runtime_dir() -> Result<PathBuf> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -266,10 +267,28 @@ pub fn lock_path(session: &str) -> Result<PathBuf> {
     Ok(runtime_dir()?.join(format!("{session}.lock")))
 }
 
-/// Acquire an exclusive non-blocking lock for this session (single-instance).
+/// How long a starting daemon retries the session lock before calling the
+/// session taken. The window it covers is a fork/exec gap of a few ms; 250ms is
+/// slack, not a poll budget. Pass `Duration::ZERO` to probe without waiting.
+#[cfg(unix)]
+pub const LOCK_WAIT: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const LOCK_RETRY_SLEEP: Duration = Duration::from_millis(5);
+
+/// Acquire the exclusive session lock (single-instance), retrying for `wait`.
+///
+/// `flock` is held by the *open file description*, so any child forked while we
+/// hold the lock inherits it and keeps it alive until it execs (the fd is
+/// CLOEXEC, so exec is what drops it). A daemon that forks pane shells, `git`,
+/// or `ss` therefore leaves a few-millisecond window in which a lock it has
+/// already released still reads as held. Failing fast there turns a free
+/// session into "already locked by another vmux daemon" — so a daemon taking
+/// the lock for real passes `LOCK_WAIT`, and only callers probing whether the
+/// lock is held right now pass `Duration::ZERO`.
+///
 /// Returns the held file so the OS releases the lock when the process exits.
 #[cfg(unix)]
-pub fn try_lock_session(session: &str) -> Result<Option<std::fs::File>> {
+pub fn lock_session(session: &str, wait: Duration) -> Result<Option<std::fs::File>> {
     use std::os::unix::io::AsRawFd;
     let path = lock_path(session)?;
     if let Some(parent) = path.parent() {
@@ -282,12 +301,32 @@ pub fn try_lock_session(session: &str) -> Result<Option<std::fs::File>> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open lock {}", path.display()))?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        bail!(
-            "session {session:?} is already locked by another vmux daemon (lock {})",
-            path.display()
+    let deadline = Instant::now() + wait;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            break;
+        }
+        // Only EWOULDBLOCK/EAGAIN mean "held by someone else". Any other errno
+        // (permissions, bad fd, …) is permanent — spinning for LOCK_WAIT would
+        // just delay a real failure and report it as "already locked".
+        let err = std::io::Error::last_os_error();
+        let retryable = matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
         );
+        if !retryable {
+            return Err(err)
+                .with_context(|| format!("flock exclusive on session lock {}", path.display()));
+        }
+        // Duration::ZERO must fail on the first contention without sleeping.
+        if wait.is_zero() || Instant::now() >= deadline {
+            bail!(
+                "session {session:?} is already locked by another vmux daemon (lock {})",
+                path.display()
+            );
+        }
+        std::thread::sleep(LOCK_RETRY_SLEEP);
     }
     // Record our pid inside the lock for doctor/debug.
     let _ = fs::write(&path, format!("{}\n", std::process::id()));
@@ -422,5 +461,59 @@ mod tests {
                 "{reserved:?} is a daemon state file, not a session, but was listed"
             );
         }
+    }
+
+    /// A child forked while we hold the lock inherits the fd and keeps the
+    /// flock alive until it execs, so a session that is free can read as held
+    /// for a few milliseconds. A starting daemon must wait that out.
+    #[cfg(unix)]
+    #[test]
+    fn lock_session_waits_out_a_holder_that_is_letting_go() {
+        let session = format!("vmux-test-lock-wait-{}", std::process::id());
+        let held = lock_session(&session, Duration::ZERO)
+            .unwrap()
+            .expect("first lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let taken = lock_session(&session, LOCK_WAIT)
+            .expect("a lock released inside the wait window must be acquired, not refused");
+        let waited = started.elapsed();
+        assert!(taken.is_some());
+        assert!(
+            waited >= Duration::from_millis(40),
+            "should have waited for the holder, returned after {waited:?}"
+        );
+
+        releaser.join().unwrap();
+        drop(taken);
+        fs::remove_file(lock_path(&session).unwrap()).ok();
+    }
+
+    /// The waiting is opt-in: callers probing whether a daemon is alive (and
+    /// the shutdown test that asserts a held lock is refused) must not spin.
+    #[cfg(unix)]
+    #[test]
+    fn a_zero_wait_lock_refuses_a_held_lock_immediately() {
+        let session = format!("vmux-test-lock-nowait-{}", std::process::id());
+        let held = lock_session(&session, Duration::ZERO)
+            .unwrap()
+            .expect("first lock");
+
+        let started = Instant::now();
+        assert!(
+            lock_session(&session, Duration::ZERO).is_err(),
+            "a held lock must be refused"
+        );
+        assert!(
+            started.elapsed() < LOCK_WAIT,
+            "a zero wait must return immediately, not retry"
+        );
+
+        drop(held);
+        fs::remove_file(lock_path(&session).unwrap()).ok();
     }
 }
