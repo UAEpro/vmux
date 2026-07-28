@@ -740,7 +740,7 @@ impl Server {
         );
 
         #[cfg(unix)]
-        let session_lock = paths::try_lock_session(session_name)?;
+        let session_lock = paths::lock_session(session_name, paths::LOCK_WAIT)?;
 
         // Read once at start; `normalized()` clamps scrollback_bytes.
         let config = crate::config::load().unwrap_or_default().normalized();
@@ -5432,7 +5432,7 @@ impl Server {
     /// "not running" while the flock is still held for the response-flush grace
     /// period. Without an explicit unlock, an `ensure_running` issued in that
     /// window (the restore phase of `vmux smoke` does exactly this) spawns a
-    /// daemon that fails `try_lock_session` and dies — "vmux daemon helper
+    /// daemon that fails to take the session lock and dies — "vmux daemon helper
     /// exited with exit status: 0".
     #[cfg(unix)]
     fn release_session_lock(&self) {
@@ -8470,7 +8470,7 @@ mod tests {
 
         // While the daemon holds the lock, a successor must be refused.
         assert!(
-            paths::try_lock_session(session.as_str()).is_err(),
+            paths::lock_session(session.as_str(), Duration::ZERO).is_err(),
             "second lock while daemon holds it should fail"
         );
 
@@ -8479,7 +8479,7 @@ mod tests {
         server.release_session_lock();
 
         assert!(
-            paths::try_lock_session(session.as_str()).is_ok(),
+            paths::lock_session(session.as_str(), Duration::ZERO).is_ok(),
             "successor must acquire the lock as soon as shutdown released it"
         );
     }
