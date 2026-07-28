@@ -307,7 +307,20 @@ pub fn lock_session(session: &str, wait: Duration) -> Result<Option<std::fs::Fil
         if rc == 0 {
             break;
         }
-        if Instant::now() >= deadline {
+        // Only EWOULDBLOCK/EAGAIN mean "held by someone else". Any other errno
+        // (permissions, bad fd, …) is permanent — spinning for LOCK_WAIT would
+        // just delay a real failure and report it as "already locked".
+        let err = std::io::Error::last_os_error();
+        let retryable = matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        );
+        if !retryable {
+            return Err(err)
+                .with_context(|| format!("flock exclusive on session lock {}", path.display()));
+        }
+        // Duration::ZERO must fail on the first contention without sleeping.
+        if wait.is_zero() || Instant::now() >= deadline {
             bail!(
                 "session {session:?} is already locked by another vmux daemon (lock {})",
                 path.display()
