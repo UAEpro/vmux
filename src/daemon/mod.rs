@@ -1752,9 +1752,12 @@ impl Server {
             }
             Request::Shutdown => {
                 self.port_registry.lock_or_recover().stop_all_forwards();
-                self.shutting_down
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.save()?;
+                // Final save first: `stop_saving` closes the door behind it, so
+                // no reader thread can re-create the state file once the
+                // cleanup below has removed this session's runtime files.
+                let saved = self.save();
+                self.stop_saving();
+                saved?;
                 self.log("daemon shutting down").ok();
                 // The relay serves this daemon; leaving it up means a phone
                 // holding a socket to a corpse. Its autostart record survives,
@@ -5445,6 +5448,23 @@ impl Server {
     #[cfg(not(unix))]
     fn release_session_lock(&self) {}
 
+    /// Stop persisting this session, for good.
+    ///
+    /// Saves are not only made by request threads: a pane's reader thread calls
+    /// `mark_exited` when its child dies, and that ends in a `save()`. So a
+    /// caller that cleans up a session's files (`Shutdown`, `vmux smoke`, a
+    /// test guard) races those threads — the state file gets re-created after
+    /// the delete and lingers as a phantom entry in `vmux sessions` forever.
+    ///
+    /// Taking `save_lock` here is what makes this a fence rather than a hint:
+    /// a save already in flight finishes first, and every later one sees the
+    /// flag (checked under the same lock) and does nothing.
+    fn stop_saving(&self) {
+        let _guard = self.save_lock.lock_or_recover();
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn save(&self) -> Result<()> {
         self.touch();
         // Hold save_lock across the ENTIRE save — snapshot capture through
@@ -5453,6 +5473,14 @@ impl Server {
         // would resurrect killed panes / drop new ones). The lock also gives
         // each save a unique temp name via the per-save counter below.
         let mut counter = self.save_lock.lock_or_recover();
+        // Past `stop_saving` the session's files are being (or have been)
+        // removed; writing now would resurrect them. See `stop_saving`.
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
         // Keep active-tab records in sync with live layout fields before
         // persisting (inactive tabs already hold their own layout).
         {
@@ -7530,10 +7558,17 @@ mod tests {
     /// 2. Cleanup was a bare statement at the end of the test body, so any
     ///    failing assertion panicked straight past it. The leaked `*.json` files
     ///    then showed up as phantom sessions in the developer's real `vmux ls`.
+    /// 3. Deleting the files was not enough on its own: a test that launches a
+    ///    pane leaves a reader thread that calls `mark_exited` → `save()` when
+    ///    the child dies, which wrote the state file back moments after cleanup.
+    ///    `server()` registers the server so `Drop` calls `stop_saving` first.
     ///
     /// Cleanup lives in `Drop` so it runs on the panicking path too.
     struct TestSession {
         name: String,
+        /// Servers loaded for this session, kept weakly so the guard never
+        /// keeps one alive on its own.
+        servers: std::cell::RefCell<Vec<std::sync::Weak<Server>>>,
     }
 
     impl TestSession {
@@ -7546,16 +7581,30 @@ mod tests {
                     std::process::id(),
                     unix_time()
                 ),
+                servers: std::cell::RefCell::new(Vec::new()),
             }
         }
 
         fn as_str(&self) -> &str {
             &self.name
         }
+
+        /// Load a daemon for this session whose saves stop when the guard drops.
+        /// Any test that launches a pane must get its server this way.
+        fn server(&self) -> Arc<Server> {
+            let server = Arc::new(Server::load(&self.name).expect("load test session"));
+            self.servers.borrow_mut().push(Arc::downgrade(&server));
+            server
+        }
     }
 
     impl Drop for TestSession {
         fn drop(&mut self) {
+            // Before the files go: silence anything still holding this server,
+            // or its next save re-creates what we are about to delete.
+            for server in self.servers.borrow().iter().filter_map(|s| s.upgrade()) {
+                server.stop_saving();
+            }
             for path in [
                 paths::state_path(&self.name).ok(),
                 paths::lock_path(&self.name).ok(),
@@ -8407,7 +8456,7 @@ mod tests {
         session.panes.insert("pane-1".to_string(), pane);
         fs::write(&state_path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
 
-        let server = Server::load(&session_name).unwrap();
+        let server = _guard.server();
         {
             let loaded = server.session.lock_or_recover();
             let pane = loaded.panes.get("pane-1").unwrap();
@@ -8417,7 +8466,6 @@ mod tests {
             assert_eq!(pane.scrollback, "old scrollback");
         }
 
-        let server = Arc::new(server);
         let restored = server.restore_saved_panes().unwrap();
         assert_eq!(restored, vec!["pane-1".to_string()]);
         assert!(server.panes.lock_or_recover().contains_key("pane-1"));
@@ -8430,9 +8478,9 @@ mod tests {
         assert_eq!(pane.scrollback, "old scrollback");
 
         // `printf` exits immediately. Wait for the reaper rather than accepting
-        // `Running | Exited`: that OR made the assertion unfalsifiable, and the
-        // reader thread's `mark_exited` calls `save()`, so ending the test while
-        // it is still in flight re-creates the state file after cleanup.
+        // `Running | Exited`: that OR made the assertion unfalsifiable. (The
+        // `mark_exited` → `save()` that lands here can no longer outlive the
+        // test — `TestSession::server` has the guard stop saves before cleanup.)
         let exited = (0..200).any(|_| {
             let done = matches!(
                 server.snapshot(false).unwrap().panes["pane-1"].status,
@@ -8455,6 +8503,46 @@ mod tests {
         }
         server.cleanup_runtime_files();
         let _ = state_path;
+    }
+
+    /// Cleaning up a session must be final. A pane's reader thread calls
+    /// `mark_exited` → `save()` when its child dies, so a child that exits just
+    /// after cleanup used to write the state file back — one phantom session in
+    /// the developer's real `vmux sessions` per test run, and the same hazard
+    /// for `vmux smoke` and `Shutdown`.
+    #[test]
+    fn a_pane_exiting_after_cleanup_cannot_resurrect_the_state_file() {
+        let state_path;
+        {
+            let session = TestSession::new("save-after-cleanup");
+            state_path = paths::state_path(session.as_str()).unwrap();
+            let server = session.server();
+            // Exits well after this block ends, so its save races the cleanup.
+            server
+                .new_pane(
+                    SplitDirection::Right,
+                    "sh -c 'sleep 0.2; printf gone'".to_string(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            server.save().unwrap();
+            assert!(
+                state_path.exists(),
+                "the session must have a state file to begin with"
+            );
+            // Guard drops here: stop saving, then remove the files.
+        }
+
+        for _ in 0..80 {
+            assert!(
+                !state_path.exists(),
+                "state file was re-created after cleanup: {}",
+                state_path.display()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// A successor daemon must be able to take the session lock as soon as the
@@ -9936,7 +10024,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         std::env::set_var("NO_COLOR", "1");
         std::env::set_var("FORCE_COLOR", "0");
 
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         // Print only the markers (empty if scrubbed) plus a sentinel so we
         // know the command ran.
         let cmd =
