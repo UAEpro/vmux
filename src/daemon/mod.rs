@@ -9939,12 +9939,13 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         let server = Arc::new(Server::load(session.as_str()).unwrap());
         // Print only the markers (empty if scrubbed) plus a sentinel so we
         // know the command ran.
-        let cmd = "sh -c 'printf \"child=[%s] session=[%s] claudecode=[%s] nocolor=[%s] SENTINEL\\n\" \
+        let cmd =
+            "sh -c 'printf \"child=[%s] session=[%s] claudecode=[%s] nocolor=[%s] SENTINEL\\n\" \
             \"${CLAUDE_CODE_CHILD_SESSION-}\" \
             \"${CLAUDE_CODE_SESSION_ID-}\" \
             \"${CLAUDECODE-}\" \
             \"${NO_COLOR-}\"'"
-            .to_string();
+                .to_string();
         let pane = server
             .new_pane(SplitDirection::Right, cmd, None, None, None)
             .unwrap();
