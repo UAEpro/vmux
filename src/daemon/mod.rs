@@ -1755,9 +1755,13 @@ impl Server {
                 // Final save first: `stop_saving` closes the door behind it, so
                 // no reader thread can re-create the state file once the
                 // cleanup below has removed this session's runtime files.
+                // Always tear down even if that save fails — otherwise the
+                // daemon is left alive with `shutting_down` set and no way out.
                 let saved = self.save();
                 self.stop_saving();
-                saved?;
+                if let Err(err) = &saved {
+                    self.log(&format!("shutdown save failed: {err:#}")).ok();
+                }
                 self.log("daemon shutting down").ok();
                 // The relay serves this daemon; leaving it up means a phone
                 // holding a socket to a corpse. Its autostart record survives,
@@ -1769,7 +1773,12 @@ impl Server {
                     thread::sleep(Duration::from_millis(50));
                     std::process::exit(0);
                 });
-                Ok(Response::empty())
+                // Process is exiting either way; still surface a save failure
+                // so the caller that asked for shutdown can log it.
+                Ok(match saved {
+                    Ok(()) => Response::empty(),
+                    Err(err) => Response::err(format!("{err:#}")),
+                })
             }
         }
     }
@@ -5466,7 +5475,6 @@ impl Server {
     }
 
     fn save(&self) -> Result<()> {
-        self.touch();
         // Hold save_lock across the ENTIRE save — snapshot capture through
         // rename — so two concurrent saves can't build snapshots out of order
         // and rename an older payload over a newer one (which after a crash
@@ -5475,12 +5483,15 @@ impl Server {
         let mut counter = self.save_lock.lock_or_recover();
         // Past `stop_saving` the session's files are being (or have been)
         // removed; writing now would resurrect them. See `stop_saving`.
+        // Gate under the lock (before `touch`) so a rejected save neither
+        // rewrites state nor wakes long-poll clients for a no-op write.
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return Ok(());
         }
+        self.touch();
         // Keep active-tab records in sync with live layout fields before
         // persisting (inactive tabs already hold their own layout).
         {
@@ -7623,7 +7634,7 @@ mod tests {
     #[test]
     fn handle_stream_returns_json_error_for_unknown_request() {
         let session = TestSession::new("decode");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         let (mut client, daemon) = UnixStream::pair().unwrap();
         let worker = {
             let server = Arc::clone(&server);
@@ -7652,7 +7663,7 @@ mod tests {
     #[test]
     fn idle_prompt_notification_does_not_demote_done() {
         let session = TestSession::new("idle-note");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             // Hook-authority agent (no screen manifest) — Claude/Codex status
@@ -7709,7 +7720,7 @@ mod tests {
     #[test]
     fn wait_panes_resolves_on_agent_status_and_rejects_unknown_status() {
         let session = TestSession::new("wait-status");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             let mut pane = Pane::new(
@@ -7773,7 +7784,7 @@ mod tests {
     #[test]
     fn snapshot_long_poll_wakes_on_generation_bump() {
         let session = TestSession::new("longpoll");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         let gen = server.generation();
         let waiter = {
             let server = Arc::clone(&server);
@@ -7838,7 +7849,7 @@ mod tests {
     #[test]
     fn record_agent_session_stores_id_once() {
         let session = TestSession::new("agent-session");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             let pane = Pane::new(
@@ -7872,7 +7883,7 @@ mod tests {
         // phone app's chat has nothing to read after a daemon restart.
         let session = TestSession::new("agent-transcript");
         {
-            let server = Arc::new(Server::load(session.as_str()).unwrap());
+            let server = session.server();
             {
                 let mut state = server.session.lock_or_recover();
                 let pane = Pane::new(
@@ -7889,7 +7900,7 @@ mod tests {
             server.record_agent_transcript(None, "/nope");
             server.save().unwrap();
         }
-        let reloaded = Server::load(session.as_str()).unwrap();
+        let reloaded = session.server();
         {
             let state = reloaded.session.lock_or_recover();
             assert_eq!(
@@ -7906,7 +7917,7 @@ mod tests {
         // Keeping the old path would show the *previous* chat in the new
         // session's pane, which is worse than showing nothing.
         let session = TestSession::new("agent-conv-swap");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut state = server.session.lock_or_recover();
             state.panes.insert(
@@ -7951,7 +7962,7 @@ mod tests {
         // for a status glyph, but it would make one pane serve another agent's
         // conversation. Guard lives in the Notify dispatch arm.
         let session = TestSession::new("agent-conv-guess");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut state = server.session.lock_or_recover();
             state.panes.insert(
@@ -7989,7 +8000,7 @@ mod tests {
     #[test]
     fn agent_chat_serves_items_and_tails_incrementally() {
         let session = TestSession::new("agent-chat");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         let transcript =
             std::env::temp_dir().join(format!("{}-transcript.jsonl", session.as_str()));
         fs::write(
@@ -8094,7 +8105,7 @@ mod tests {
         // "agent working" (no UserPromptSubmit title) was flipping ✅ → 🔄.
         // Uses a hook-authority agent (no screen manifest).
         let session = TestSession::new("late-busy");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             // Coding agent without a screen manifest (hooks remain authority).
@@ -8179,7 +8190,7 @@ mod tests {
     #[test]
     fn notify_dedupes_repeated_same_state_notifications() {
         let session = TestSession::new("notify-dedupe");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             for id in ["pane-1", "pane-2"] {
@@ -8254,7 +8265,7 @@ mod tests {
         // tab into the live view; setting active_pane alone leaves the pane
         // invisible (workspace.panes is the active tab's layout).
         let session = TestSession::new("jump-bg-tab");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             let ws = &mut session.workspaces[0];
@@ -8310,7 +8321,7 @@ mod tests {
     #[test]
     fn focus_pane_switches_workspace_and_tab() {
         let session = TestSession::new("focus-tab");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             // Second workspace with a single tab holding pane-9.
@@ -8398,7 +8409,7 @@ mod tests {
         session.panes.insert("pane-9".to_string(), orphan);
         fs::write(&state_path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
 
-        let server = Arc::new(Server::load(&session_name).unwrap());
+        let server = _guard.server();
         server.reap_orphan_panes().unwrap();
 
         let loaded = server.session.lock_or_recover();
@@ -8415,7 +8426,7 @@ mod tests {
     #[test]
     fn new_tab_pane_does_not_freeze_the_tab_title() {
         let _guard = TestSession::new("tabtitle");
-        let server = Arc::new(Server::load(_guard.as_str()).unwrap());
+        let server = _guard.server();
         let data = server.new_tab(None, None, None).unwrap();
         let pane_id = data
             .get("pane")
@@ -8554,7 +8565,7 @@ mod tests {
     #[test]
     fn shutdown_releases_the_session_lock_for_a_successor() {
         let session = TestSession::new("lock-release");
-        let server = Server::load(session.as_str()).unwrap();
+        let server = session.server();
 
         // While the daemon holds the lock, a successor must be refused.
         assert!(
@@ -8593,7 +8604,7 @@ mod tests {
     #[test]
     fn view_override_clamps_leases_and_never_persists() {
         let guard = TestSession::new("view-size");
-        let server = Server::load(guard.as_str()).unwrap();
+        let server = guard.server();
         {
             let mut session = server.session.lock_or_recover();
             let mut pane = Pane::new("pane-1".into(), "sh".into(), SplitDirection::Right);
@@ -8732,7 +8743,7 @@ mod tests {
     #[test]
     fn mutating_requests_bump_the_generation_counter() {
         let session = TestSession::new("generation");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
 
         let mutations: Vec<(&str, Request)> = vec![
             (
@@ -8807,7 +8818,7 @@ mod tests {
         session.panes.insert("pane-1".to_string(), pane);
         fs::write(&state_path, serde_json::to_vec_pretty(&session).unwrap()).unwrap();
 
-        let server = Arc::new(Server::load(&session_name).unwrap());
+        let server = _guard.server();
         server.restore_saved_panes().unwrap();
         // The restored runtime is keyed bare (no tabs yet).
         assert!(server.panes.lock_or_recover().contains_key("pane-1"));
@@ -9088,7 +9099,7 @@ mod tests {
     #[test]
     fn pane_size_sync_uses_single_attach_owner() {
         let session = TestSession::new("size-owner");
-        let server = Server::load(session.as_str()).unwrap();
+        let server = session.server();
         server
             .resize_ptys(BTreeMap::new(), Some("desktop".to_string()), true)
             .unwrap();
@@ -9365,7 +9376,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
     #[test]
     fn turn_complete_notification_does_not_raise_attention() {
         let session = TestSession::new("turn-complete");
-        let server = Arc::new(Server::load(session.as_str()).unwrap());
+        let server = session.server();
         {
             let mut session = server.session.lock_or_recover();
             let mut pane = Pane::new(
@@ -9721,7 +9732,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         let state_path = paths::state_path(&session_name).unwrap();
         fs::write(&state_path, b"{ this is not valid json").unwrap();
 
-        let server = Server::load(&session_name).unwrap();
+        let server = _guard.server();
         {
             let session = server.session.lock_or_recover();
             assert_eq!(session.name, session_name);
@@ -9784,7 +9795,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         // Light path clears heavy strings; persist/full path must refill them.
         let _guard = TestSession::new("persist");
         let session_name = _guard.as_str().to_string();
-        let server = Server::load(&session_name).unwrap();
+        let server = _guard.server();
         {
             let mut panes = server.panes.lock_or_recover();
             let mut runtime = PaneRuntime {
@@ -9862,7 +9873,7 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
 
         // Phase 1: live daemon with output only in the runtime deque.
         {
-            let server = Server::load(&session_name).unwrap();
+            let server = _guard.server();
             {
                 let mut session = server.session.lock_or_recover();
                 let mut pane =
@@ -9939,18 +9950,9 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
 
         // Phase 2: cold start from disk (lock re-acquired after drop).
         {
-            // Concurrent tests that spawn PTY children can briefly inherit
-            // this session's flock fd (flock lives until every duplicated fd
-            // closes), so the re-acquire may need a few retries under a
-            // parallel test run.
-            let server = (0..50)
-                .find_map(|attempt| {
-                    if attempt > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Server::load(&session_name).ok()
-                })
-                .expect("re-acquire session lock after drop");
+            // `Server::load` waits out an inherited flock (LOCK_WAIT). Register
+            // with the guard so a late save cannot resurrect the state file.
+            let server = _guard.server();
             let loaded = server.session.lock_or_recover();
             let pane = loaded.panes.get("pane-1").expect("pane after reload");
             assert!(
