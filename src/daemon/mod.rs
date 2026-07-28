@@ -34,13 +34,19 @@ use view_size::{
     upsert_override, ViewOverride,
 };
 
-/// Parent-agent session markers. Coding agents (Claude Code, Codex companion,
-/// …) inject these into their process tree so nested launches know they are
-/// children. If the daemon inherits them (started from inside an agent
-/// session), every pane shell inherits them too — and every `claude` started
-/// in a pane silently disables transcript writing ("Transcript saving is off —
-/// inherited CLAUDE_CODE_CHILD_SESSION marker"). Same class of leak as
-/// [`VMUX_DAEMONIZE`](start_detached_or_daemonize).
+/// Env the daemon must not hand to pane shells (or keep in its own process).
+///
+/// Two families leak in when the daemon is started from inside an agent:
+///
+/// 1. **Parent session markers** (Claude Code, Codex companion, …). Nested
+///    `claude` then disables transcript writing ("Transcript saving is off —
+///    inherited CLAUDE_CODE_CHILD_SESSION marker").
+/// 2. **Color / TTY suppression** that agent hosts set so tool output stays
+///    plain (`NO_COLOR=1`, `FORCE_COLOR=0`, `CLICOLOR=0`, …). Pane shells
+///    inherit those and Claude Code (and most TUIs) render monochrome even
+///    though we pin `TERM`/`COLORTERM` for truecolor.
+///
+/// Same class of leak as [`VMUX_DAEMONIZE`](start_detached_or_daemonize).
 const INHERITED_AGENT_ENV: &[&str] = &[
     // Claude Code
     "CLAUDECODE",
@@ -53,6 +59,16 @@ const INHERITED_AGENT_ENV: &[&str] = &[
     "CODEX_COMPANION_TRANSCRIPT_PATH",
     // Generic agent tag some launchers inject
     "AI_AGENT",
+    // Color / interactive-TTY suppression from agent/CI hosts. Presence of
+    // NO_COLOR alone is enough for Claude Code to skip ANSI; FORCE_COLOR=0 /
+    // CLICOLOR=0 do the same for other tools.
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "CARGO_TERM_COLOR",
+    "NPM_CONFIG_COLOR",
+    "PIP_NO_COLOR",
 ];
 
 /// Drop parent-agent session markers from *this* process so anything we later
@@ -9871,12 +9887,16 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
 
     #[test]
     fn scrub_inherited_agent_env_drops_claude_child_session_markers() {
-        // Simulate a daemon that was started from inside Claude Code.
+        // Simulate a daemon that was started from inside Claude Code / an
+        // agent host that also forces plain (no-color) tool output.
         std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "parent-session-id");
         std::env::set_var("CLAUDECODE", "1");
         std::env::set_var("CLAUDE_PID", "999");
         std::env::set_var("CODEX_COMPANION_SESSION_ID", "parent-session-id");
+        std::env::set_var("NO_COLOR", "1");
+        std::env::set_var("FORCE_COLOR", "0");
+        std::env::set_var("CLICOLOR", "0");
         // Unrelated var must survive.
         std::env::set_var("VMUX_SCRUB_TEST_KEEP", "yes");
 
@@ -9890,6 +9910,12 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         assert!(std::env::var_os("CLAUDECODE").is_none());
         assert!(std::env::var_os("CLAUDE_PID").is_none());
         assert!(std::env::var_os("CODEX_COMPANION_SESSION_ID").is_none());
+        assert!(
+            std::env::var_os("NO_COLOR").is_none(),
+            "NO_COLOR must be scrubbed so pane TUIs keep color"
+        );
+        assert!(std::env::var_os("FORCE_COLOR").is_none());
+        assert!(std::env::var_os("CLICOLOR").is_none());
         assert_eq!(
             std::env::var("VMUX_SCRUB_TEST_KEEP").ok().as_deref(),
             Some("yes"),
@@ -9898,23 +9924,26 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         std::env::remove_var("VMUX_SCRUB_TEST_KEEP");
     }
 
-    /// Pane PTYs must not inherit Claude's child-session markers even when the
-    /// daemon process itself still carries them (upgrade mid-session).
+    /// Pane PTYs must not inherit Claude's child-session markers or host
+    /// color-suppression vars even when the daemon process still carries them.
     #[test]
     fn pane_pty_scrubs_claude_child_session_marker() {
         let session = TestSession::new("scrub-claude");
-        // Poison *this* process the way a Claude-spawned daemon is poisoned.
+        // Poison *this* process the way a Claude/agent-spawned daemon is.
         std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "parent-session-id");
         std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("NO_COLOR", "1");
+        std::env::set_var("FORCE_COLOR", "0");
 
         let server = Arc::new(Server::load(session.as_str()).unwrap());
         // Print only the markers (empty if scrubbed) plus a sentinel so we
-        // know the command ran. Use env - not a shell that re-exports.
-        let cmd = "sh -c 'printf \"child=[%s] session=[%s] claudecode=[%s] SENTINEL\\n\" \
+        // know the command ran.
+        let cmd = "sh -c 'printf \"child=[%s] session=[%s] claudecode=[%s] nocolor=[%s] SENTINEL\\n\" \
             \"${CLAUDE_CODE_CHILD_SESSION-}\" \
             \"${CLAUDE_CODE_SESSION_ID-}\" \
-            \"${CLAUDECODE-}\"'"
+            \"${CLAUDECODE-}\" \
+            \"${NO_COLOR-}\"'"
             .to_string();
         let pane = server
             .new_pane(SplitDirection::Right, cmd, None, None, None)
@@ -9953,9 +9982,14 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
             "CLAUDECODE must not reach the pane: {last_output}"
         );
         assert!(
+            !last_output.contains("nocolor=[1]"),
+            "NO_COLOR must not reach the pane (kills Claude colors): {last_output}"
+        );
+        assert!(
             last_output.contains("child=[]")
                 && last_output.contains("session=[]")
-                && last_output.contains("claudecode=[]"),
+                && last_output.contains("claudecode=[]")
+                && last_output.contains("nocolor=[]"),
             "markers should expand empty: {last_output}"
         );
 
@@ -9963,6 +9997,8 @@ LISTEN 0 128 [::1]:3000 [::]:* users:(("python",pid=1234,fd=4))
         std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
         std::env::remove_var("CLAUDE_CODE_SESSION_ID");
         std::env::remove_var("CLAUDECODE");
+        std::env::remove_var("NO_COLOR");
+        std::env::remove_var("FORCE_COLOR");
 
         if let Some(mut runtime) = server.panes.lock_or_recover().remove(&pane_id) {
             if let Some(mut killer) = runtime.killer.take() {
