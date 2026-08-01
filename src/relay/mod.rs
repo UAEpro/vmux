@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,10 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:4399";
 const DEFAULT_FPS: u32 = 15;
 const DEFAULT_IDLE_FPS: u32 = 5;
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+/// Relay health is a local/LAN probe on attach and in Settings. Never inherit
+/// the OS TCP connect timeout: a black-holed Tailscale route can otherwise
+/// block the UI startup path for tens of seconds on macOS.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Cap on a `chat.send` message (paste-bomb guard).
 const CHAT_SEND_MAX_BYTES: usize = 16 * 1024;
 /// Per-connection floor between `chat.fetch` calls: each one is a daemon
@@ -892,8 +896,28 @@ fn ureq_get_health(url: &str) -> Result<String> {
         .split_once('/')
         .map(|(h, p)| (h, format!("/{p}")))
         .unwrap_or((url, "/".into()));
-    let mut stream = TcpStream::connect(hostport)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let addresses = hostport
+        .to_socket_addrs()
+        .with_context(|| format!("resolve relay health address {hostport}"))?;
+    let mut last_error = None;
+    let mut stream = addresses
+        .filter_map(
+            |address| match TcpStream::connect_timeout(&address, HEALTH_PROBE_TIMEOUT) {
+                Ok(stream) => Some(stream),
+                Err(err) => {
+                    last_error = Some(err);
+                    None
+                }
+            },
+        )
+        .next()
+        .ok_or_else(|| {
+            last_error
+                .map(anyhow::Error::from)
+                .unwrap_or_else(|| anyhow!("no address resolved for relay health probe"))
+        })?;
+    stream.set_read_timeout(Some(HEALTH_PROBE_TIMEOUT))?;
+    stream.set_write_timeout(Some(HEALTH_PROBE_TIMEOUT))?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n"
@@ -3119,6 +3143,26 @@ fn port_of(listen: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_probe_times_out_when_a_listener_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(700));
+        });
+
+        let started = Instant::now();
+        let result = ureq_get_health(&format!("http://{address}/v1/health"));
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "a stalled health endpoint must time out");
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "health probe blocked attach for {elapsed:?}"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn replay_scrollback_returns_history_above_the_screen_oldest_first() {
