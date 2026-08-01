@@ -51,7 +51,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::cli::SplitDirection;
 use crate::config::LmuxConfig;
-use crate::input::{key_to_input, parse_key_binding};
+#[cfg(test)]
+use crate::input::key_to_input;
+use crate::input::{key_to_input_with_modes, parse_key_binding};
 use crate::model::{LayoutNode, Session, SplitAxis};
 use crate::paths;
 use crate::protocol::{self, PaneSize, Request};
@@ -1053,6 +1055,21 @@ impl Ui {
                 self.pane_size_control_requested = true;
                 if self.prefix {
                     self.prefix = false;
+                    // Like other terminal multiplexers, prefix + prefix sends
+                    // the literal prefix key to the child. Fullscreen apps
+                    // commonly bind Ctrl-b, so swallowing it makes their
+                    // input surface incomplete.
+                    if self.is_prefix_key(key.code, key.modifiers) {
+                        if let Some(pane) = self.active_pane() {
+                            if let Some(data) =
+                                self.key_input_for_pane(&pane, key.code, key.modifiers)
+                            {
+                                self.note_typing();
+                                self.queue_input(pane, data)?;
+                            }
+                        }
+                        return Ok(false);
+                    }
                     // Prefix keys that map to a command-palette action are driven
                     // by the shared `prefix_action_bindings` table so the palette
                     // shortcut column can never drift from the real binding. The
@@ -1237,8 +1254,8 @@ impl Ui {
                     self.prefix = true;
                     return Ok(false);
                 }
-                if let Some(data) = key_to_input(key.code, key.modifiers) {
-                    if let Some(pane) = self.active_pane() {
+                if let Some(pane) = self.active_pane() {
+                    if let Some(data) = self.key_input_for_pane(&pane, key.code, key.modifiers) {
                         self.note_typing();
                         self.queue_input(pane, data)?;
                     }
@@ -1407,9 +1424,19 @@ impl Ui {
                     self.note_typing();
                     // Paste is already a bulk payload — flush any keystroke batch first.
                     self.flush_input_batch()?;
+                    let data = if self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.panes.get(&pane))
+                        .is_some_and(|pane| pane.bracketed_paste_mode)
+                    {
+                        bracketed_paste(&text)
+                    } else {
+                        text
+                    };
                     self.rpc(&Request::Input {
                         pane: Some(pane),
-                        data: text,
+                        data,
                         submit: false,
                     })?;
                 }
@@ -2935,6 +2962,24 @@ impl Ui {
             .iter()
             .find(|workspace| workspace.id == snapshot.active_workspace)
             .and_then(|workspace| workspace.active_pane.clone())
+    }
+
+    fn key_input_for_pane(
+        &self,
+        pane_id: &str,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<String> {
+        let pane = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.panes.get(pane_id));
+        key_to_input_with_modes(
+            code,
+            modifiers,
+            pane.is_some_and(|pane| pane.application_cursor_mode),
+            pane.is_some_and(|pane| pane.application_keypad_mode),
+        )
     }
 
     fn scroll_active(&mut self, delta: isize) {
@@ -8275,6 +8320,14 @@ fn sgr_mouse_sequence(button: MouseButtonCode, x: u16, y: u16, pressed: bool) ->
     format!("\x1b[<{code};{x};{y}{suffix}")
 }
 
+fn bracketed_paste(text: &str) -> String {
+    let mut data = String::with_capacity(text.len().saturating_add(12));
+    data.push_str("\x1b[200~");
+    data.push_str(text);
+    data.push_str("\x1b[201~");
+    data
+}
+
 fn pane_mouse_input(
     pane: &crate::model::Pane,
     button: MouseButtonCode,
@@ -10051,6 +10104,14 @@ mod tests {
         assert_eq!(
             pane_mouse_input(&pane, MouseButtonCode::WheelUp, 4, 2, true).as_deref(),
             Some("\x1b[<64;4;2M")
+        );
+    }
+
+    #[test]
+    fn wraps_host_paste_for_child_bracketed_paste_mode() {
+        assert_eq!(
+            bracketed_paste("first\nsecond"),
+            "\x1b[200~first\nsecond\x1b[201~"
         );
     }
 

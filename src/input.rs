@@ -90,6 +90,21 @@ fn parse_key_code(key: &str) -> Result<KeyCode> {
 }
 
 pub fn key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
+    key_to_input_with_modes(code, modifiers, false, false)
+}
+
+/// Encode a host key according to the input modes negotiated by the child.
+///
+/// `application_cursor` is DECCKM (DECSET 1). In that mode xterm sends SS3
+/// for unmodified arrows and Home/End; modified variants remain CSI sequences.
+/// `application_keypad` currently affects `KeypadBegin`, the keypad key that
+/// crossterm can distinguish portably from its non-keypad counterpart.
+pub fn key_to_input_with_modes(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    application_cursor: bool,
+    application_keypad: bool,
+) -> Option<String> {
     let mut data = match code {
         KeyCode::Enter => modified_other_key(13, modifiers).unwrap_or_else(|| "\r".to_string()),
         KeyCode::Backspace => {
@@ -102,16 +117,18 @@ pub fn key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
         KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => "\x1b[Z".to_string(),
         KeyCode::Tab => "\t".to_string(),
         KeyCode::Esc => "\x1b".to_string(),
-        KeyCode::Left => modified_arrow("D", modifiers),
-        KeyCode::Right => modified_arrow("C", modifiers),
-        KeyCode::Up => modified_arrow("A", modifiers),
-        KeyCode::Down => modified_arrow("B", modifiers),
-        KeyCode::Home => modified_csi("H", modifiers),
-        KeyCode::End => modified_csi("F", modifiers),
+        KeyCode::Left => cursor_key("D", modifiers, application_cursor),
+        KeyCode::Right => cursor_key("C", modifiers, application_cursor),
+        KeyCode::Up => cursor_key("A", modifiers, application_cursor),
+        KeyCode::Down => cursor_key("B", modifiers, application_cursor),
+        KeyCode::Home => cursor_key("H", modifiers, application_cursor),
+        KeyCode::End => cursor_key("F", modifiers, application_cursor),
         KeyCode::PageUp => modified_tilde(5, modifiers),
         KeyCode::PageDown => modified_tilde(6, modifiers),
         KeyCode::Insert => modified_tilde(2, modifiers),
         KeyCode::Delete => modified_tilde(3, modifiers),
+        KeyCode::KeypadBegin if application_keypad && modifiers.is_empty() => "\x1bOu".to_string(),
+        KeyCode::KeypadBegin => modified_csi("E", modifiers),
         KeyCode::F(n) => function_key(n, modifiers)?,
         KeyCode::Char(ch) => char_to_input(ch, modifiers)?,
         _ => return None,
@@ -120,6 +137,14 @@ pub fn key_to_input(code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
         data.insert(0, '\x1b');
     }
     Some(data)
+}
+
+fn cursor_key(final_byte: &str, modifiers: KeyModifiers, application: bool) -> String {
+    if application && modifier_code(modifiers).is_none() {
+        format!("\x1bO{final_byte}")
+    } else {
+        modified_csi(final_byte, modifiers)
+    }
 }
 
 fn char_to_input(ch: char, modifiers: KeyModifiers) -> Option<String> {
@@ -141,14 +166,6 @@ fn ctrl_char(ch: char) -> Option<u8> {
         '_' | '7' | '/' => Some(31),
         '8' | '?' => Some(127),
         _ => None,
-    }
-}
-
-fn modified_arrow(final_byte: &str, modifiers: KeyModifiers) -> String {
-    if let Some(code) = modifier_code(modifiers) {
-        format!("\x1b[1;{code}{final_byte}")
-    } else {
-        format!("\x1b[{final_byte}")
     }
 }
 
@@ -269,6 +286,27 @@ mod tests {
         assert_eq!(
             key_to_input(KeyCode::F(5), KeyModifiers::empty()).as_deref(),
             Some("\x1b[15~")
+        );
+    }
+
+    #[test]
+    fn application_cursor_mode_uses_ss3_for_unmodified_navigation() {
+        assert_eq!(
+            key_to_input_with_modes(KeyCode::Up, KeyModifiers::empty(), true, false).as_deref(),
+            Some("\x1bOA")
+        );
+        assert_eq!(
+            key_to_input_with_modes(KeyCode::Home, KeyModifiers::empty(), true, false).as_deref(),
+            Some("\x1bOH")
+        );
+        // xterm keeps modified cursor keys in CSI form under DECCKM.
+        assert_eq!(
+            key_to_input_with_modes(KeyCode::Right, KeyModifiers::CONTROL, true, false).as_deref(),
+            Some("\x1b[1;5C")
+        );
+        assert_eq!(
+            key_to_input_with_modes(KeyCode::Down, KeyModifiers::empty(), false, false).as_deref(),
+            Some("\x1b[B")
         );
     }
 
