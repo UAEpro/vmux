@@ -2354,8 +2354,19 @@ impl Server {
                     Err(_) => break,
                 }
             }
-            let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
-            output_server.mark_exited(&runtime_key, &pane_id, generation, exit_code);
+            let exit_status = child.wait().ok();
+            let exit_code = exit_status.as_ref().map(|status| status.exit_code() as i32);
+            let exit_signal = exit_status
+                .as_ref()
+                .and_then(|status| status.signal())
+                .map(str::to_string);
+            output_server.mark_exited(
+                &runtime_key,
+                &pane_id,
+                generation,
+                exit_code,
+                exit_signal.as_deref(),
+            );
         });
 
         Ok(())
@@ -4846,12 +4857,9 @@ impl Server {
         pane_id: &str,
         generation: u64,
         exit_code: Option<i32>,
+        exit_signal: Option<&str>,
     ) {
-        let agent_status = if exit_code == Some(0) {
-            AgentStatus::Done
-        } else {
-            AgentStatus::Error
-        };
+        let mut agent_status = AgentStatus::Error;
         let mut runtime_pane = None;
         {
             let mut panes = self.panes.lock_or_recover();
@@ -4859,6 +4867,8 @@ impl Server {
                 if runtime.generation != generation {
                     return;
                 }
+                agent_status =
+                    pane_exit_agent_status(&runtime.pane.command, exit_code, exit_signal);
                 runtime.pane.status = PaneStatus::Exited;
                 runtime.pane.exit_code = exit_code;
                 runtime.pane.pid = None;
@@ -5848,6 +5858,72 @@ fn update_pane_terminal_modes(pane: &mut Pane, screen: &vt100::Screen) {
 
 fn default_shell() -> String {
     crate::config::resolve_default_shell()
+}
+
+/// Whether `command` launches an interactive shell rather than running a shell
+/// script or `-c` command. A shell attached directly to a PTY is interactive
+/// even without an explicit `-i` flag.
+fn is_interactive_shell_command(command: &str) -> bool {
+    let Ok(argv) = shell_words::split(command) else {
+        return false;
+    };
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let base = program
+        .rsplit('/')
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if !matches!(
+        base.as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "ksh"
+            | "mksh"
+            | "pdksh"
+            | "csh"
+            | "tcsh"
+            | "nu"
+            | "xonsh"
+    ) {
+        return false;
+    }
+
+    // A positional argument is a script. `-c` may be standalone or combined
+    // with other short flags (`-lc`). Other flags (`-l`, `-i`, `-f`, …) still
+    // describe the interactive shell itself.
+    argv.iter().skip(1).all(|arg| {
+        if !arg.starts_with('-') || arg == "-" {
+            return false;
+        }
+        if arg == "--command" {
+            return false;
+        }
+        arg.starts_with("--") || !arg.trim_start_matches('-').contains('c')
+    })
+}
+
+/// Map process termination to the activity status shown in pane chrome.
+///
+/// `exit` without an explicit code inherits a shell's previous status. After
+/// Ctrl-C that is commonly 130, but closing an interactive shell is still a
+/// normal pane completion, not a failed task. Preserve errors for shells that
+/// were actually terminated by a signal and for non-shell commands.
+fn pane_exit_agent_status(
+    command: &str,
+    exit_code: Option<i32>,
+    exit_signal: Option<&str>,
+) -> AgentStatus {
+    if exit_code == Some(0)
+        || (exit_code.is_some() && exit_signal.is_none() && is_interactive_shell_command(command))
+    {
+        AgentStatus::Done
+    } else {
+        AgentStatus::Error
+    }
 }
 
 mod browser;
@@ -7328,6 +7404,37 @@ fn scrollback_limit(limit_bytes: Option<usize>) -> usize {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn interactive_shell_detection_excludes_scripts_and_command_mode() {
+        assert!(is_interactive_shell_command("/bin/zsh"));
+        assert!(is_interactive_shell_command("bash -l"));
+        assert!(is_interactive_shell_command("fish -i"));
+        assert!(!is_interactive_shell_command("zsh -c false"));
+        assert!(!is_interactive_shell_command("bash -lc 'exit 7'"));
+        assert!(!is_interactive_shell_command("bash script.sh"));
+        assert!(!is_interactive_shell_command("cargo test"));
+    }
+
+    #[test]
+    fn inherited_nonzero_shell_exit_is_completion_not_error() {
+        assert_eq!(
+            pane_exit_agent_status("/bin/zsh", Some(130), None),
+            AgentStatus::Done
+        );
+        assert_eq!(
+            pane_exit_agent_status("/bin/zsh", Some(1), Some("Hangup")),
+            AgentStatus::Error
+        );
+        assert_eq!(
+            pane_exit_agent_status("sh -c false", Some(1), None),
+            AgentStatus::Error
+        );
+        assert_eq!(
+            pane_exit_agent_status("cargo test", Some(0), None),
+            AgentStatus::Done
+        );
+    }
 
     #[test]
     fn terminal_mode_tracker_handles_split_alternate_scroll_sequences() {
