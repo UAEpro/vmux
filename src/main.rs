@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
 #[cfg(test)]
@@ -39,6 +40,7 @@ fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Attach) {
         Command::Attach => {
+            guard_recursive_attach(session)?;
             daemon::ensure_running(session)?;
             ui::attach(session)
         }
@@ -670,6 +672,24 @@ fn main() -> Result<()> {
         Command::Smoke { keep } => smoke(keep),
         Command::Stop => stop_session(session),
     }
+}
+
+/// Refuse only the unsafe case: an attach client rendered inside a pane of the
+/// exact same session. Its frames become pane output, which changes the session
+/// and triggers another frame forever. Different vmux sessions remain valid
+/// nested TUIs, and every non-attach subcommand remains available in a pane.
+fn guard_recursive_attach(session: &str) -> Result<()> {
+    let target = paths::socket_path(session)?;
+    if is_recursive_attach(&target, std::env::var_os("VMUX_SOCKET_PATH").as_deref()) {
+        anyhow::bail!(
+            "cannot attach vmux session {session:?} inside itself: this creates a recursive render loop and consumes CPU\nuse `vmux --session <different-name>` for a nested session, or run a vmux subcommand"
+        );
+    }
+    Ok(())
+}
+
+fn is_recursive_attach(target: &Path, inherited_socket: Option<&std::ffi::OsStr>) -> bool {
+    inherited_socket.is_some_and(|socket| !socket.is_empty() && Path::new(socket) == target)
 }
 
 fn relay_command(session: &str, command: RelayCommand) -> Result<()> {
@@ -3427,6 +3447,21 @@ fn print_response(response: protocol::Response) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn recursive_attach_only_matches_the_same_socket() {
+        let current = Path::new("/tmp/vmux-501/vmux/default.sock");
+        assert!(is_recursive_attach(current, Some(current.as_os_str())));
+        assert!(!is_recursive_attach(
+            Path::new("/tmp/vmux-501/vmux/inner.sock"),
+            Some(current.as_os_str())
+        ));
+        assert!(!is_recursive_attach(current, None));
+        assert!(!is_recursive_attach(
+            current,
+            Some(std::ffi::OsStr::new(""))
+        ));
+    }
 
     #[test]
     fn command_on_path_requires_executable_file() {
