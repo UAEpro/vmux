@@ -1012,6 +1012,18 @@ pub struct Pane {
     pub mouse_protocol_mode: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mouse_protocol_encoding: String,
+    /// The child enabled DECCKM (DECSET 1), so unmodified cursor and
+    /// Home/End keys must use SS3 sequences instead of their normal CSI form.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub application_cursor_mode: bool,
+    /// The child enabled application-keypad mode (DECKPAM). Kept in the
+    /// snapshot so attach clients can honor keypad input as support expands.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub application_keypad_mode: bool,
+    /// The child enabled bracketed paste (DECSET 2004). Host paste events must
+    /// be wrapped in begin/end markers while this is active.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bracketed_paste_mode: bool,
     /// The child enabled xterm alternate-scroll mode (DECSET 1007) while its
     /// alternate screen is active. Terminals translate wheel events into
     /// cursor-up/down input in this mode instead of scrolling host history.
@@ -1080,6 +1092,9 @@ impl Pane {
             output_formatted: String::new(),
             mouse_protocol_mode: String::new(),
             mouse_protocol_encoding: String::new(),
+            application_cursor_mode: false,
+            application_keypad_mode: false,
+            bracketed_paste_mode: false,
             alternate_scroll_mode: false,
             cursor_row: None,
             cursor_col: None,

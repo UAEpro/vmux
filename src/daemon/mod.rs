@@ -691,10 +691,10 @@ impl Server {
                         // viewer survives a daemon restart. (save() also strips
                         // them — this is the belt to that brace.)
                         pane.view_size = None;
-                        // DECSET 1007 belongs to the old child terminal. A
-                        // restored pane starts a new PTY and must negotiate it
-                        // again before the UI forwards wheel events.
-                        pane.alternate_scroll_mode = false;
+                        // Input modes belong to the old child terminal. A
+                        // restored pane starts a new PTY and must negotiate
+                        // them again before attach encodes keys/mouse/paste.
+                        clear_pane_terminal_modes(pane);
                     }
                     session.ensure_workspace();
                     // Workspace → Tab → Pane hierarchy (and collapse legacy
@@ -2261,7 +2261,7 @@ impl Server {
         pane.output.clear();
         pane.scrollback.clear();
         pane.scrollback_formatted.clear();
-        pane.alternate_scroll_mode = false;
+        clear_pane_terminal_modes(pane);
         pane.updated_at = unix_time();
 
         let pane_id = pane.id.clone();
@@ -4628,6 +4628,9 @@ impl Server {
                     pane.screen_cols = light.screen_cols;
                     pane.mouse_protocol_mode = light.mouse_protocol_mode.clone();
                     pane.mouse_protocol_encoding = light.mouse_protocol_encoding.clone();
+                    pane.application_cursor_mode = light.application_cursor_mode;
+                    pane.application_keypad_mode = light.application_keypad_mode;
+                    pane.bracketed_paste_mode = light.bracketed_paste_mode;
                     pane.alternate_scroll_mode = light.alternate_scroll_mode;
                     pane.status = light.status.clone();
                     pane.pid = light.pid;
@@ -4877,7 +4880,7 @@ impl Server {
                 runtime.pane.notification_message = None;
                 runtime.pane.notification_color = None;
                 runtime.terminal_modes = TerminalModeTracker::default();
-                runtime.pane.alternate_scroll_mode = false;
+                clear_pane_terminal_modes(&mut runtime.pane);
                 runtime.pane.updated_at = unix_time();
                 // Materialize final screen/scrollback into the pane record so
                 // save/restart keep history even when no full snapshot runs.
@@ -5518,7 +5521,7 @@ impl Server {
         // attached. Strip them; load() clears any that slip through.
         for pane in snapshot.panes.values_mut() {
             pane.view_size = None;
-            pane.alternate_scroll_mode = false;
+            clear_pane_terminal_modes(pane);
         }
         // Compact JSON: pretty-print was multi-MB and blocked request threads.
         let payload = serde_json::to_vec(&snapshot)?;
@@ -5854,6 +5857,18 @@ fn update_pane_terminal_modes(pane: &mut Pane, screen: &vt100::Screen) {
         vt100::MouseProtocolEncoding::Utf8 => "utf8".to_string(),
         vt100::MouseProtocolEncoding::Sgr => "sgr".to_string(),
     };
+    pane.application_cursor_mode = screen.application_cursor();
+    pane.application_keypad_mode = screen.application_keypad();
+    pane.bracketed_paste_mode = screen.bracketed_paste();
+}
+
+fn clear_pane_terminal_modes(pane: &mut Pane) {
+    pane.mouse_protocol_mode.clear();
+    pane.mouse_protocol_encoding.clear();
+    pane.application_cursor_mode = false;
+    pane.application_keypad_mode = false;
+    pane.bracketed_paste_mode = false;
+    pane.alternate_scroll_mode = false;
 }
 
 fn default_shell() -> String {
@@ -7493,7 +7508,8 @@ mod tests {
     #[test]
     fn clearing_parser_preserves_fullscreen_input_modes() {
         let mut parser = vt100::Parser::new(24, 80, 100);
-        parser.process(b"\x1b[?1049h\x1b[?1h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?25lvisible");
+        parser
+            .process(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?25lvisible");
         let mut modes = TerminalModeTracker::default();
         modes.process(b"\x1b[?1007h");
 
@@ -7512,6 +7528,17 @@ mod tests {
             screen.mouse_protocol_encoding(),
             vt100::MouseProtocolEncoding::Sgr
         );
+        let mut pane = Pane::new(
+            "pane-modes".to_string(),
+            "/bin/sh".to_string(),
+            SplitDirection::Right,
+        );
+        update_pane_terminal_modes(&mut pane, screen);
+        assert!(pane.application_cursor_mode);
+        assert!(pane.application_keypad_mode);
+        assert!(pane.bracketed_paste_mode);
+        assert_eq!(pane.mouse_protocol_mode, "press-release");
+        assert_eq!(pane.mouse_protocol_encoding, "sgr");
         assert!(alternate_scroll_active(
             &PaneStatus::Running,
             &modes,
