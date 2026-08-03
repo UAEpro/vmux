@@ -520,13 +520,28 @@ mod tests {
 
     #[test]
     fn native_cmdline_check_reads_process_arguments() {
-        let mut child = std::process::Command::new("sleep")
+        // Prefer an absolute path so PATH races on CI do not spawn a different
+        // binary. Retry briefly: /proc/<pid>/cmdline can lag spawn by a tick.
+        let sleep_bin = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| PathBuf::from(p).is_file())
+            .unwrap_or("sleep");
+        let mut child = std::process::Command::new(sleep_bin)
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
-        assert!(process_cmdline_contains(pid, "sleep"));
-        assert!(process_cmdline_contains(pid, "30"));
+        let saw = (0..50).any(|_| {
+            if process_cmdline_contains(pid, "sleep") && process_cmdline_contains(pid, "30") {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(
+            saw,
+            "cmdline for pid {pid} should include sleep and 30"
+        );
         assert!(!process_cmdline_contains(pid, "vmux-no-such-argument"));
         child.kill().ok();
         child.wait().ok();
