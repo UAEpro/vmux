@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.7.1 — 2026-08-03
+
+Patch release: macOS attach startup, terminal input modes, interactive
+shell exit chrome, and a guard against recursive same-session attach.
+Upgrade with the install one-liner, `cargo install vmux-tui`, or wait
+for the in-app update notice.
+
+### Fixed
+
+- **macOS attach could stall for many seconds** before the first frame.
+  Process liveness no longer depends on Linux `/proc` (`kill(pid, 0)`,
+  macOS starttime via `proc_pidinfo`, argv via `KERN_PROCARGS2`). Optional
+  relay ensure runs off the first-frame path, and relay health probes use
+  a 250 ms connect/read/write deadline so a black-holed Tailscale route
+  cannot block UI startup.
+- **Fullscreen apps (htop, Vim, lazygit) ignored negotiated input modes.**
+  Snapshots expose DECCKM application cursor keys, application keypad, and
+  bracketed paste; attach encodes unmodified arrows as SS3, wraps host
+  paste when requested, and **prefix+prefix** sends one literal prefix to
+  the child. Modes clear on pane exit/restart/restore.
+- **Interactive shell exit after Ctrl-C looked like an error.** zsh can
+  leave status 130; a later plain `exit` inherits it. Interactive shells
+  that exit without a signal now report **Done** (scripts, `-c`, and
+  signal-killed processes still report **Error**). The numeric exit code
+  is still stored for diagnostics.
+- **`vmux` inside a pane of the same session** spun CPU in a recursive
+  render loop. Attach now rejects attaching to the socket inherited as
+  `VMUX_SOCKET_PATH` and points at `vmux --session <other>` for a nested
+  session. Separate sessions and non-attach subcommands remain allowed.
+
 ## v0.7.0 — 2026-07-28
 
 Feature release: structured agent chat (host + phone), transcript/env
