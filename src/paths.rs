@@ -204,8 +204,8 @@ pub fn read_pid_file(path: &Path) -> Option<u32> {
     read_pid_record(path).map(|r| r.pid)
 }
 
-/// PID file record: `pid` on line 1, optional process starttime (jiffies) on line 2.
-/// Starttime prevents signalling a recycled PID after a crash.
+/// PID file record: `pid` on line 1, optional platform process start time on
+/// line 2. Start time prevents signalling a recycled PID after a crash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PidRecord {
     pub pid: u32,
@@ -227,16 +227,60 @@ pub fn write_pid_record(path: &Path, pid: u32) -> Result<()> {
 }
 
 pub fn process_exists(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    // `/proc` is not mounted on macOS.  `kill(pid, 0)` is the portable Unix
+    // liveness probe: it sends no signal and succeeds when the process exists
+    // and is visible to us.  EPERM also means the process exists, just that we
+    // are not allowed to signal it.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Linux `/proc/<pid>/stat` field 22 (starttime in clock ticks).
+#[cfg(target_os = "linux")]
 pub fn process_starttime(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm can contain spaces/parens: parse after the last `) `.
     let after_comm = stat.rsplit_once(") ").map(|(_, rest)| rest)?;
     let field = after_comm.split_whitespace().nth(19)?; // 22nd field overall → index 19 after comm
     field.parse().ok()
+}
+
+/// macOS process start time, in microseconds since the Unix epoch.
+///
+/// Keeping a start time in the pid record prevents a recycled pid from being
+/// signalled.  `proc_pidinfo` provides the same identity check on macOS that
+/// `/proc/<pid>/stat` provides on Linux.
+#[cfg(target_os = "macos")]
+pub fn process_starttime(pid: u32) -> Option<u64> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected as i32,
+        )
+    };
+    if read != expected as i32 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_starttime(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// True when `pid` is alive and matches the recorded starttime (if present).
@@ -250,7 +294,8 @@ pub fn process_matches_record(record: PidRecord) -> bool {
     }
 }
 
-/// Best-effort: does `/proc/<pid>/cmdline` look like a vmux daemon/relay?
+/// Best-effort: does a process argument look like a vmux daemon/relay?
+#[cfg(target_os = "linux")]
 pub fn process_cmdline_contains(pid: u32, needle: &str) -> bool {
     fs::read(format!("/proc/{pid}/cmdline"))
         .ok()
@@ -259,6 +304,85 @@ pub fn process_cmdline_contains(pid: u32, needle: &str) -> bool {
             text.contains(needle)
         })
         .unwrap_or(false)
+}
+
+/// Read argv through macOS's native `KERN_PROCARGS2` interface.
+///
+/// Only the executable path and the declared argv entries are searched.  The
+/// buffer also contains the process environment; searching the whole buffer
+/// could mistake an unrelated process carrying a `VMUX_*` variable for vmux
+/// and make the stop path signal the wrong pid.
+#[cfg(target_os = "macos")]
+pub fn process_cmdline_contains(pid: u32, needle: &str) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 || needle.is_empty() {
+        return false;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
+    let mut size = 0usize;
+    let size_rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size_rc != 0 || size < std::mem::size_of::<i32>() {
+        return false;
+    }
+    let mut bytes = vec![0u8; size];
+    let read_rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read_rc != 0 || size < std::mem::size_of::<i32>() {
+        return false;
+    }
+    bytes.truncate(size);
+
+    let argc = i32::from_ne_bytes(bytes[..4].try_into().unwrap_or([0; 4]));
+    if argc <= 0 {
+        return false;
+    }
+    let mut offset = 4usize;
+    let Some(executable_end) = bytes[offset..].iter().position(|byte| *byte == 0) else {
+        return false;
+    };
+    if String::from_utf8_lossy(&bytes[offset..offset + executable_end]).contains(needle) {
+        return true;
+    }
+    offset += executable_end + 1;
+
+    // KERN_PROCARGS2 pads with NUL bytes between the executable path and argv.
+    while offset < bytes.len() && bytes[offset] == 0 {
+        offset += 1;
+    }
+    for _ in 0..argc {
+        if offset >= bytes.len() {
+            return false;
+        }
+        let Some(end) = bytes[offset..].iter().position(|byte| *byte == 0) else {
+            return false;
+        };
+        if String::from_utf8_lossy(&bytes[offset..offset + end]).contains(needle) {
+            return true;
+        }
+        offset += end + 1;
+    }
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_cmdline_contains(_pid: u32, _needle: &str) -> bool {
+    false
 }
 
 /// Path of the exclusive session lock file.
@@ -362,6 +486,66 @@ unsafe fn libc_getuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_process_checks_recognize_the_current_process() {
+        let pid = std::process::id();
+        assert!(process_exists(pid));
+        assert!(process_starttime(pid).is_some());
+        assert!(process_matches_record(PidRecord {
+            pid,
+            starttime: process_starttime(pid),
+        }));
+        assert!(process_cmdline_contains(pid, "vmux"));
+        assert!(!process_cmdline_contains(pid, "vmux-no-such-argument"));
+    }
+
+    #[test]
+    fn native_process_checks_reject_an_impossible_pid() {
+        let pid = i32::MAX as u32;
+        assert!(!process_exists(pid));
+        assert_eq!(process_starttime(pid), None);
+        assert!(!process_cmdline_contains(pid, "vmux"));
+    }
+
+    #[test]
+    fn process_record_rejects_a_mismatched_start_time() {
+        let pid = std::process::id();
+        let starttime = process_starttime(pid).expect("current process start time");
+        assert!(!process_matches_record(PidRecord {
+            pid,
+            starttime: Some(starttime.saturating_add(1)),
+        }));
+    }
+
+    #[test]
+    fn native_cmdline_check_reads_process_arguments() {
+        // Prefer an absolute path so PATH races on CI do not spawn a different
+        // binary. Retry briefly: /proc/<pid>/cmdline can lag spawn by a tick.
+        let sleep_bin = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| PathBuf::from(p).is_file())
+            .unwrap_or("sleep");
+        let mut child = std::process::Command::new(sleep_bin)
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let saw = (0..50).any(|_| {
+            if process_cmdline_contains(pid, "sleep") && process_cmdline_contains(pid, "30") {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(
+            saw,
+            "cmdline for pid {pid} should include sleep and 30"
+        );
+        assert!(!process_cmdline_contains(pid, "vmux-no-such-argument"));
+        child.kill().ok();
+        child.wait().ok();
+    }
 
     #[test]
     fn runtime_artifact_paths_share_session_stem() {

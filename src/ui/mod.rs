@@ -67,13 +67,19 @@ pub fn attach(session: &str) -> Result<()> {
     // error returns cleanly without leaving the user's shell in a broken state.
     let config = crate::config::load()?;
     // Mobile relay: on by default; Settings → mobile relay can turn it off.
-    // Failures are non-fatal so attach still works offline / without Tailscale.
+    // Starting it includes network health probes, so keep that work off the
+    // first-frame path. In particular, a black-holed Tailscale address can
+    // leave macOS connect() pending for tens of seconds. The settings panel
+    // reports relay health after attach, so startup does not need to wait for
+    // this best-effort background task or print over the alternate screen.
     if config.relay.enabled {
-        match crate::relay::ensure_from_config(session, &config) {
-            Ok(Some(msg)) => eprintln!("vmux: {msg}"),
-            Ok(None) => {}
-            Err(err) => eprintln!("vmux: mobile relay not started ({err:#})"),
-        }
+        let relay_session = session.to_string();
+        let relay_config = config.clone();
+        let _ = std::thread::Builder::new()
+            .name("vmux-relay-ensure".into())
+            .spawn(move || {
+                let _ = crate::relay::ensure_from_config(&relay_session, &relay_config);
+            });
     }
     // Enable raw mode + the alternate screen behind an RAII guard so the TTY is
     // always restored, even if `Ui::new`, terminal init, an early RPC, or a
