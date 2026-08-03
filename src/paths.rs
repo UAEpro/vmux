@@ -538,10 +538,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
             false
         });
-        assert!(
-            saw,
-            "cmdline for pid {pid} should include sleep and 30"
-        );
+        assert!(saw, "cmdline for pid {pid} should include sleep and 30");
         assert!(!process_cmdline_contains(pid, "vmux-no-such-argument"));
         child.kill().ok();
         child.wait().ok();
