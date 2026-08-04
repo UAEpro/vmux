@@ -3228,9 +3228,17 @@ impl Ui {
                 return Ok(false);
             }
         }
-        // Click the collapsed ☰ header to open the workspace picker.
-        if layout_cols > 0 && self.sidebar_collapsed && column < layout_cols && row == 0 {
-            self.toggle_workspace_picker();
+        // Click the ☰ header: expand/collapse the rail on desktop; on narrow
+        // terminals the rail is fully hidden so ☰ lives on the control bar.
+        if layout_cols > 0 && column < layout_cols && row == 0 {
+            if self.sidebar_collapsed {
+                self.sidebar_collapsed = false;
+            } else {
+                // Only treat the header row as a collapse control when a header
+                // is actually painted (collapsed always has one; expanded when
+                // the skin provides a sidebar_header).
+                self.sidebar_collapsed = true;
+            }
             return Ok(false);
         }
         if let Some(hit) = control_bar_hit_at(
@@ -4219,25 +4227,20 @@ fn draw_sidebar(
     // Paint the whole rail first so styles that use surface stand out from panes.
     frame.render_widget(Block::default().style(Style::default().bg(rail_bg)), area);
 
-    let has_header = sidebar_collapsed || !chrome.sidebar_header.is_empty();
-    let chunks = if has_header {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1)])
-            .split(area)
-    };
-    let list_area = if has_header { chunks[1] } else { chunks[0] };
+    // Always paint a ☰ header so collapse/expand is one click (numbers-only
+    // rail or full names).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    let list_area = chunks[1];
 
-    if has_header {
-        let title = if sidebar_collapsed {
-            " ☰ "
+    {
+        // Collapsed: just ☰. Expanded: ☰ + skin header label (if any).
+        let title = if sidebar_collapsed || chrome.sidebar_header.is_empty() {
+            " ☰ ".to_string()
         } else {
-            chrome.sidebar_header
+            format!(" ☰ {}", chrome.sidebar_header.trim())
         };
         let header_style = match chrome.sidebar_style {
             SidebarStyle::Classic => Style::default()
@@ -5083,6 +5086,9 @@ fn is_sidebar_resize_edge(column: u16, sidebar_cols: u16) -> bool {
     column + 1 == sidebar_cols || column == sidebar_cols
 }
 
+/// Short label from a workspace id (tests / diagnostics). Collapsed UI uses
+/// 1-based list indices instead so the rail stays stable when ids jump.
+#[cfg(test)]
 fn compact_workspace_id(id: &str) -> String {
     id.strip_prefix("ws-")
         .map(|suffix| suffix.chars().take(2).collect::<String>())
@@ -5151,21 +5157,25 @@ fn workspace_list_item(
     let status = workspace_status(snapshot, &all_panes, status_markers);
     // Ordered segments so the pin and status marker can be tinted independently.
     // Concatenating the segment texts yields the exact row text hit-tests expect.
-    let mut segments: Vec<(String, SidebarSeg)> = vec![(prefix.to_string(), SidebarSeg::Plain)];
+    let mut segments: Vec<(String, SidebarSeg)> = Vec::new();
     if sidebar_collapsed {
-        let pin = if workspace.pinned { "*" } else { " " };
-        let marker = if status.is_empty() {
-            " ".to_string()
+        // Numbers-only rail: 1-based index + optional status glyph. Fits the
+        // 6-column collapsed width with a clear burger above.
+        let num = format!("{}", index + 1);
+        if active {
+            segments.push((">".to_string(), SidebarSeg::Plain));
         } else {
-            status.clone()
-        };
-        segments.push((pin.to_string(), SidebarSeg::Pin));
-        segments.push((
-            format!("{} ", compact_workspace_id(&workspace.id)),
-            SidebarSeg::Plain,
-        ));
-        segments.push((marker, SidebarSeg::Status));
+            segments.push((" ".to_string(), SidebarSeg::Plain));
+        }
+        segments.push((num, SidebarSeg::Plain));
+        if workspace.pinned {
+            segments.push(("*".to_string(), SidebarSeg::Pin));
+        }
+        if !status.is_empty() {
+            segments.push((status.clone(), SidebarSeg::Status));
+        }
     } else {
+        segments.push((prefix.to_string(), SidebarSeg::Plain));
         // Mandatory head keeps the status marker and index visible; the workspace
         // name is truncated, while the configured detail moves to line two.
         if workspace.pinned {
@@ -10480,8 +10490,16 @@ mod tests {
         assert!(full.contains("workspace") || full.contains("tab"));
 
         let collapsed = render_to_string(&session, true);
-        assert!(collapsed.contains(">  1"));
-        assert!(collapsed.contains("  *2"));
+        // Numbers-only rail: active index, pinned marker on the second workspace.
+        assert!(
+            collapsed.contains(">1") || collapsed.contains("> 1"),
+            "active workspace should show as numbered row, got:\n{collapsed}"
+        );
+        assert!(
+            collapsed.contains("2*") || collapsed.contains("2 *"),
+            "pinned workspace 2 should keep a pin mark, got:\n{collapsed}"
+        );
+        assert!(collapsed.contains("☰"), "burger header should be visible");
         assert!(!collapsed.contains("agents"));
         assert!(!collapsed.contains("@feature"));
     }

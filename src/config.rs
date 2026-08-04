@@ -212,7 +212,9 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            sidebar_collapsed: false,
+            // Start narrow (index numbers + ☰) so panes get the width; expand
+            // with ☰ / Settings / Ctrl-b B.
+            sidebar_collapsed: true,
             sidebar_width: default_sidebar_width(),
             sidebar_fit: true,
             prefix_key: default_prefix_key(),

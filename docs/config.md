@@ -33,7 +33,7 @@ Or open [config.schema.json](config.schema.json) directly (`$id`:
 | Key | Example | Notes |
 |-----|---------|-------|
 | `ui.prefix_key` | `Ctrl-b`, `Ctrl-a` | Prefix chord. Default `Ctrl-b`. |
-| `ui.sidebar_collapsed` | `true` / `false` | Start with a compact sidebar |
+| `ui.sidebar_collapsed` | `true` / `false` | Start with a **narrow** sidebar (default **on**): ☰ header + workspace **numbers** only. Click ☰ or Settings → sidebar, or `Ctrl-b B`, to expand names |
 | `ui.sidebar_width` | `28` | Expanded width (12–60). Max when `sidebar_fit` is on |
 | `ui.sidebar_fit` | `true` / `false` | Fit width to workspace name text (default **on**) |
 | `ui.sidebar_responsive` | `true` / `false` | Auto-hide sidebar on narrow terminals (default on) |

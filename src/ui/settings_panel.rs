@@ -204,9 +204,9 @@ pub(crate) fn settings_panel_lines(view: SettingsView<'_>) -> Vec<Line<'static>>
                 SettingsEntryId::WorkspaceLine => view.workspace_second_line.label().to_string(),
                 SettingsEntryId::Sidebar => {
                     if view.sidebar_collapsed {
-                        "collapsed".to_string()
+                        "☰ numbers (narrow)".to_string()
                     } else {
-                        "expanded".to_string()
+                        "expanded names".to_string()
                     }
                 }
                 SettingsEntryId::SidebarResponsive => {
