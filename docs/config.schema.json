@@ -13,8 +13,8 @@
       "properties": {
         "sidebar_collapsed": {
           "type": "boolean",
-          "default": false,
-          "description": "Start with a compact sidebar."
+          "default": true,
+          "description": "Start with a narrow sidebar (☰ + workspace numbers). Click ☰ or Settings to expand names."
         },
         "sidebar_width": {
           "type": "integer",
