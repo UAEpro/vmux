@@ -122,21 +122,24 @@ all = [
   ] },
 ]
 
+# Weak catch-all: no visible_blocker so the engine prefers concurrent
+# visible_idle (OSC ✳ / prompt box) over leftover chat text that still
+# mentions "would you like to… yes" or an old "tab to amend" line.
 [[rules]]
 id = "legacy_no_prompt_blocker"
 state = "blocked"
 priority = 300
 region = "whole_recent"
 any = [
-  { contains = ["do you want to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
-  { contains = ["would you like to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
   { contains = ["waiting for permission"] },
   { contains = ["do you want to allow this connection?"] },
-  { contains = ["tab to amend"] },
-  { contains = ["ctrl+e to explain"] },
   { contains = ["do you want to proceed?", "esc to cancel"] },
   { contains = ["review your answers"] },
   { contains = ["skip interview and plan immediately"] },
+  # Keep permission-chrome phrases, but not bare conversational
+  # "do you want to" / "would you like to" which fire on normal replies.
+  { contains = ["tab to amend", "esc to cancel"] },
+  { contains = ["ctrl+e to explain", "esc to cancel"] },
 ]
 not = [
   { regex = ['(?m)^\s*❯\s*$'] },
@@ -145,7 +148,9 @@ not = [
 [[rules]]
 id = "osc_title_idle"
 state = "idle"
-priority = 250
+# Above legacy_no_prompt_blocker (300) so an idle OSC title wins even when
+# weak-blocker demotion is not needed.
+priority = 400
 region = "osc_title"
 visible_idle = true
 regex = ['^\x{2733} ']
@@ -153,6 +158,6 @@ regex = ['^\x{2733} ']
 [[rules]]
 id = "osc_progress_idle"
 state = "idle"
-priority = 250
+priority = 400
 region = "osc_progress"
 regex = ['^4;0']

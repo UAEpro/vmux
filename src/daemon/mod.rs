@@ -6152,9 +6152,10 @@ fn should_skip_busy_after_settled(
 }
 
 /// Herdr-style: for agents with screen manifests (Claude/Codex/…), hooks are
-/// **not** the status authority — screen rules are. Still allow Stop→Done and
-/// Error so ✅/❌ work; ignore busy/attention/idle from hooks so they cannot
-/// fight the live UI (permission dialogs, spinners, prompt box).
+/// **not** the status authority — screen rules are. Only Stop→Done is accepted
+/// from hooks (✅ is not a screen state). Busy/attention/idle/error from hooks
+/// must not fight the live UI: herdr has no Error badge, and hook ❌ used to
+/// stick after the agent recovered.
 ///
 /// Also applies when the agent was launched *inside* a shell pane (command is
 /// still `bash`/`zsh` but a claude/codex child is running) — otherwise hooks
@@ -6163,10 +6164,8 @@ fn should_skip_hook_status_for_screen_authority(pane: &Pane, status: &str) -> bo
     if !crate::detect::screen_is_status_authority_for_pane(&pane.command, pane.pid) {
         return false;
     }
-    matches!(
-        parse_agent_status(status),
-        AgentStatus::Busy | AgentStatus::Attention | AgentStatus::Idle | AgentStatus::Unknown
-    )
+    // Only Done (Stop) may override screen for manifest agents.
+    !matches!(parse_agent_status(status), AgentStatus::Done)
 }
 
 /// Re-run screen-manifest detection on a runtime pane. Idle agents often emit

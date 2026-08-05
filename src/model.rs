@@ -1255,39 +1255,41 @@ pub fn unix_time() -> u64 {
 pub fn infer_agent_status(output: &str, command: &str) -> AgentStatus {
     // Only scan the output chunk — do not mix in the command name, which can
     // create false matches and thrash status on every redraw.
+    //
+    // Keyword heuristics are a fallback for non-manifest agents only. Keep
+    // patterns tight: bare "exception"/"traceback"/"thinking" fire on normal
+    // chat and code review, which used to pin ❌/🔄 forever via sticky merge.
     let haystack = output.to_lowercase();
     if !haystack.trim().is_empty() {
-        if haystack.contains("traceback")
-            || haystack.contains("exception")
-            || haystack.contains("fatal error")
-            || haystack.contains("command failed")
+        if haystack.contains("traceback (most recent call last)")
+            || haystack.contains("fatal error:")
+            || haystack.contains("command failed with exit")
+            || haystack.contains("command failed with status")
         {
             return AgentStatus::Error;
         }
-        if haystack.contains("needs input")
-            || haystack.contains("need input")
-            || haystack.contains("waiting for input")
-            || haystack.contains("waiting for approval")
+        // Prefer explicit permission/approval phrasing over conversational
+        // "do you want to" / "allow this" which appear in ordinary agent replies.
+        if haystack.contains("waiting for approval")
             || haystack.contains("needs approval")
             || haystack.contains("approval required")
             || haystack.contains("permission required")
-            || haystack.contains("allow this")
-            || haystack.contains("do you want to")
-            || haystack.contains("press enter to")
-            || haystack.contains("awaiting user")
-            || haystack.contains("user input")
+            || haystack.contains("waiting for permission")
+            || haystack.contains("needs your permission")
+            || haystack.contains("awaiting user input")
             || haystack.contains("needs-input")
+            || haystack.contains("needs input before")
         {
             return AgentStatus::Attention;
         }
         // Agent-specific activity phrases only. Generic words like "executing",
-        // "generating", "in progress", "streaming", and "working on" appear
-        // constantly in ordinary build/log output and produced false 🔄. A
-        // genuinely stuck heuristic Busy is also self-healed by decay_stale_busy.
-        if haystack.contains("thinking")
-            || haystack.contains("tool call")
+        // "generating", "in progress", "streaming", "working on", and bare
+        // "thinking" appear constantly in ordinary chat/log output.
+        if haystack.contains("tool call")
             || haystack.contains("calling tool")
             || haystack.contains("running tool")
+            || haystack.contains("thinking…")
+            || haystack.contains("thinking...")
         {
             return AgentStatus::Busy;
         }
@@ -1373,21 +1375,19 @@ pub fn merge_agent_status(
     inferred: AgentStatus,
 ) -> (AgentStatus, bool) {
     if !pinned {
-        // Unpinned: keep Busy sticky while a coding agent is still redrawing
-        // quiet frames (Idle), so the spinner does not flicker off mid-turn.
+        // Unpinned keyword path (non-manifest agents only):
+        // - Busy stays sticky through quiet Idle frames so the spinner does
+        //   not flicker mid-turn (healed later by decay_stale_busy).
+        // - Done stays sticky so a finished turn does not vanish on redraw.
+        // - Attention/Error must NOT stick through Idle: a one-shot false
+        //   keyword match (chat saying "exception", leftover "approval") used
+        //   to pin 🙋/❌ forever. Re-match every chunk; real signals re-fire.
         return match (current, inferred) {
             (AgentStatus::Busy, AgentStatus::Idle | AgentStatus::Unknown) => {
                 (AgentStatus::Busy, false)
             }
             (AgentStatus::Done, AgentStatus::Idle | AgentStatus::Unknown) => {
                 (AgentStatus::Done, false)
-            }
-            (AgentStatus::Attention, AgentStatus::Idle | AgentStatus::Unknown) => {
-                (AgentStatus::Attention, false)
-            }
-            // Keep ❌ sticky through idle redraws (shell prompt after traceback).
-            (AgentStatus::Error, AgentStatus::Idle | AgentStatus::Unknown) => {
-                (AgentStatus::Error, false)
             }
             (_, next) => (next, false),
         };
@@ -1409,6 +1409,8 @@ pub fn merge_agent_status(
         ) => (AgentStatus::Attention, true),
         // Authoritative pin holds through idle/unknown redraws.
         (AgentStatus::Done, _) => (AgentStatus::Done, true),
+        // Pinned Error holds for keyword/hook path; screen-authority clears
+        // Error via merge_screen_status instead of this pin table.
         (AgentStatus::Error, _) => (AgentStatus::Error, true),
         (AgentStatus::Attention, AgentStatus::Busy) => (AgentStatus::Busy, true),
         (AgentStatus::Attention, AgentStatus::Done) => (AgentStatus::Done, true),
@@ -2200,9 +2202,45 @@ mod tests {
             AgentStatus::Attention
         );
         assert_eq!(
-            infer_agent_status("Allow this tool call?", "grok"),
+            infer_agent_status("agent needs your permission to use Bash", "claude"),
             AgentStatus::Attention
         );
+    }
+
+    #[test]
+    fn infer_agent_status_ignores_chatty_false_positives() {
+        // Conversation / code-review text must not pin ❌ / 🙋 / 🔄.
+        assert_eq!(
+            infer_agent_status("The exception handler looks fine", "bash"),
+            AgentStatus::Unknown
+        );
+        assert_eq!(
+            infer_agent_status("See the traceback in the logs above", "bash"),
+            AgentStatus::Unknown
+        );
+        assert_eq!(
+            infer_agent_status("Do you want to try a different approach?", "bash"),
+            AgentStatus::Unknown
+        );
+        assert_eq!(
+            infer_agent_status("I am thinking about the design", "bash"),
+            AgentStatus::Unknown
+        );
+        assert_eq!(
+            infer_agent_status("traceback (most recent call last):\n  File...", "bash"),
+            AgentStatus::Error
+        );
+    }
+
+    #[test]
+    fn merge_agent_status_does_not_sticky_unpinned_error_or_attention() {
+        let (status, pinned) = merge_agent_status(AgentStatus::Error, false, AgentStatus::Idle);
+        assert_eq!(status, AgentStatus::Idle);
+        assert!(!pinned);
+        let (status, pinned) =
+            merge_agent_status(AgentStatus::Attention, false, AgentStatus::Unknown);
+        assert_eq!(status, AgentStatus::Unknown);
+        assert!(!pinned);
     }
 
     #[test]

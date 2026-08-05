@@ -282,9 +282,11 @@ pub fn to_agent_status(state: DetectedState) -> crate::model::AgentStatus {
 
 /// Merge a screen-detection result into the current pane status.
 ///
-/// Screen is authoritative for busy/idle/attention. `Done` (from Stop) is kept
-/// through plain idle until the user acknowledges; screen `working`/`blocked`
-/// always wins. `Error` is sticky until a non-idle screen state appears.
+/// Screen is authoritative every frame (herdr model: idle/working/blocked only
+/// on the wire). `Done` (from Stop) is kept through plain idle until the user
+/// acknowledges; screen `working`/`blocked` always wins. Prior `Error` from
+/// hooks/keywords is **not** sticky — herdr has no Error state, and a live
+/// idle/working screen must clear a false ❌.
 pub fn merge_screen_status(
     current: crate::model::AgentStatus,
     detection: &Detection,
@@ -295,15 +297,16 @@ pub fn merge_screen_status(
     }
     let screen = to_agent_status(detection.state);
     let next = match (&current, &screen) {
-        (AgentStatus::Error, AgentStatus::Idle | AgentStatus::Unknown) => AgentStatus::Error,
+        // Done holds through quiet idle until user acks or new work starts.
         (AgentStatus::Done, AgentStatus::Idle | AgentStatus::Unknown) => AgentStatus::Done,
         (AgentStatus::Done, AgentStatus::Busy) => AgentStatus::Busy,
         (AgentStatus::Done, AgentStatus::Attention) => AgentStatus::Attention,
+        // Live screen always wins over Error/Busy/Attention/Idle/Unknown.
         (_, status) => status.clone(),
     };
     // Screen results are unpinned so a later frame can correct them freely.
     // Done stays pinned so quiet redraws cannot clear ✅.
-    let pinned = matches!(next, AgentStatus::Done | AgentStatus::Error);
+    let pinned = matches!(next, AgentStatus::Done);
     if next == current {
         return None;
     }
@@ -467,6 +470,63 @@ Do you want to proceed?
         assert_eq!(
             merge_screen_status(AgentStatus::Done, &working),
             Some((AgentStatus::Busy, false))
+        );
+    }
+
+    #[test]
+    fn merge_screen_clears_error_when_idle() {
+        use crate::model::AgentStatus;
+        let d = Detection {
+            agent: Some("claude"),
+            state: DetectedState::Idle,
+            skip_state_update: false,
+            visible_idle: true,
+            visible_blocker: false,
+            visible_working: false,
+            matched_rule: Some("live_prompt_box".into()),
+            fallback_reason: None,
+        };
+        // Herdr has no Error: live idle screen must clear a false/stale ❌.
+        assert_eq!(
+            merge_screen_status(AgentStatus::Error, &d),
+            Some((AgentStatus::Idle, false))
+        );
+    }
+
+    #[test]
+    fn conversational_would_you_like_is_not_attention() {
+        // Normal assistant prose must not trip blocked; idle prompt + OSC win.
+        let screen = "\
+Would you like to continue with the plan? Yes, that makes sense.
+
+─────────────────────
+ ❯  
+─────────────────────
+";
+        let d = detect_agent(ManifestAgent::Claude, screen, "\u{2733} idle title", "");
+        assert_eq!(d.state, DetectedState::Idle, "{d:?}");
+    }
+
+    #[test]
+    fn weak_blocker_loses_to_visible_idle_when_both_match() {
+        // Leftover permission chrome without a strong visible_blocker, while
+        // OSC title is idle ✳ — engine prefers visible_idle evidence.
+        let screen = "\
+waiting for permission from the user to continue editing files
+
+─────────────────────
+ ❯  
+─────────────────────
+";
+        let d = detect_agent(ManifestAgent::Claude, screen, "\u{2733} done", "");
+        assert_eq!(d.state, DetectedState::Idle, "{d:?}");
+        assert!(
+            d.visible_idle
+                || matches!(
+                    d.matched_rule.as_deref(),
+                    Some("live_prompt_box" | "osc_title_idle")
+                ),
+            "{d:?}"
         );
     }
 

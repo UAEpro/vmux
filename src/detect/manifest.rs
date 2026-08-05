@@ -281,7 +281,15 @@ pub fn detect_with_osc(agent: ManifestAgent, input: DetectionInput<'_>) -> Manif
         };
     };
 
+    // Collect every matching rule (priority order applied when choosing).
+    // Weak blocked rules (no visible_blocker) lose to concurrent visible_idle
+    // evidence — otherwise chat text like "would you like to… yes" or leftover
+    // "tab to amend" in scrollback raises Attention while OSC ✳ / prompt box
+    // already prove idle. Herdr's manifests rely on this evidence split:
+    // strong permission UIs set visible_blocker; legacy catch-alls do not.
     let mut matched: Option<&ManifestRule> = None;
+    let mut visible_idle_rule: Option<&ManifestRule> = None;
+    let mut visible_working_rule: Option<&ManifestRule> = None;
     for (rule, compiled) in loaded.manifest.rules.iter().zip(&loaded.compiled_rules) {
         let region_text = region(input, &rule.region);
         if !compiled_rule_matches(compiled, region_text) {
@@ -290,6 +298,19 @@ pub fn detect_with_osc(agent: ManifestAgent, input: DetectionInput<'_>) -> Manif
         match matched {
             Some(prev) if prev.priority >= rule.priority => {}
             _ => matched = Some(rule),
+        }
+        let state = rule.state.map(DetectedState::from);
+        if rule.visible_idle && matches!(state, Some(DetectedState::Idle)) {
+            match visible_idle_rule {
+                Some(prev) if prev.priority >= rule.priority => {}
+                _ => visible_idle_rule = Some(rule),
+            }
+        }
+        if rule.visible_working && matches!(state, Some(DetectedState::Working)) {
+            match visible_working_rule {
+                Some(prev) if prev.priority >= rule.priority => {}
+                _ => visible_working_rule = Some(rule),
+            }
         }
     }
 
@@ -305,10 +326,28 @@ pub fn detect_with_osc(agent: ManifestAgent, input: DetectionInput<'_>) -> Manif
         };
     };
 
-    let state = rule
+    let mut rule = rule;
+    let mut state = rule
         .state
         .map(DetectedState::from)
         .unwrap_or(DetectedState::Unknown);
+
+    // Prefer strong idle evidence over a weak (non-visible) blocker.
+    if matches!(state, DetectedState::Blocked) && !rule.visible_blocker {
+        if let Some(idle) = visible_idle_rule {
+            rule = idle;
+            state = DetectedState::Idle;
+        }
+    }
+    // Prefer strong working evidence over a weak blocker when both fire
+    // (e.g. leftover permission text while OSC braille spinner is live).
+    if matches!(state, DetectedState::Blocked) && !rule.visible_blocker {
+        if let Some(working) = visible_working_rule {
+            rule = working;
+            state = DetectedState::Working;
+        }
+    }
+
     ManifestDetection {
         state,
         skip_state_update: rule.skip_state_update,
