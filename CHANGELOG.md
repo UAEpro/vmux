@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.7.2 — 2026-08-05
+
+Patch release: herdr-aligned agent status badges (fewer false ❌/🙋/🔄),
+and a narrower default sidebar. Upgrade with the install one-liner,
+`cargo install vmux-tui`, or wait for the in-app update notice.
+
+### Fixed
+
+- **False agent badges (error / attention / running).** Compared with herdr:
+  screen is ground truth every frame (herdr has no Error status). Sticky ❌
+  no longer survives a live idle screen; hooks on Claude/Codex/Grok panes
+  only apply Stop→Done (not busy/attention/error); unpinned keyword
+  Attention/Error no longer stick through quiet chunks; PTY keyword
+  patterns are tighter (no bare `exception` / `thinking` / `do you want to`);
+  weak Claude blockers lose to concurrent visible idle (OSC ✳ / prompt box);
+  conversational “would you like to…” no longer raises Attention.
+
+### Changed
+
+- **Default sidebar is collapsed** (☰ + workspace numbers) so more of the
+  terminal is visible on narrow layouts; expand with the sidebar toggle.
+
 ## v0.7.1 — 2026-08-03
 
 Patch release: macOS attach startup, terminal input modes, interactive
